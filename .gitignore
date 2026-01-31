@@ -1,5 +1,6 @@
 .DS_Store
 
+/.solver-notes
 /target
 /.vscode
 /.idea
