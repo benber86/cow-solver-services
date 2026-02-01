@@ -4,13 +4,23 @@ use {
     crate::domain::eth,
     reqwest::Url,
     serde::Deserialize,
-    std::{fmt, time::Duration},
+    std::{
+        collections::HashMap,
+        fmt,
+        sync::Mutex,
+        time::{Duration, Instant},
+    },
 };
+
+/// WETH address on Ethereum mainnet.
+const WETH_ADDRESS: eth::Address =
+    alloy::primitives::address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
 
 /// Curve Price API client.
 pub struct Client {
     http: reqwest::Client,
     base_url: Url,
+    cache: Mutex<HashMap<eth::Address, CachedPrice>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +33,15 @@ struct PriceData {
     usd_price: f64,
 }
 
+/// Cached ETH-denominated price with fetch timestamp.
+struct CachedPrice {
+    price: eth::U256,
+    fetched_at: Instant,
+}
+
+/// How long to keep a cached price before refreshing.
+const CACHE_TTL: Duration = Duration::from_secs(60);
+
 impl Client {
     /// Creates a new Curve Price API client.
     pub fn new(base_url: Url) -> Self {
@@ -31,20 +50,56 @@ impl Client {
             .build()
             .expect("failed to build HTTP client");
 
-        Self { http, base_url }
+        Self {
+            http,
+            base_url,
+            cache: Mutex::new(HashMap::new()),
+        }
     }
 
-    /// Fetches USD price for a token.
-    /// Returns price as U256 with 18 decimals (like ETH price format).
-    pub async fn get_usd_price(
+    /// Fetches the ETH-denominated price for a token.
+    /// Returns price as U256 representing wei needed to buy 10^18 of the token.
+    /// This is compatible with `auction::Price`.
+    pub async fn get_eth_price(
         &self,
         chain: &str,
         token: eth::Address,
     ) -> Result<eth::U256, Error> {
-        let url = format!(
-            "{}v1/usd_price/{}/{:?}",
-            self.base_url, chain, token
-        );
+        if let Some(price) = self.cached_price(token) {
+            return Ok(price);
+        }
+
+        // Fetch both token and WETH USD prices
+        let token_usd = self.get_usd_price_raw(chain, token).await?;
+        let weth_usd = self.get_usd_price_raw(chain, WETH_ADDRESS).await?;
+
+        if weth_usd <= 0.0 {
+            return Err(Error::Parse("invalid WETH price".to_string()));
+        }
+
+        // Convert: eth_price = (token_usd / weth_usd) * 10^18
+        // This gives us wei needed to buy 10^18 of the token
+        let eth_price = (token_usd / weth_usd) * 1e18;
+
+        if !eth_price.is_finite() || eth_price <= 0.0 {
+            return Err(Error::Parse(format!(
+                "invalid ETH price calculation: token_usd={}, weth_usd={}",
+                token_usd, weth_usd
+            )));
+        }
+
+        if eth_price >= 2.0_f64.powi(128) {
+            return Err(Error::Parse("price overflow".to_string()));
+        }
+
+        let as_u256 = eth::U256::from(eth_price as u128);
+        self.insert_cache(token, as_u256);
+        Ok(as_u256)
+    }
+
+    /// Fetches raw USD price for a token as f64.
+    async fn get_usd_price_raw(&self, chain: &str, token: eth::Address) -> Result<f64, Error> {
+        let url = format!("{}v1/usd_price/{}/{:?}", self.base_url, chain, token);
 
         tracing::debug!(%url, "fetching Curve token price");
 
@@ -69,19 +124,34 @@ impl Client {
             .await
             .map_err(|e| Error::Parse(e.to_string()))?;
 
-        // Convert f64 USD price to U256 with 18 decimals
         let usd_price = price_response.data.usd_price;
         if !usd_price.is_finite() || usd_price <= 0.0 {
             return Err(Error::Parse(format!("invalid price: {}", usd_price)));
         }
 
-        // Convert to 18 decimal representation
-        let price_with_decimals = usd_price * 1e18;
-        if price_with_decimals >= 2.0_f64.powi(256) {
-            return Err(Error::Parse("price overflow".to_string()));
-        }
+        Ok(usd_price)
+    }
 
-        Ok(eth::U256::from(price_with_decimals as u128))
+    fn cached_price(&self, token: eth::Address) -> Option<eth::U256> {
+        let cache = self.cache.lock().ok()?;
+        let entry = cache.get(&token)?;
+        if entry.fetched_at.elapsed() <= CACHE_TTL {
+            Some(entry.price)
+        } else {
+            None
+        }
+    }
+
+    fn insert_cache(&self, token: eth::Address, price: eth::U256) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(
+                token,
+                CachedPrice {
+                    price,
+                    fetched_at: Instant::now(),
+                },
+            );
+        }
     }
 }
 
@@ -111,11 +181,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_price_conversion() {
-        // Test that price conversion works correctly
-        let usd_price = 1.5_f64;
-        let price_with_decimals = usd_price * 1e18;
-        let result = eth::U256::from(price_with_decimals as u128);
+    fn test_eth_price_conversion() {
+        // Test ETH price calculation: token_usd=3000, weth_usd=2000
+        // eth_price = (3000 / 2000) * 10^18 = 1.5 * 10^18
+        let token_usd = 3000.0_f64;
+        let weth_usd = 2000.0_f64;
+        let eth_price = (token_usd / weth_usd) * 1e18;
+        let result = eth::U256::from(eth_price as u128);
         assert_eq!(result, eth::U256::from(1_500_000_000_000_000_000u128));
     }
 }

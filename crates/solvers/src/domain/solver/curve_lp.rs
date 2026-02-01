@@ -260,13 +260,14 @@ impl Inner {
         let sell_token_price = match tokens.reference_price(&order.sell.token) {
             Some(price) => price,
             None => {
-                // Fetch from Curve price API
-                let usd_price = self
+                // Fetch ETH-denominated price from Curve price API
+                // (converts USD prices to wei-per-token using WETH/USD)
+                let eth_price = self
                     .price_client
-                    .get_usd_price("ethereum", order.sell.token.0)
+                    .get_eth_price("ethereum", order.sell.token.0)
                     .await
                     .map_err(|_| SolveError::NoPriceForSellToken)?;
-                auction::Price(eth::Ether(usd_price))
+                auction::Price(eth::Ether(eth_price))
             }
         };
 
