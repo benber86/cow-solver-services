@@ -2,6 +2,7 @@
 //! "legacy" logic in `shared` and `model`.
 
 pub mod baseline;
+pub mod curve;
 pub mod liquidity;
 
 pub type Result<T> = anyhow::Result<T>;

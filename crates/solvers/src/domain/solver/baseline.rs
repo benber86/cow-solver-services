@@ -6,7 +6,6 @@
 //! over separate paths.
 
 use {
-    super::solution::Solution,
     crate::{
         boundary,
         domain::{
@@ -14,7 +13,7 @@ use {
             eth,
             liquidity,
             order::{self, Order, Side},
-            solution,
+            solution::{self, Solution},
         },
         infra::metrics,
     },

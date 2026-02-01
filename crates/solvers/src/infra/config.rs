@@ -1,3 +1,5 @@
+pub mod curve_lp;
+
 use {
     crate::{
         domain::{eth, solver},

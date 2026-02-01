@@ -39,4 +39,9 @@ pub enum Command {
         #[clap(long, env)]
         config: PathBuf,
     },
+    /// solve Curve LP token orders via Curve Router
+    CurveLp {
+        #[clap(long, env)]
+        config: PathBuf,
+    },
 }

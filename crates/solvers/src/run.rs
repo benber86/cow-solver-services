@@ -44,6 +44,10 @@ async fn run_with(args: cli::Args, bind: Option<oneshot::Sender<SocketAddr>>) {
             let config = config::load(&config).await;
             solver::Solver::new(config).await
         }
+        cli::Command::CurveLp { config } => {
+            let config = config::curve_lp::load(&config).await;
+            solver::Solver::new_curve_lp(config).await
+        }
     };
 
     crate::api::Api {
