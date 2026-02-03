@@ -198,6 +198,16 @@ impl Inner {
         tokens: &auction::Tokens,
         gas_price: &auction::GasPrice,
     ) -> Result<Solution, SolveError> {
+        // Get token decimals (default to 18 for LP tokens, 6 for stables)
+        let sell_token_decimals = tokens
+            .get(&order.sell.token)
+            .and_then(|t| t.decimals)
+            .unwrap_or(18);
+        let buy_token_decimals = tokens
+            .get(&order.buy.token)
+            .and_then(|t| t.decimals)
+            .unwrap_or(18);
+
         // 1. Query Curve API for optimal route
         let route = self
             .api_client
@@ -206,6 +216,8 @@ impl Inner {
                 order.sell.token.0,
                 order.buy.token.0,
                 order.sell.amount,
+                sell_token_decimals,
+                buy_token_decimals,
             )
             .await
             .map_err(SolveError::Api)?;

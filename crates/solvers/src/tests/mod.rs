@@ -55,7 +55,22 @@ impl SolverEngine {
 
         let handle = tokio::spawn(crate::run(args, Some(bind)));
 
-        let addr = bind_receiver.await.unwrap();
+        let addr = match bind_receiver.await {
+            Ok(addr) => addr,
+            Err(_) => {
+                // Check if the task panicked
+                match handle.await {
+                    Ok(()) => panic!("solver task completed without sending address"),
+                    Err(join_err) => {
+                        if join_err.is_panic() {
+                            std::panic::resume_unwind(join_err.into_panic());
+                        } else {
+                            panic!("solver task was cancelled: {}", join_err);
+                        }
+                    }
+                }
+            }
+        };
         let url = format!("http://{addr}/").parse().unwrap();
 
         Self {

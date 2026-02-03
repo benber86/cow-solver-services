@@ -1,7 +1,8 @@
-//! Baseline solver test cases.
+//! Solver test cases.
 
 mod bal_liquidity;
 mod buy_order_rounding;
+mod curve_lp;
 mod direct_swap;
 mod internalization;
 mod limit_order_quoting;
