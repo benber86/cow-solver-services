@@ -6,3 +6,5 @@
 /.idea
 **/testing.*.toml
 /playground/.env
+
+configs/local/*.local.toml
