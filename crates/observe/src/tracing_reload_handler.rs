@@ -22,10 +22,15 @@ pub(crate) fn spawn_reload_handler<T: 'static>(
         let socket_path = format!("/tmp/log_filter_override_{name}_{id}.sock");
         tracing::warn!(file = socket_path, "open log filter reload socket");
         let _ = tokio::fs::remove_file(&socket_path).await;
-        let handle = SocketHandle {
-            listener: UnixListener::bind(&socket_path).expect("socket handle is unique"),
-            socket_path,
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(listener) => listener,
+            Err(err) => {
+                tracing::warn!(?err, "failed to bind log filter reload socket; disabling reload");
+                return;
+            }
         };
+
+        let handle = SocketHandle { listener, socket_path };
 
         loop {
             handle_connection(&handle.listener, &initial_filter, &reload_handle).await;
