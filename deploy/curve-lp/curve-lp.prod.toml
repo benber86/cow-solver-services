@@ -1,0 +1,31 @@
+# Curve LP Solver - Production Configuration
+#
+# SECRETS: This file contains NO secrets.
+# NODE_URL is injected via environment variable.
+
+# RPC for on-chain verification (injected from environment)
+node-url = "${NODE_URL}"
+
+# Curve APIs (public, no auth needed)
+curve-api-url = "https://api.curve.fi"
+curve-price-api-url = "https://prices.curve.finance"
+
+# LP tokens we handle (Ethereum mainnet)
+lp-tokens = [
+    "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4",  # TricryptoUSDT
+    "0xc4AD29ba4B3c580e6D59105FFf484999997675Ff",  # crv3crypto
+    "0x7F86Bf177Dd4F3494b841a37e810A34dD56c829B",  # TricryptoUSDC
+]
+
+# Allowed output tokens
+allowed-buy-tokens = [
+    "0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E",  # crvUSD
+]
+
+# Safety settings
+slippage-bps = 100              # 1% slippage buffer
+max-quote-deviation-bps = 300   # 3% max deviation between API and on-chain quote
+gas-estimate = 500000
+
+# Curve Router (Ethereum mainnet)
+curve-router-address = "0x45312ea0eff7e09c83cbe249fa1d7598c4c8cd4e"

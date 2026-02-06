@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  driver:
+    image: ghcr.io/cowprotocol/services:latest
+    command: >
+      driver
+      --config /config/driver.toml
+      --ethrpc ${NODE_URL}
+    ports:
+      - "8080:11088"
+    volumes:
+      - ./processed/driver.toml:/config/driver.toml:ro
+    environment:
+      # Secrets injected from environment - NEVER in files
+      - NODE_URL=${NODE_URL}
+      - SOLVER_ACCOUNT=${SOLVER_ACCOUNT}
+    depends_on:
+      - solver
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  solver:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: solvers
+    command: >
+      solvers
+      --addr 0.0.0.0:7872
+      curvelp
+      --config /config/curve-lp.toml
+    expose:
+      - "7872"  # Internal only - not accessible from outside
+    volumes:
+      - ./processed/curve-lp.toml:/config/curve-lp.toml:ro
+    environment:
+      - NODE_URL=${NODE_URL}
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"

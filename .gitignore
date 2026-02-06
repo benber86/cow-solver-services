@@ -1,15 +1,22 @@
+# Build artifacts
+/target
+
+# IDE
+/.idea
+/.vscode
 .DS_Store
 
-/.solver-notes
-/target
-/.vscode
-/.idea
-**/testing.*.toml
-/playground/.env
-
+# Local configs with secrets
 configs/local/*.local.toml
-.folder
+/playground/.env
+**/testing.*.toml
 
-# Deployment secrets - NEVER commit these
-.folder/.env
-.folder/processed/
+# Solver notes
+/.solver-notes
+
+# Local plans/notes (not committed)
+.folder/
+
+# Deployment secrets - NEVER commit
+deploy/*/.env
+deploy/*/processed/
