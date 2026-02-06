@@ -8,3 +8,8 @@
 /playground/.env
 
 configs/local/*.local.toml
+.folder
+
+# Deployment secrets - NEVER commit these
+.folder/.env
+.folder/processed/
