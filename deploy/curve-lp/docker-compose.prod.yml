@@ -1,18 +1,47 @@
 version: '3.8'
 
 services:
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - certbot-etc:/etc/letsencrypt:ro
+      - certbot-var:/var/lib/letsencrypt
+      - certbot-www:/var/www/certbot
+    depends_on:
+      - driver
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  certbot:
+    image: certbot/certbot
+    volumes:
+      - certbot-etc:/etc/letsencrypt
+      - certbot-var:/var/lib/letsencrypt
+      - certbot-www:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+    restart: unless-stopped
+
   driver:
     image: ghcr.io/cowprotocol/services:latest
     command: >
       driver
       --config /config/driver.toml
       --ethrpc ${NODE_URL}
-    ports:
-      - "8080:11088"
+    expose:
+      - "11088"
     volumes:
       - ./processed/driver.toml:/config/driver.toml:ro
     environment:
-      # Secrets injected from environment - NEVER in files
       - NODE_URL=${NODE_URL}
       - SOLVER_ACCOUNT=${SOLVER_ACCOUNT}
     depends_on:
@@ -35,7 +64,7 @@ services:
       curvelp
       --config /config/curve-lp.toml
     expose:
-      - "7872"  # Internal only - not accessible from outside
+      - "7872"
     volumes:
       - ./processed/curve-lp.toml:/config/curve-lp.toml:ro
     environment:
@@ -46,3 +75,8 @@ services:
       options:
         max-size: "100m"
         max-file: "3"
+
+volumes:
+  certbot-etc:
+  certbot-var:
+  certbot-www:
