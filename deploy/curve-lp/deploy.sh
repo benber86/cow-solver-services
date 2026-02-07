@@ -106,6 +106,10 @@ echo -e "${GREEN}✓ No placeholder values in configs${NC}"
 # Start services
 echo "Starting services..."
 
+# Enable BuildKit for Docker builds (required for --mount syntax in Dockerfile)
+export DOCKER_BUILDKIT=1
+export COMPOSE_DOCKER_CLI_BUILD=1
+
 docker-compose -f docker-compose.prod.yml up -d --build
 
 echo ""
