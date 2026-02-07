@@ -12,12 +12,12 @@ services:
     entrypoint: /bin/sh
     command: >
       -c '
-        if [ ! -d /etc/letsencrypt/live/$DOMAIN ]; then
+        if [ ! -d /etc/letsencrypt/live/$$DOMAIN ]; then
           echo "Creating dummy certificate for nginx to start...";
-          mkdir -p /etc/letsencrypt/live/$DOMAIN;
+          mkdir -p /etc/letsencrypt/live/$$DOMAIN;
           openssl req -x509 -nodes -days 1 -newkey rsa:2048 \
-            -keyout /etc/letsencrypt/live/$DOMAIN/privkey.pem \
-            -out /etc/letsencrypt/live/$DOMAIN/fullchain.pem \
+            -keyout /etc/letsencrypt/live/$$DOMAIN/privkey.pem \
+            -out /etc/letsencrypt/live/$$DOMAIN/fullchain.pem \
             -subj "/CN=localhost";
         fi
       '
@@ -43,11 +43,11 @@ services:
     command: >
       -c '
         # Substitute env vars in nginx config
-        envsubst "\$DOMAIN" < /etc/nginx/nginx.template > /etc/nginx/nginx.conf;
+        envsubst "\$$DOMAIN" < /etc/nginx/nginx.template > /etc/nginx/nginx.conf;
 
         # Start nginx in background
         nginx &
-        NGINX_PID=$$!;
+        NGINX_PID=$$$$!;
 
         # First reload after 30s (to pick up real cert after certbot gets it)
         sleep 30 && nginx -s reload && echo "Initial reload done" &
@@ -60,7 +60,7 @@ services:
         done &
 
         # Wait for nginx
-        wait $NGINX_PID
+        wait $$NGINX_PID
       '
     logging:
       driver: "json-file"
@@ -85,12 +85,12 @@ services:
         sleep 10;
 
         # Check if we have a real cert (not self-signed)
-        if [ ! -f /etc/letsencrypt/renewal/$DOMAIN.conf ]; then
+        if [ ! -f /etc/letsencrypt/renewal/$$DOMAIN.conf ]; then
           echo "Getting real certificate from Lets Encrypt...";
           certbot certonly --webroot --webroot-path=/var/www/certbot \
-            --email $SSL_EMAIL --agree-tos --no-eff-email \
-            --force-renewal -d $DOMAIN;
-          if [ $? -eq 0 ]; then
+            --email $$SSL_EMAIL --agree-tos --no-eff-email \
+            --force-renewal -d $$DOMAIN;
+          if [ $$? -eq 0 ]; then
             echo "Certificate obtained! Nginx will reload shortly.";
           fi
         else
