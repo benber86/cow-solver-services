@@ -14,7 +14,6 @@ cd "$SCRIPT_DIR"
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 echo -e "${GREEN}=== Curve LP Solver Deployment ===${NC}"
@@ -33,7 +32,7 @@ source .env
 set +a
 
 # Validate required variables
-REQUIRED_VARS=("NODE_URL" "SOLVER_ACCOUNT")
+REQUIRED_VARS=("NODE_URL" "SOLVER_ACCOUNT" "DOMAIN" "SSL_EMAIL")
 MISSING_VARS=()
 
 for var in "${REQUIRED_VARS[@]}"; do
@@ -69,7 +68,21 @@ if [ "$SOLVER_ACCOUNT" = "0x0000000000000000000000000000000000000000000000000000
     exit 1
 fi
 
+# Validate DOMAIN looks like a domain
+if [[ ! "$DOMAIN" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$ ]]; then
+    echo -e "${RED}ERROR: DOMAIN must be a valid domain name${NC}"
+    exit 1
+fi
+
+# Validate SSL_EMAIL looks like an email
+if [[ ! "$SSL_EMAIL" =~ ^[^@]+@[^@]+\.[^@]+$ ]]; then
+    echo -e "${RED}ERROR: SSL_EMAIL must be a valid email address${NC}"
+    exit 1
+fi
+
 echo -e "${GREEN}✓ Environment variables validated${NC}"
+echo "  DOMAIN: $DOMAIN"
+echo "  SSL_EMAIL: $SSL_EMAIL"
 
 # Create processed config directory
 mkdir -p ./processed
@@ -90,10 +103,9 @@ fi
 
 echo -e "${GREEN}✓ No placeholder values in configs${NC}"
 
-# Update docker-compose to use processed configs
+# Start services
 echo "Starting services..."
 
-# Run docker-compose with processed configs
 docker-compose -f docker-compose.prod.yml up -d --build
 
 echo ""
@@ -106,5 +118,5 @@ echo "View logs with:"
 echo "  docker-compose -f docker-compose.prod.yml logs -f"
 echo ""
 echo "Health checks:"
-echo "  curl http://localhost:8080/healthz  # Driver"
+echo "  curl https://$DOMAIN/healthz"
 echo ""
