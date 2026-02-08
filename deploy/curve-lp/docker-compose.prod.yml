@@ -47,7 +47,7 @@ services:
 
         # Start nginx in background
         nginx &
-        NGINX_PID=$$$$!;
+        NGINX_PID=$$!;
 
         # First reload after 30s (to pick up real cert after certbot gets it)
         sleep 30 && nginx -s reload && echo "Initial reload done" &
@@ -137,7 +137,6 @@ services:
       dockerfile: Dockerfile
       target: solvers
     command: >
-      solvers
       --addr 0.0.0.0:7872
       curvelp
       --config /config/curve-lp.toml
