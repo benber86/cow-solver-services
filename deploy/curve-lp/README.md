@@ -21,14 +21,15 @@
    |---------|-------|
    | Name | `curve-lp-solver` |
    | AMI | Amazon Linux 2023 or Ubuntu 22.04 |
-   | Instance type | `t3.small` (start small, upgrade if needed) |
+   | Instance type | `t3.medium` (4 GB RAM, needed for Rust builds) |
    | Key pair | Create new or use existing |
    | Storage | 20 GB gp3 |
 
 3. **Network settings:**
    - Create new security group
    - Allow SSH (port 22) from your IP
-   - Allow port 8080 from `0.0.0.0/0` (or restrict to CoW IPs later)
+   - Allow HTTP (port 80) from `0.0.0.0/0` (for Let's Encrypt)
+   - Allow HTTPS (port 443) from `0.0.0.0/0`
 
 4. **Launch** and note the instance ID
 
@@ -44,15 +45,20 @@ aws ec2 authorize-security-group-ingress \
   --group-name curve-lp-solver-sg \
   --protocol tcp --port 22 --cidr YOUR_IP/32
 
-# Allow solver port
+# Allow HTTP (for Let's Encrypt)
 aws ec2 authorize-security-group-ingress \
   --group-name curve-lp-solver-sg \
-  --protocol tcp --port 8080 --cidr 0.0.0.0/0
+  --protocol tcp --port 80 --cidr 0.0.0.0/0
+
+# Allow HTTPS
+aws ec2 authorize-security-group-ingress \
+  --group-name curve-lp-solver-sg \
+  --protocol tcp --port 443 --cidr 0.0.0.0/0
 
 # Launch instance
 aws ec2 run-instances \
   --image-id ami-0c55b159cbfafe1f0 \
-  --instance-type t3.small \
+  --instance-type t3.medium \
   --key-name YOUR_KEY_NAME \
   --security-groups curve-lp-solver-sg \
   --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20,"VolumeType":"gp3"}}]' \
@@ -140,11 +146,15 @@ nano .env
 ```bash
 NODE_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_ACTUAL_KEY
 SOLVER_ACCOUNT=0xYOUR_ACTUAL_PRIVATE_KEY
+DOMAIN=solver.yourdomain.xyz
+SSL_EMAIL=admin@yourdomain.xyz
 ```
 
 **Important:**
 - The `SOLVER_ACCOUNT` wallet needs some ETH for gas (~0.1 ETH to start)
 - This wallet will be used to sign settlement transactions
+- `DOMAIN` must have DNS pointing to your Elastic IP before deploying
+- `SSL_EMAIL` is used for Let's Encrypt certificate notifications
 
 ---
 
@@ -158,10 +168,26 @@ cd ~/cow-solver-services/deploy/curve-lp
 ./deploy.sh
 ```
 
+**First build tip:** The Rust build is memory-intensive. Add swap before the first build:
+```bash
+sudo fallocate -l 4G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+```
+
+Use `tmux` so the build survives SSH disconnects:
+```bash
+tmux new -s deploy
+./deploy.sh
+# Ctrl+B then D to detach, reconnect with: tmux attach -t deploy
+```
+
 This will:
 1. Validate your environment variables
 2. Process config files (substitute secrets)
-3. Build and start the containers
+3. Build the solver image and start all containers (driver, solver, nginx, certbot)
+4. Automatically obtain an SSL certificate from Let's Encrypt
 
 ---
 
@@ -175,17 +201,14 @@ docker-compose -f docker-compose.prod.yml ps
 docker-compose -f docker-compose.prod.yml logs -f
 
 # Test health endpoint
-curl http://localhost:8080/healthz
-
-# Test from outside (use your Elastic IP)
-curl http://YOUR_ELASTIC_IP:8080/healthz
+curl https://YOUR_DOMAIN/healthz
 ```
 
 ---
 
 ## Step 8: Register with CoW Protocol
 
-Your solver is running at `http://YOUR_ELASTIC_IP:8080`
+Your solver is running at `https://YOUR_DOMAIN`
 
 To participate in CoW Protocol auctions, you need to:
 
@@ -194,7 +217,7 @@ To participate in CoW Protocol auctions, you need to:
    - Or their solver onboarding process
 
 2. **Provide:**
-   - Your solver endpoint: `http://YOUR_ELASTIC_IP:8080`
+   - Your solver endpoint: `https://YOUR_DOMAIN`
    - Solver name: `curve-lp` (or your choice)
    - What orders you handle: Curve LP token sells
 
@@ -237,11 +260,11 @@ docker-compose -f docker-compose.prod.yml down
 
 | Resource | Monthly Cost |
 |----------|-------------|
-| EC2 t3.small | ~$15 |
+| EC2 t3.medium | ~$30 |
 | Elastic IP | Free (when attached) |
 | Storage 20GB | ~$2 |
 | Data transfer | ~$1-5 |
-| **Total** | **~$20-25/mo** |
+| **Total** | **~$35-40/mo** |
 
 ---
 
@@ -252,25 +275,27 @@ docker-compose -f docker-compose.prod.yml down
 docker-compose -f docker-compose.prod.yml logs
 ```
 
-### Can't connect to port 8080:
-- Check security group allows 8080
-- Check `docker ps` shows containers running
-- Check firewall: `sudo iptables -L`
+### Can't connect via HTTPS:
+- Check security group allows ports 80 and 443
+- Check `docker-compose -f docker-compose.prod.yml ps` shows containers running (not `Restarting`)
+- Check DNS points to your Elastic IP: `dig YOUR_DOMAIN`
+- Check certbot logs: `docker-compose -f docker-compose.prod.yml logs certbot`
 
 ### Solver not finding routes:
 - Check Curve API is accessible: `curl https://api.curve.fi`
 - Check RPC is working: logs will show RPC errors
 
-### Out of memory:
-- Upgrade to t3.medium
-- Or add swap: `sudo fallocate -l 2G /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`
+### Out of memory during build:
+- Ensure swap is enabled: `swapon --show`
+- If no swap, add it: `sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`
+- Or upgrade to t3.large (stop instance, change type, start)
 
 ---
 
 ## Security Hardening (Optional)
 
 1. **Restrict SSH access** to your IP only
-2. **Restrict port 8080** to CoW Protocol IPs (ask them for IP ranges)
+2. **Restrict HTTPS** to CoW Protocol IPs once registered (ask them for IP ranges)
 3. **Enable CloudWatch** for log monitoring
 4. **Set up alerts** for container restarts
 5. **Use AWS Secrets Manager** instead of .env file (see AWS_SECRETS.md)
