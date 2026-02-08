@@ -3,6 +3,9 @@
 # SECRETS: This file contains NO secrets.
 # NODE_URL is injected via environment variable.
 
+# Chain ID (1 = Ethereum mainnet)
+chain-id = 1
+
 # RPC for on-chain verification (injected from environment)
 node-url = "${NODE_URL}"
 
@@ -25,7 +28,6 @@ allowed-buy-tokens = [
 # Safety settings
 slippage-bps = 100              # 1% slippage buffer
 max-quote-deviation-bps = 300   # 3% max deviation between API and on-chain quote
-gas-estimate = 500000
 
-# Curve Router (Ethereum mainnet)
-curve-router-address = "0x45312ea0eff7e09c83cbe249fa1d7598c4c8cd4e"
+# CoW Protocol Settlement contract (Ethereum mainnet)
+settlement-contract = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
