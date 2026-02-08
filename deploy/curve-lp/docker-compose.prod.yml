@@ -42,25 +42,8 @@ services:
     entrypoint: /bin/sh
     command: >
       -c '
-        # Substitute env vars in nginx config
-        envsubst "\$$DOMAIN" < /etc/nginx/nginx.template > /etc/nginx/nginx.conf;
-
-        # Start nginx in background
-        nginx &
-        NGINX_PID=$$!;
-
-        # First reload after 30s (to pick up real cert after certbot gets it)
-        sleep 30 && nginx -s reload && echo "Initial reload done" &
-
-        # Then reload every 6 hours
-        while :; do
-          sleep 6h;
-          echo "Reloading nginx configuration...";
-          nginx -s reload;
-        done &
-
-        # Wait for nginx
-        wait $$NGINX_PID
+        sed "s/\$$DOMAIN/$$DOMAIN/g" /etc/nginx/nginx.template > /etc/nginx/nginx.conf;
+        exec nginx -g "daemon off;"
       '
     logging:
       driver: "json-file"
