@@ -16,10 +16,14 @@ struct Config {
     chain_id: u64,
 
     /// Whitelisted LP tokens that this solver handles.
-    lp_tokens: Vec<eth::Address>,
+    /// Omit to accept any sell token.
+    #[serde(default)]
+    lp_tokens: Option<Vec<eth::Address>>,
 
     /// Allowed buy tokens (crvUSD + pool underlyings).
-    allowed_buy_tokens: Vec<eth::Address>,
+    /// Omit to accept any buy token.
+    #[serde(default)]
+    allowed_buy_tokens: Option<Vec<eth::Address>>,
 
     /// Curve Router API URL.
     curve_api_url: Url,

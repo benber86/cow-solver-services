@@ -319,10 +319,11 @@ async fn all_lp_tokens_to_crvusd() {
     assert_eq!(solutions.len(), 3, "expected 3 solutions for all LP tokens");
 }
 
-/// Test that non-whitelisted buy tokens are rejected.
+/// Test that the default config (no token lists) accepts any Curve-routable
+/// pair. TricryptoUSDT→DAI is routable via the Curve Router.
 #[tokio::test]
 #[ignore = "requires network access to Curve APIs and RPC node"]
-async fn rejects_non_whitelisted_buy_token() {
+async fn accepts_any_routable_pair() {
     let engine = create_solver_engine().await;
 
     let solution = engine
@@ -374,5 +375,92 @@ async fn rejects_non_whitelisted_buy_token() {
         .await;
 
     let solutions = solution["solutions"].as_array().unwrap();
-    assert_eq!(solutions.len(), 0, "should reject non-whitelisted buy token");
+    assert_eq!(
+        solutions.len(),
+        1,
+        "default config should accept any Curve-routable pair"
+    );
+}
+
+/// Test that explicit token lists still filter correctly. With allowed-buy-tokens
+/// set to only crvUSD, a TricryptoUSDT→DAI order should be rejected.
+#[tokio::test]
+#[ignore = "requires network access to Curve APIs and RPC node"]
+async fn rejects_filtered_buy_token() {
+    // Use an inline config with explicit token lists
+    let config_path = std::env::var("CURVE_LP_CONFIG")
+        .unwrap_or_else(|_| "../../configs/local/curve-lp.local.toml".to_string());
+    let base_config = tokio::fs::read_to_string(&config_path)
+        .await
+        .expect("failed to read base config");
+
+    // Append explicit token lists to restrict filtering
+    let config_with_filter = format!(
+        "{}\n\
+         lp-tokens = [\"0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4\"]\n\
+         allowed-buy-tokens = [\"0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E\"]\n",
+        base_config
+    );
+
+    let engine = tokio::time::timeout(
+        Duration::from_secs(30),
+        tests::SolverEngine::new("curvelp", tests::Config::String(config_with_filter)),
+    )
+    .await
+    .expect("solver engine failed to start within 30 seconds");
+
+    let solution = engine
+        .solve(json!({
+            "id": "1",
+            "tokens": {
+                "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4": {
+                    "decimals": 18,
+                    "symbol": "TricryptoUSDT",
+                    "availableBalance": "1000000000000000000",
+                    "trusted": true
+                },
+                "0x6B175474E89094C44Da98b954EedeAC495271d0F": {
+                    "decimals": 18,
+                    "symbol": "DAI",
+                    "availableBalance": "0",
+                    "trusted": true
+                }
+            },
+            "orders": [
+                {
+                    "uid": "0x0404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404040404",
+                    "sellToken": "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4",
+                    "buyToken": "0x6B175474E89094C44Da98b954EedeAC495271d0F",
+                    "sellAmount": "1000000000000000000",
+                    "fullSellAmount": "1000000000000000000",
+                    "buyAmount": "1",
+                    "fullBuyAmount": "1",
+                    "feePolicies": [],
+                    "validTo": 0,
+                    "kind": "sell",
+                    "owner": "0x5b1e2c2762667331bc91648052f646d1b0d35984",
+                    "partiallyFillable": false,
+                    "preInteractions": [],
+                    "postInteractions": [],
+                    "sellTokenSource": "erc20",
+                    "buyTokenDestination": "erc20",
+                    "class": "market",
+                    "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "signingScheme": "presign",
+                    "signature": "0x"
+                }
+            ],
+            "liquidity": [],
+            "effectiveGasPrice": "15000000000",
+            "deadline": "2099-01-01T00:00:00.000Z",
+            "surplusCapturingJitOrderOwners": []
+        }))
+        .await;
+
+    let solutions = solution["solutions"].as_array().unwrap();
+    assert_eq!(
+        solutions.len(),
+        0,
+        "should reject buy token not in allowed-buy-tokens"
+    );
 }

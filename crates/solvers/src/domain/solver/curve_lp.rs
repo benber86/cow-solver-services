@@ -33,9 +33,11 @@ pub struct Config {
     /// Chain ID (1 for mainnet).
     pub chain_id: u64,
     /// Whitelisted LP tokens that this solver handles.
-    pub lp_tokens: Vec<eth::Address>,
+    /// `None` means accept any sell token.
+    pub lp_tokens: Option<Vec<eth::Address>>,
     /// Allowed buy tokens (crvUSD + pool underlyings).
-    pub allowed_buy_tokens: Vec<eth::Address>,
+    /// `None` means accept any buy token.
+    pub allowed_buy_tokens: Option<Vec<eth::Address>>,
     /// Curve Router API URL.
     pub curve_api_url: Url,
     /// Curve Price API URL.
@@ -54,8 +56,8 @@ pub struct Config {
 
 struct Inner {
     chain_id: u64,
-    lp_tokens: HashSet<eth::Address>,
-    allowed_buy_tokens: HashSet<eth::Address>,
+    lp_tokens: Option<HashSet<eth::Address>>,
+    allowed_buy_tokens: Option<HashSet<eth::Address>>,
     api_client: api::Client,
     price_client: price_api::Client,
     provider: ethrpc::AlloyProvider,
@@ -80,8 +82,8 @@ impl Solver {
         Self {
             inner: Arc::new(Inner {
                 chain_id: config.chain_id,
-                lp_tokens: config.lp_tokens.into_iter().collect(),
-                allowed_buy_tokens: config.allowed_buy_tokens.into_iter().collect(),
+                lp_tokens: config.lp_tokens.map(|v| v.into_iter().collect()),
+                allowed_buy_tokens: config.allowed_buy_tokens.map(|v| v.into_iter().collect()),
                 api_client,
                 price_client,
                 provider: web3.alloy,
@@ -171,21 +173,25 @@ impl Inner {
         }
     }
 
-    /// Checks if this order is a supported LP sell order.
+    /// Checks if this order is a supported sell order.
     fn is_supported_order(&self, order: &Order) -> bool {
-        // Only handle sell orders (user selling LP tokens)
+        // Only handle sell orders
         if order.side != order::Side::Sell {
             return false;
         }
 
-        // Only handle whitelisted LP tokens
-        if !self.lp_tokens.contains(&order.sell.token.0) {
-            return false;
+        // If lp_tokens is set, only handle those sell tokens
+        if let Some(ref lp_tokens) = self.lp_tokens {
+            if !lp_tokens.contains(&order.sell.token.0) {
+                return false;
+            }
         }
 
-        // Only allow whitelisted buy tokens
-        if !self.allowed_buy_tokens.contains(&order.buy.token.0) {
-            return false;
+        // If allowed_buy_tokens is set, only allow those buy tokens
+        if let Some(ref allowed) = self.allowed_buy_tokens {
+            if !allowed.contains(&order.buy.token.0) {
+                return false;
+            }
         }
 
         true

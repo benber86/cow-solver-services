@@ -110,7 +110,46 @@ impl Client {
             .await
             .map_err(|e| Error::Parse(e.to_string()))?;
 
-        Self::parse_route(api_response, token_out, token_out_decimals)
+        Self::parse_route(api_response, token_in, token_out, token_out_decimals)
+    }
+
+    /// Validates that a constructed route matches the requested tokens.
+    fn validate_route(
+        route: &[eth::Address; 11],
+        swap_params: &[[u64; 5]; 5],
+        token_in: eth::Address,
+        token_out: eth::Address,
+    ) -> Result<(), Error> {
+        // First token in the route must be the requested sell token
+        if route[0] != token_in {
+            return Err(Error::InvalidRoute(format!(
+                "route starts with {:?} but expected sell token {:?}",
+                route[0], token_in,
+            )));
+        }
+
+        // At least one hop must exist (first swap_params row not all zeros)
+        if swap_params[0].iter().all(|&p| p == 0) {
+            return Err(Error::InvalidRoute(
+                "no hops in route (swap_params[0] is all zeros)".to_string(),
+            ));
+        }
+
+        // The last non-zero address in the route must be the requested buy token
+        let last_token = route
+            .iter()
+            .rev()
+            .find(|addr| **addr != eth::Address::ZERO)
+            .copied()
+            .unwrap_or(eth::Address::ZERO);
+        if last_token != token_out {
+            return Err(Error::InvalidRoute(format!(
+                "route ends with {:?} but expected buy token {:?}",
+                last_token, token_out,
+            )));
+        }
+
+        Ok(())
     }
 
     /// Converts a wei amount to a human-readable decimal string.
@@ -170,7 +209,8 @@ impl Client {
 
     fn parse_route(
         response: ApiResponse,
-        _token_out: eth::Address,
+        token_in: eth::Address,
+        token_out: eth::Address,
         token_out_decimals: u8,
     ) -> Result<Route, Error> {
         // Take the first route option (best route)
@@ -236,6 +276,9 @@ impl Client {
             }
         }
 
+        // Validate the constructed route
+        Self::validate_route(&route, &swap_params, token_in, token_out)?;
+
         Ok(Route {
             route,
             swap_params,
@@ -250,6 +293,7 @@ pub enum Error {
     Network(String),
     Api { status: u16, message: String },
     Parse(String),
+    InvalidRoute(String),
 }
 
 impl fmt::Display for Error {
@@ -260,6 +304,7 @@ impl fmt::Display for Error {
                 write!(f, "API error (status {}): {}", status, message)
             }
             Error::Parse(msg) => write!(f, "parse error: {}", msg),
+            Error::InvalidRoute(msg) => write!(f, "invalid route: {}", msg),
         }
     }
 }
@@ -287,8 +332,9 @@ mod tests {
             }],
         }];
 
+        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4".parse().unwrap();
         let token_out: eth::Address = "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().unwrap();
-        let route = Client::parse_route(response, token_out, 6).unwrap();
+        let route = Client::parse_route(response, token_in, token_out, 6).unwrap();
         // 1769.022968 with 6 decimals = 1769022968
         assert_eq!(route.expected_output, eth::U256::from(1_769_022_968u64));
     }
@@ -351,5 +397,91 @@ mod tests {
             Client::format_amount(eth::U256::from(1_230_000u64), 6),
             "1.23"
         );
+    }
+
+    #[test]
+    fn test_validate_route_rejects_wrong_token_in() {
+        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4".parse().unwrap();
+        let token_out: eth::Address =
+            "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().unwrap();
+        let wrong_token: eth::Address =
+            "0x0000000000000000000000000000000000000001".parse().unwrap();
+
+        let mut route = [eth::Address::ZERO; 11];
+        route[0] = wrong_token; // wrong first token
+        route[1] = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .parse()
+            .unwrap(); // pool
+        route[2] = token_out;
+
+        let swap_params = [[1, 0, 6, 30, 3], [0; 5], [0; 5], [0; 5], [0; 5]];
+
+        let result = Client::validate_route(&route, &swap_params, token_in, token_out);
+        assert!(result.is_err());
+        assert!(
+            matches!(&result.unwrap_err(), Error::InvalidRoute(msg) if msg.contains("starts with"))
+        );
+    }
+
+    #[test]
+    fn test_validate_route_rejects_wrong_token_out() {
+        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4".parse().unwrap();
+        let token_out: eth::Address =
+            "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().unwrap();
+        let wrong_token: eth::Address =
+            "0x0000000000000000000000000000000000000001".parse().unwrap();
+
+        let mut route = [eth::Address::ZERO; 11];
+        route[0] = token_in;
+        route[1] = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .parse()
+            .unwrap();
+        route[2] = wrong_token; // wrong last token
+
+        let swap_params = [[1, 0, 6, 30, 3], [0; 5], [0; 5], [0; 5], [0; 5]];
+
+        let result = Client::validate_route(&route, &swap_params, token_in, token_out);
+        assert!(result.is_err());
+        assert!(
+            matches!(&result.unwrap_err(), Error::InvalidRoute(msg) if msg.contains("ends with"))
+        );
+    }
+
+    #[test]
+    fn test_validate_route_rejects_no_hops() {
+        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4".parse().unwrap();
+        let token_out: eth::Address =
+            "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().unwrap();
+
+        let mut route = [eth::Address::ZERO; 11];
+        route[0] = token_in;
+        route[2] = token_out;
+
+        let swap_params = [[0; 5]; 5]; // all zeros = no hops
+
+        let result = Client::validate_route(&route, &swap_params, token_in, token_out);
+        assert!(result.is_err());
+        assert!(
+            matches!(&result.unwrap_err(), Error::InvalidRoute(msg) if msg.contains("no hops"))
+        );
+    }
+
+    #[test]
+    fn test_validate_route_accepts_valid_route() {
+        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4".parse().unwrap();
+        let token_out: eth::Address =
+            "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().unwrap();
+
+        let mut route = [eth::Address::ZERO; 11];
+        route[0] = token_in;
+        route[1] = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .parse()
+            .unwrap();
+        route[2] = token_out;
+
+        let swap_params = [[1, 0, 6, 30, 3], [0; 5], [0; 5], [0; 5], [0; 5]];
+
+        let result = Client::validate_route(&route, &swap_params, token_in, token_out);
+        assert!(result.is_ok());
     }
 }

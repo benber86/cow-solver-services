@@ -3,21 +3,19 @@
 
 chain-id = 1
 
-# Whitelisted LP tokens (only solve orders selling these)
-lp-tokens = [
-    "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4",  # TricryptoUSDT
-    "0xc4AD29ba4B3c580e6D59105FFf484999997675Ff",  # crv3crypto
-    "0x7F86Bf177Dd4F3494b841a37e810A34dD56c829B",  # TricryptoUSDC
-]
-
-# Allowed buy tokens (crvUSD + underlyings)
-allowed-buy-tokens = [
-    "0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E",  # crvUSD
-    "0xdAC17F958D2ee523a2206206994597C13D831ec7",  # USDT
-    "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",  # USDC
-    "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599",  # WBTC
-    "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",  # WETH
-]
+# Token filtering: omitting lp-tokens and allowed-buy-tokens means the solver
+# accepts any sell order and relies on the Curve Router API + on-chain get_dy
+# verification to determine validity.
+#
+# To restrict to specific tokens, uncomment:
+# lp-tokens = [
+#     "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4",  # TricryptoUSDT
+#     "0xc4AD29ba4B3c580e6D59105FFf484999997675Ff",  # crv3crypto
+#     "0x7F86Bf177Dd4F3494b841a37e810A34dD56c829B",  # TricryptoUSDC
+# ]
+# allowed-buy-tokens = [
+#     "0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E",  # crvUSD
+# ]
 
 # Curve Router API URL
 curve-api-url = "https://www.curve.finance/api/router/optimal-route"
