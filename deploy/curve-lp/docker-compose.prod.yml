@@ -94,10 +94,12 @@ services:
 
   driver:
     image: ghcr.io/cowprotocol/services:latest
-    command: >
-      driver
-      --config /config/driver.toml
-      --ethrpc ${NODE_URL}
+    command:
+      - driver
+      - --config
+      - /config/driver.toml
+      - --ethrpc
+      - ${NODE_URL}
     expose:
       - "11088"
     volumes:
