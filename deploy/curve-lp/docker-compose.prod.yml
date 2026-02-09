@@ -100,8 +100,8 @@ services:
       - /config/driver.toml
       - --ethrpc
       - ${NODE_URL}
-    expose:
-      - "11088"
+    ports:
+      - "127.0.0.1:11088:11088"
     volumes:
       - ./processed/driver.toml:/config/driver.toml:ro
     environment:
