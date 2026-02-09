@@ -110,16 +110,16 @@ echo "Starting services..."
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
 
-docker-compose -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.prod.yml up -d --build
 
 echo ""
 echo -e "${GREEN}=== Deployment Complete ===${NC}"
 echo ""
 echo "Services started. Check status with:"
-echo "  docker-compose -f docker-compose.prod.yml ps"
+echo "  docker compose -f docker-compose.prod.yml ps"
 echo ""
 echo "View logs with:"
-echo "  docker-compose -f docker-compose.prod.yml logs -f"
+echo "  docker compose -f docker-compose.prod.yml logs -f"
 echo ""
 echo "Health checks:"
 echo "  curl https://$DOMAIN/healthz"
