@@ -464,3 +464,71 @@ async fn rejects_filtered_buy_token() {
         "should reject buy token not in allowed-buy-tokens"
     );
 }
+
+/// Test selling crvCVXETH LP token for crvUSD.
+///
+/// Based on historical tx:
+/// https://explorer.cow.fi/tx/0x4d94ed032f01b8e2fdf85eb2411c9bb50140ac6cdeb359590059828d78b30884
+///
+/// This token was NOT in the old whitelist, validating accept-all behavior.
+#[tokio::test]
+#[ignore = "requires network access to Curve APIs and RPC node"]
+async fn crvcvxeth_to_crvusd() {
+    let engine = create_solver_engine().await;
+
+    let solution = engine
+        .solve(json!({
+            "id": "1",
+            "tokens": {
+                "0x3A283D9c08E8b55966afb64C515f5143cf907611": {
+                    "decimals": 18,
+                    "symbol": "crvCVXETH",
+                    "availableBalance": "58592602838992864786",
+                    "trusted": true
+                },
+                "0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E": {
+                    "decimals": 18,
+                    "symbol": "crvUSD",
+                    "referencePrice": "598672283383404855983005159",
+                    "availableBalance": "0",
+                    "trusted": true
+                }
+            },
+            "orders": [
+                {
+                    "uid": "0x0505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505050505",
+                    "sellToken": "0x3A283D9c08E8b55966afb64C515f5143cf907611",
+                    "buyToken": "0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E",
+                    "sellAmount": "58592602838992864786",
+                    "fullSellAmount": "58592602838992864786",
+                    "buyAmount": "500000000000000000000",
+                    "fullBuyAmount": "500000000000000000000",
+                    "feePolicies": [],
+                    "validTo": 0,
+                    "kind": "sell",
+                    "owner": "0xc0fc3ddfec95ca45a0d2393f518d3ea1ccf44f8b",
+                    "partiallyFillable": true,
+                    "preInteractions": [],
+                    "postInteractions": [],
+                    "sellTokenSource": "erc20",
+                    "buyTokenDestination": "erc20",
+                    "class": "limit",
+                    "appData": "0x058315b749613051abcbf50cf2d605b4fa4a41554ec35d73fd058fc530da559f",
+                    "signingScheme": "presign",
+                    "signature": "0x"
+                }
+            ],
+            "liquidity": [],
+            "effectiveGasPrice": "15000000000",
+            "deadline": "2099-01-01T00:00:00.000Z",
+            "surplusCapturingJitOrderOwners": []
+        }))
+        .await;
+
+    let solutions = solution["solutions"].as_array().unwrap();
+    assert_eq!(
+        solutions.len(),
+        1,
+        "expected 1 solution for crvCVXETH → crvUSD (previously not whitelisted)"
+    );
+}
