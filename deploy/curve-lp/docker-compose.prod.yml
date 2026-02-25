@@ -36,11 +36,7 @@ services:
     depends_on:
       certbot-init:
         condition: service_completed_successfully
-      driver-shadow:
-        condition: service_started
-      driver-staging:
-        condition: service_started
-      driver-prod:
+      solver:
         condition: service_started
     restart: unless-stopped
     entrypoint: /bin/sh
@@ -95,81 +91,6 @@ services:
     depends_on:
       - nginx
     restart: unless-stopped
-
-  driver-shadow:
-    image: ghcr.io/cowprotocol/services:latest
-    command:
-      - driver
-      - --config
-      - /config/driver.toml
-      - --ethrpc
-      - ${NODE_URL}
-      - --addr
-      - 0.0.0.0:11088
-    ports:
-      - "127.0.0.1:11088:11088"
-    volumes:
-      - ./processed/driver-shadow.toml:/config/driver.toml:ro
-    environment:
-      - NODE_URL=${NODE_URL}
-    depends_on:
-      - solver
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "100m"
-        max-file: "3"
-
-  driver-staging:
-    image: ghcr.io/cowprotocol/services:latest
-    command:
-      - driver
-      - --config
-      - /config/driver.toml
-      - --ethrpc
-      - ${NODE_URL}
-      - --addr
-      - 0.0.0.0:11089
-    ports:
-      - "127.0.0.1:11089:11089"
-    volumes:
-      - ./processed/driver-staging.toml:/config/driver.toml:ro
-    environment:
-      - NODE_URL=${NODE_URL}
-    depends_on:
-      - solver
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "100m"
-        max-file: "3"
-
-  driver-prod:
-    image: ghcr.io/cowprotocol/services:latest
-    command:
-      - driver
-      - --config
-      - /config/driver.toml
-      - --ethrpc
-      - ${NODE_URL}
-      - --addr
-      - 0.0.0.0:11090
-    ports:
-      - "127.0.0.1:11090:11090"
-    volumes:
-      - ./processed/driver-prod.toml:/config/driver.toml:ro
-    environment:
-      - NODE_URL=${NODE_URL}
-    depends_on:
-      - solver
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "100m"
-        max-file: "3"
 
   solver:
     build:
