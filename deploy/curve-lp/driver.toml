@@ -11,6 +11,8 @@ name = "curve-lp"
 endpoint = "http://solver:7872"
 relative-slippage = "0.01"       # 1% slippage tolerance
 absolute-slippage = "0"
+# Address assigned by CoW Protocol (they handle signing/submission)
+account = "0xc911F7C319b02155AcE70fc36811f6eD841754B3"
 merge-solutions = false
 response-size-limit-max-bytes = 30000000
 
