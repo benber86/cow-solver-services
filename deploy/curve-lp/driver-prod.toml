@@ -1,0 +1,22 @@
+# Driver configuration for Curve LP Solver — Production
+#
+# Production: CoW Protocol submits on our behalf.
+# Mempool needed for gas estimation.
+
+tx-gas-limit = "45000000"
+
+[[solver]]
+name = "curve-lp"
+endpoint = "http://solver:7872"
+relative-slippage = "0.01"       # 1% slippage tolerance
+absolute-slippage = "0"
+account = "0xA45CC5DE317F929835f30b51cFa8A3Fa310be678"
+merge-solutions = false
+response-size-limit-max-bytes = 30000000
+
+[[submission.mempool]]
+url = "${NODE_URL}"
+
+[contracts]
+gp-v2-settlement = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
+weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"

@@ -1,0 +1,20 @@
+# Driver configuration for Curve LP Solver — Shadow (dry-run)
+#
+# Shadow mode: solutions are computed but never submitted.
+# No mempool section needed since shadow never submits transactions.
+# Uses the staging address in dry-run mode (cannot sign).
+
+tx-gas-limit = "45000000"
+
+[[solver]]
+name = "curve-lp"
+endpoint = "http://solver:7872"
+relative-slippage = "0.01"       # 1% slippage tolerance
+absolute-slippage = "0"
+account = "0xc911F7C319b02155AcE70fc36811f6eD841754B3"
+merge-solutions = false
+response-size-limit-max-bytes = 30000000
+
+[contracts]
+gp-v2-settlement = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
+weth = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"

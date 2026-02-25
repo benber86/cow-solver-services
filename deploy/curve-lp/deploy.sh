@@ -77,13 +77,15 @@ mkdir -p ./processed
 # Substitute environment variables in config files
 echo "Processing config files..."
 
-envsubst < driver.toml > ./processed/driver.toml
+envsubst < driver-shadow.toml > ./processed/driver-shadow.toml
+envsubst < driver-staging.toml > ./processed/driver-staging.toml
+envsubst < driver-prod.toml > ./processed/driver-prod.toml
 envsubst < curve-lp.prod.toml > ./processed/curve-lp.toml
 
 echo -e "${GREEN}✓ Config files processed${NC}"
 
 # Verify no secrets leaked into processed files (sanity check)
-if grep -q "YOUR_API_KEY" ./processed/driver.toml ./processed/curve-lp.toml 2>/dev/null; then
+if grep -q "YOUR_API_KEY" ./processed/driver-shadow.toml ./processed/driver-staging.toml ./processed/driver-prod.toml ./processed/curve-lp.toml 2>/dev/null; then
     echo -e "${RED}ERROR: Placeholder values found in processed config${NC}"
     exit 1
 fi
