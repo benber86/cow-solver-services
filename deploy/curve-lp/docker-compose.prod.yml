@@ -106,7 +106,6 @@ services:
       - ./processed/driver.toml:/config/driver.toml:ro
     environment:
       - NODE_URL=${NODE_URL}
-      - SOLVER_ACCOUNT=${SOLVER_ACCOUNT}
     depends_on:
       - solver
     restart: unless-stopped

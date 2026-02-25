@@ -1,9 +1,8 @@
 # Driver configuration for Curve LP Solver
 #
 # SECRETS: This file contains NO secrets.
-# The following are injected via environment variables:
-#   - SOLVER_ACCOUNT: Private key for signing (set in .env or AWS Secrets Manager)
-#   - NODE_URL: RPC endpoint (set in .env or AWS Secrets Manager)
+# NODE_URL is injected via environment variable.
+# CoW Protocol's infrastructure handles transaction submission.
 
 tx-gas-limit = "45000000"
 
@@ -12,23 +11,8 @@ name = "curve-lp"
 endpoint = "http://solver:7872"
 relative-slippage = "0.01"       # 1% slippage tolerance
 absolute-slippage = "0"
-# IMPORTANT: Use envsubst or similar to inject this at deploy time
-# Or use the $SOLVER_ACCOUNT environment variable directly if driver supports it
-account = "${SOLVER_ACCOUNT}"
 merge-solutions = false
 response-size-limit-max-bytes = 30000000
-
-[submission]
-gas-price-cap = "500000000000"  # 500 gwei max
-
-# Primary mempool - uses NODE_URL from environment
-[[submission.mempool]]
-url = "${NODE_URL}"
-
-# Optional: Add Flashbots for MEV protection
-# [[submission.mempool]]
-# url = "https://rpc.flashbots.net"
-# name = "flashbots"
 
 [contracts]
 # Mainnet addresses (defaults, but explicit is better)

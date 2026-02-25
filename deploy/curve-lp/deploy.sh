@@ -32,7 +32,7 @@ source .env
 set +a
 
 # Validate required variables
-REQUIRED_VARS=("NODE_URL" "SOLVER_ACCOUNT" "DOMAIN" "SSL_EMAIL")
+REQUIRED_VARS=("NODE_URL" "DOMAIN" "SSL_EMAIL")
 MISSING_VARS=()
 
 for var in "${REQUIRED_VARS[@]}"; do
@@ -52,19 +52,6 @@ fi
 # Validate NODE_URL looks like a URL
 if [[ ! "$NODE_URL" =~ ^https?:// ]]; then
     echo -e "${RED}ERROR: NODE_URL must be a valid HTTP(S) URL${NC}"
-    exit 1
-fi
-
-# Validate SOLVER_ACCOUNT looks like a private key (64 hex chars after 0x)
-if [[ ! "$SOLVER_ACCOUNT" =~ ^0x[a-fA-F0-9]{64}$ ]]; then
-    echo -e "${RED}ERROR: SOLVER_ACCOUNT must be a valid private key (0x + 64 hex chars)${NC}"
-    exit 1
-fi
-
-# Check if it's the placeholder value
-if [ "$SOLVER_ACCOUNT" = "0x0000000000000000000000000000000000000000000000000000000000000000" ]; then
-    echo -e "${RED}ERROR: SOLVER_ACCOUNT is still the placeholder value${NC}"
-    echo "Please set your actual private key in .env"
     exit 1
 fi
 

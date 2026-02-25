@@ -160,6 +160,14 @@ impl Inner {
 
             match self.solve_order(&order, &auction.tokens, &auction.gas_price).await {
                 Ok(solution) => {
+                    tracing::info!(
+                        order_uid = %order.uid,
+                        sell_token = ?order.sell.token,
+                        buy_token = ?order.buy.token,
+                        sell_amount = %order.sell.amount,
+                        buy_amount = %order.buy.amount,
+                        "solved order"
+                    );
                     let solution = solution.with_id(solution::Id(i as u64));
                     if sender.send(solution).is_err() {
                         tracing::debug!("deadline hit, receiver dropped");
