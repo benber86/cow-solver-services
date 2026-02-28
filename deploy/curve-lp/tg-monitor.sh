@@ -3,7 +3,7 @@
 # Sends stats summaries and trade alerts to Telegram.
 #
 # Usage:
-#   # Add TG_BOT_TOKEN, TG_STATS_CHAT_ID, TG_TRADES_CHAT_ID to .env first
+#   # Add TG_BOT_TOKEN, TG_CHAT_ID to .env first
 #   nohup ./tg-monitor.sh > tg-monitor.log 2>&1 &
 
 set -euo pipefail
@@ -31,18 +31,20 @@ IDLE_REPORT_CYCLES=6  # report idle every 30 min
 idle_cycles=0
 
 send_tg() {
-    local chat_id="$1"
+    local thread_id="$1"
     local text="$2"
+    local args=(-d chat_id="$TG_CHAT_ID" -d text="$text" -d parse_mode="Markdown")
+    if [ -n "$thread_id" ]; then
+        args+=(-d message_thread_id="$thread_id")
+    fi
     curl -s -X POST \
         "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-        -d chat_id="$chat_id" \
-        -d text="$text" \
-        -d parse_mode="Markdown" \
+        "${args[@]}" \
         > /dev/null 2>&1 || true
 }
 
 # Startup message
-send_tg "$TG_STATS_CHAT_ID" "🟢 Solver monitor started"
+send_tg "$TG_STATS_THREAD" "🟢 Solver monitor started"
 
 while true; do
     sleep "$INTERVAL"
@@ -54,7 +56,7 @@ while true; do
         idle_cycles=$((idle_cycles + 1))
         if [ $((idle_cycles % IDLE_REPORT_CYCLES)) -eq 0 ]; then
             mins=$((idle_cycles * INTERVAL / 60))
-            send_tg "$TG_STATS_CHAT_ID" "💤 Solver idle — 0 auctions in last ${mins}m"
+            send_tg "$TG_STATS_THREAD" "💤 Solver idle — 0 auctions in last ${mins}m"
         fi
         continue
     fi
@@ -79,7 +81,7 @@ Order: \`${uid}\`
 Sell: \`${sell_tok}\` (${sell_amt})
 Buy: \`${buy_tok}\` (${buy_amt})
 https://explorer.cow.fi/orders/${uid}"
-        send_tg "$TG_TRADES_CHAT_ID" "$msg"
+        send_tg "$TG_TRADES_THREAD" "$msg"
     done < <(echo "$logs" | grep '"solved order"' || true)
 
     # Send stats if there was activity
@@ -90,12 +92,12 @@ Auctions: ${auctions}
 Orders: ${orders}
 Solutions: ${solutions}
 Errors: ${errors}"
-        send_tg "$TG_STATS_CHAT_ID" "$stats"
+        send_tg "$TG_STATS_THREAD" "$stats"
     else
         idle_cycles=$((idle_cycles + 1))
         if [ $((idle_cycles % IDLE_REPORT_CYCLES)) -eq 0 ]; then
             mins=$((idle_cycles * INTERVAL / 60))
-            send_tg "$TG_STATS_CHAT_ID" "💤 Solver idle — 0 auctions in last ${mins}m"
+            send_tg "$TG_STATS_THREAD" "💤 Solver idle — 0 auctions in last ${mins}m"
         fi
     fi
 done
