@@ -10,7 +10,7 @@ chain-id = 1
 node-url = "${NODE_URL}"
 
 # Curve APIs (public, no auth needed)
-curve-api-url = "https://www.curve.finance/api/router/optimal-route"
+curve-api-url = "https://www.curve.finance/api/router/v1/routes"
 curve-price-api-url = "https://prices.curve.finance/"
 
 # Token filtering: omitting lp-tokens and allowed-buy-tokens means the solver

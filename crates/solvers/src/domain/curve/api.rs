@@ -32,8 +32,8 @@ type ApiResponse = Vec<RouteOption>;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RouteOption {
-    /// Output amount as decimal string (e.g., "1769.022968")
-    amount_out: String,
+    /// Output amount in wei as string array (e.g., ["1000053518"])
+    amount_out: Vec<String>,
     /// The route steps
     route: Vec<RouteStep>,
 }
@@ -68,23 +68,19 @@ impl Client {
 
     /// Fetches the optimal route for a swap.
     ///
-    /// Note: The Curve API expects amounts in human-readable decimal format,
-    /// not wei. We convert using the token's decimals.
+    /// Note: The Curve v1 API expects amounts in wei (raw token units).
     pub async fn get_route(
         &self,
         chain_id: u64,
         token_in: eth::Address,
         token_out: eth::Address,
         amount_in: eth::U256,
-        token_in_decimals: u8,
-        token_out_decimals: u8,
+        _token_in_decimals: u8,
+        _token_out_decimals: u8,
     ) -> Result<Route, Error> {
-        // Convert wei amount to human-readable decimal string
-        let amount_str = Self::format_amount(amount_in, token_in_decimals);
-
         let url = format!(
-            "{}?chainId={}&tokenIn={:?}&tokenOut={:?}&amountIn={}",
-            self.base_url, chain_id, token_in, token_out, amount_str
+            "{}?chainId={}&tokenIn={:?}&tokenOut={:?}&amountIn={}&router=curve",
+            self.base_url, chain_id, token_in, token_out, amount_in
         );
 
         tracing::debug!(%url, "fetching Curve route");
@@ -110,7 +106,7 @@ impl Client {
             .await
             .map_err(|e| Error::Parse(e.to_string()))?;
 
-        Self::parse_route(api_response, token_in, token_out, token_out_decimals)
+        Self::parse_route(api_response, token_in, token_out)
     }
 
     /// Validates that a constructed route matches the requested tokens.
@@ -152,66 +148,10 @@ impl Client {
         Ok(())
     }
 
-    /// Converts a wei amount to a human-readable decimal string.
-    /// E.g., 1500000000000000000 with 18 decimals -> "1.5"
-    fn format_amount(amount: eth::U256, decimals: u8) -> String {
-        let divisor = eth::U256::from(10u64).pow(eth::U256::from(decimals));
-        let whole = amount / divisor;
-        let remainder = amount % divisor;
-
-        if remainder.is_zero() {
-            whole.to_string()
-        } else {
-            // Format remainder with leading zeros
-            let remainder_str = format!("{:0>width$}", remainder, width = decimals as usize);
-            // Trim trailing zeros
-            let trimmed = remainder_str.trim_end_matches('0');
-            format!("{}.{}", whole, trimmed)
-        }
-    }
-
-    /// Parses a decimal string amount to wei.
-    /// E.g., "1769.022968" with 6 decimals -> 1769022968
-    fn parse_amount(amount_str: &str, decimals: u8) -> Result<eth::U256, Error> {
-        let parts: Vec<&str> = amount_str.split('.').collect();
-        let whole: eth::U256 = parts[0]
-            .parse()
-            .map_err(|_| Error::Parse(format!("invalid whole part: {}", parts[0])))?;
-
-        let decimals_u256 = eth::U256::from(decimals);
-        let multiplier = eth::U256::from(10u64).pow(decimals_u256);
-
-        let fractional = if parts.len() > 1 {
-            let frac_str = parts[1];
-            let frac_len = frac_str.len();
-
-            if frac_len > decimals as usize {
-                // Truncate to token decimals
-                let truncated = &frac_str[..decimals as usize];
-                truncated
-                    .parse::<eth::U256>()
-                    .map_err(|_| Error::Parse(format!("invalid fractional: {}", frac_str)))?
-            } else {
-                // Pad with zeros
-                let padding = decimals as usize - frac_len;
-                let padded_multiplier = eth::U256::from(10u64).pow(eth::U256::from(padding));
-                let frac_val: eth::U256 = frac_str
-                    .parse()
-                    .map_err(|_| Error::Parse(format!("invalid fractional: {}", frac_str)))?;
-                frac_val * padded_multiplier
-            }
-        } else {
-            eth::U256::ZERO
-        };
-
-        Ok(whole * multiplier + fractional)
-    }
-
     fn parse_route(
         response: ApiResponse,
         token_in: eth::Address,
         token_out: eth::Address,
-        token_out_decimals: u8,
     ) -> Result<Route, Error> {
         // Take the first route option (best route)
         let route_option = response
@@ -219,8 +159,14 @@ impl Client {
             .next()
             .ok_or_else(|| Error::Parse("empty route response".to_string()))?;
 
-        // Parse the expected output from decimal string to wei
-        let expected_output = Self::parse_amount(&route_option.amount_out, token_out_decimals)?;
+        // Parse the expected output (wei string in array)
+        let amount_out_str = route_option
+            .amount_out
+            .first()
+            .ok_or_else(|| Error::Parse("empty amountOut array".to_string()))?;
+        let expected_output: eth::U256 = amount_out_str
+            .parse()
+            .map_err(|_| Error::Parse(format!("invalid amountOut: {}", amount_out_str)))?;
 
         // Build the route array for the contract call
         // Format: [token_in, pool, token_out, pool, token_out, ...]
@@ -317,9 +263,9 @@ mod tests {
 
     #[test]
     fn test_parse_route() {
-        // Simulate the actual API response format
+        // Simulate the v1 API response format (amounts in wei)
         let response: ApiResponse = vec![RouteOption {
-            amount_out: "1769.022968".to_string(),
+            amount_out: vec!["1769022968".to_string()],
             route: vec![RouteStep {
                 token_in: vec!["0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4".to_string()],
                 token_out: vec!["0xdAC17F958D2ee523a2206206994597C13D831ec7".to_string()],
@@ -334,69 +280,8 @@ mod tests {
 
         let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4".parse().unwrap();
         let token_out: eth::Address = "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().unwrap();
-        let route = Client::parse_route(response, token_in, token_out, 6).unwrap();
-        // 1769.022968 with 6 decimals = 1769022968
+        let route = Client::parse_route(response, token_in, token_out).unwrap();
         assert_eq!(route.expected_output, eth::U256::from(1_769_022_968u64));
-    }
-
-    #[test]
-    fn test_parse_amount() {
-        // Simple integer
-        assert_eq!(
-            Client::parse_amount("100", 6).unwrap(),
-            eth::U256::from(100_000_000u64)
-        );
-
-        // With decimals
-        assert_eq!(
-            Client::parse_amount("1769.022968", 6).unwrap(),
-            eth::U256::from(1_769_022_968u64)
-        );
-
-        // Fewer decimals than token supports
-        assert_eq!(
-            Client::parse_amount("1.5", 18).unwrap(),
-            eth::U256::from(1_500_000_000_000_000_000u128)
-        );
-    }
-
-    #[test]
-    fn test_format_amount() {
-        // 1 token with 18 decimals
-        assert_eq!(
-            Client::format_amount(eth::U256::from(1_000_000_000_000_000_000u128), 18),
-            "1"
-        );
-
-        // 1.5 tokens with 18 decimals
-        assert_eq!(
-            Client::format_amount(eth::U256::from(1_500_000_000_000_000_000u128), 18),
-            "1.5"
-        );
-
-        // 0.5 tokens with 18 decimals
-        assert_eq!(
-            Client::format_amount(eth::U256::from(500_000_000_000_000_000u128), 18),
-            "0.5"
-        );
-
-        // 5.5 tokens with 18 decimals
-        assert_eq!(
-            Client::format_amount(eth::U256::from(5_500_000_000_000_000_000u128), 18),
-            "5.5"
-        );
-
-        // 100 USDT with 6 decimals
-        assert_eq!(
-            Client::format_amount(eth::U256::from(100_000_000u64), 6),
-            "100"
-        );
-
-        // 1.23 USDT with 6 decimals
-        assert_eq!(
-            Client::format_amount(eth::U256::from(1_230_000u64), 6),
-            "1.23"
-        );
     }
 
     #[test]
