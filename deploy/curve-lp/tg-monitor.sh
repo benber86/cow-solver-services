@@ -49,15 +49,37 @@ send_tg "$TG_STATS_THREAD" "🟢 Solver monitor started"
 while true; do
     sleep "$INTERVAL"
 
-    # Grab last 5 min of solver logs
+    # Grab last 5 min of logs
     logs=$(docker compose -f "$COMPOSE_FILE" logs --since 5m solver 2>&1 || true)
+    nginx_logs=$(docker compose -f "$COMPOSE_FILE" logs --since 5m nginx 2>&1 || true)
 
-    if [ -z "$logs" ]; then
+    # Check nginx for 4xx/5xx errors
+    nginx_errors=""
+    if [ -n "$nginx_logs" ]; then
+        nginx_4xx=$(echo "$nginx_logs" | grep -cP '" [4][0-9]{2} ' || true)
+        nginx_5xx=$(echo "$nginx_logs" | grep -cP '" [5][0-9]{2} ' || true)
+        if [ "$nginx_4xx" -gt 0 ] || [ "$nginx_5xx" -gt 0 ]; then
+            # Grab the specific error codes
+            top_errors=$(echo "$nginx_logs" | grep -oP '" \K[45][0-9]{2}' | sort | uniq -c | sort -rn | head -5 || true)
+            nginx_errors="⚠️ *Nginx errors (last 5m)*
+4xx: ${nginx_4xx} | 5xx: ${nginx_5xx}
+\`\`\`
+${top_errors}
+\`\`\`"
+            send_tg "$TG_STATS_THREAD" "$nginx_errors"
+        fi
+    fi
+
+    if [ -z "$logs" ] && [ -z "$nginx_errors" ]; then
         idle_cycles=$((idle_cycles + 1))
         if [ $((idle_cycles % IDLE_REPORT_CYCLES)) -eq 0 ]; then
             mins=$((idle_cycles * INTERVAL / 60))
             send_tg "$TG_STATS_THREAD" "💤 Solver idle — 0 auctions in last ${mins}m"
         fi
+        continue
+    fi
+
+    if [ -z "$logs" ]; then
         continue
     fi
 
