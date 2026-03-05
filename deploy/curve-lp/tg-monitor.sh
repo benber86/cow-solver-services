@@ -89,7 +89,7 @@ ${top_errors}
     orders=$(echo "$logs" | grep -c "processing Curve LP order" || true)
     errors=$(echo "$logs" | grep -c "failed to solve order" || true)
 
-    # Send winning trade alerts immediately
+    # Send solution details to stats thread
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         uid=$(echo "$line" | grep -oP 'order_uid=\K\S+' || echo "???")
@@ -98,13 +98,16 @@ ${top_errors}
         sell_amt=$(echo "$line" | grep -oP 'sell_amount=\K[0-9]+' || echo "???")
         buy_amt=$(echo "$line" | grep -oP 'buy_amount=\K[0-9]+' || echo "???")
 
-        msg="🎯 *Winning Trade!*
-Order: \`${uid}\`
-Sell: \`${sell_tok}\` (${sell_amt})
-Buy: \`${buy_tok}\` (${buy_amt})
-https://explorer.cow.fi/orders/${uid}"
-        send_tg "$TG_TRADES_THREAD" "$msg"
-    done < <(echo "$logs" | grep '"solved order"' || true)
+        # Shorten addresses for readability
+        sell_short="${sell_tok:0:6}...${sell_tok: -4}"
+        buy_short="${buy_tok:0:6}...${buy_tok: -4}"
+
+        msg="✅ *Solution Submitted*
+\`${sell_short}\` → \`${buy_short}\`
+Sell: ${sell_amt} | Buy: ${buy_amt}
+[Order](https://explorer.cow.fi/orders/${uid})"
+        send_tg "$TG_STATS_THREAD" "$msg"
+    done < <(echo "$logs" | grep "solved order" || true)
 
     # Send stats if there was activity
     if [ "$auctions" -gt 0 ] || [ "$orders" -gt 0 ] || [ "$errors" -gt 0 ]; then
