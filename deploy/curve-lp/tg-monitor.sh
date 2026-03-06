@@ -26,9 +26,15 @@ TG_TRADES_THREAD=${TG_TRADES_THREAD:-3}  # Wins topic
 
 COMPOSE_FILE="docker-compose.prod.yml"
 INTERVAL=300  # 5 minutes
-IDLE_REPORT_CYCLES=6  # report idle every 30 min
+STATS_REPORT_CYCLES=12  # stats every 12 cycles (1 hour)
+IDLE_REPORT_CYCLES=6    # report idle every 30 min
 
 idle_cycles=0
+stats_cycle=0
+hourly_auctions=0
+hourly_orders=0
+hourly_solutions=0
+hourly_errors=0
 
 send_tg() {
     local thread_id="$1"
@@ -89,7 +95,7 @@ ${top_errors}
     orders=$(echo "$logs" | grep -c "processing Curve LP order" || true)
     errors=$(echo "$logs" | grep -c "failed to solve order" || true)
 
-    # Send solution details to stats thread
+    # Send solution details immediately
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         uid=$(echo "$line" | grep -oP 'order_uid=\K\S+' || echo "???")
@@ -109,20 +115,35 @@ Sell: ${sell_amt} | Buy: ${buy_amt}
         send_tg "$TG_STATS_THREAD" "$msg"
     done < <(echo "$logs" | grep "solved order" || true)
 
-    # Send stats if there was activity
-    if [ "$auctions" -gt 0 ] || [ "$orders" -gt 0 ] || [ "$errors" -gt 0 ]; then
+    # Accumulate hourly stats
+    hourly_auctions=$((hourly_auctions + auctions))
+    hourly_orders=$((hourly_orders + orders))
+    hourly_solutions=$((hourly_solutions + solutions))
+    hourly_errors=$((hourly_errors + errors))
+    stats_cycle=$((stats_cycle + 1))
+
+    # Track idle
+    if [ "$auctions" -gt 0 ] || [ "$orders" -gt 0 ]; then
         idle_cycles=0
-        stats="📊 *Solver Stats (last 5m)*
-Auctions: ${auctions}
-Orders: ${orders}
-Solutions: ${solutions}
-Errors: ${errors}"
-        send_tg "$TG_STATS_THREAD" "$stats"
     else
         idle_cycles=$((idle_cycles + 1))
         if [ $((idle_cycles % IDLE_REPORT_CYCLES)) -eq 0 ]; then
             mins=$((idle_cycles * INTERVAL / 60))
             send_tg "$TG_STATS_THREAD" "💤 Solver idle — 0 auctions in last ${mins}m"
         fi
+    fi
+
+    # Send hourly stats summary
+    if [ $((stats_cycle % STATS_REPORT_CYCLES)) -eq 0 ]; then
+        stats="📊 *Solver Stats (last 1h)*
+Auctions: ${hourly_auctions}
+Orders: ${hourly_orders}
+Solutions: ${hourly_solutions}
+Errors: ${hourly_errors}"
+        send_tg "$TG_STATS_THREAD" "$stats"
+        hourly_auctions=0
+        hourly_orders=0
+        hourly_solutions=0
+        hourly_errors=0
     fi
 done
