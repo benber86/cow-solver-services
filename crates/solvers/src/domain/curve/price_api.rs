@@ -69,9 +69,13 @@ impl Client {
             return Ok(price);
         }
 
-        // Fetch both token and WETH USD prices
-        let token_usd = self.get_usd_price_raw(chain, token).await?;
-        let weth_usd = self.get_usd_price_raw(chain, WETH_ADDRESS).await?;
+        // Fetch both token and WETH USD prices in parallel
+        let (token_usd, weth_usd) = tokio::join!(
+            self.get_usd_price_raw(chain, token),
+            self.get_usd_price_raw(chain, WETH_ADDRESS),
+        );
+        let token_usd = token_usd?;
+        let weth_usd = weth_usd?;
 
         if weth_usd <= 0.0 {
             return Err(Error::Parse("invalid WETH price".to_string()));

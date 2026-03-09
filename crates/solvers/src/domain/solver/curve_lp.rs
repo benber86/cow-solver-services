@@ -15,6 +15,7 @@ use {
         },
     },
     alloy::{primitives::U256, providers::Provider, rpc::types::TransactionRequest},
+    futures::stream::StreamExt,
     reqwest::Url,
     std::{collections::HashSet, fmt, sync::Arc},
     tracing::Instrument,
@@ -22,6 +23,9 @@ use {
 
 /// The amount of time we aim the solver to finish before the deadline.
 const DEADLINE_SLACK: chrono::Duration = chrono::Duration::milliseconds(500);
+
+/// Maximum number of orders solved concurrently (bounds network fan-out).
+const MAX_CONCURRENT_ORDERS: usize = 8;
 
 /// Curve LP token solver.
 pub struct Solver {
@@ -112,19 +116,15 @@ impl Solver {
             inner.solve(auction, sender).instrument(span).await;
         };
 
-        let handle = tokio::spawn(background_work);
+        let mut handle = tokio::spawn(background_work);
 
         // Wait for completion or timeout
-        match tokio::time::timeout(remaining, handle).await {
-            Ok(Ok(())) => {
-                // Task completed successfully
-            }
-            Ok(Err(e)) => {
-                tracing::warn!(?e, "solver task panicked");
-            }
+        match tokio::time::timeout(remaining, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(?e, "solver task panicked"),
             Err(_) => {
                 tracing::debug!("reached timeout while solving Curve LP orders");
-                // Task will be dropped/aborted when handle goes out of scope
+                handle.abort();
             }
         }
 
@@ -145,37 +145,50 @@ impl Inner {
         auction: Auction,
         sender: tokio::sync::mpsc::UnboundedSender<Solution>,
     ) {
-        for (i, order) in auction.orders.into_iter().enumerate() {
-            // Only handle LP sell orders for whitelisted tokens
-            if !self.is_supported_order(&order) {
-                continue;
-            }
+        let mut stream = futures::stream::iter(
+            auction
+                .orders
+                .into_iter()
+                .enumerate()
+                .filter(|(_, order)| self.is_supported_order(order))
+                .map(|(i, order)| {
+                    let tokens = &auction.tokens;
+                    let gas_price = &auction.gas_price;
+                    async move {
+                        tracing::debug!(
+                            order_uid = %order.uid,
+                            sell_token = ?order.sell.token,
+                            buy_token = ?order.buy.token,
+                            "processing Curve LP order"
+                        );
 
-            tracing::debug!(
-                order_uid = %order.uid,
-                sell_token = ?order.sell.token,
-                buy_token = ?order.buy.token,
-                "processing Curve LP order"
-            );
-
-            match self.solve_order(&order, &auction.tokens, &auction.gas_price).await {
-                Ok(solution) => {
-                    tracing::info!(
-                        order_uid = %order.uid,
-                        sell_token = ?order.sell.token,
-                        buy_token = ?order.buy.token,
-                        sell_amount = %order.sell.amount,
-                        buy_amount = %order.buy.amount,
-                        "solved order"
-                    );
-                    let solution = solution.with_id(solution::Id(i as u64));
-                    if sender.send(solution).is_err() {
-                        tracing::debug!("deadline hit, receiver dropped");
-                        return;
+                        match self.solve_order(&order, tokens, gas_price).await {
+                            Ok(solution) => {
+                                tracing::info!(
+                                    order_uid = %order.uid,
+                                    sell_token = ?order.sell.token,
+                                    buy_token = ?order.buy.token,
+                                    sell_amount = %order.sell.amount,
+                                    buy_amount = %order.buy.amount,
+                                    "solved order"
+                                );
+                                Some(solution.with_id(solution::Id(i as u64)))
+                            }
+                            Err(err) => {
+                                tracing::warn!(order_uid = %order.uid, ?err, "failed to solve order");
+                                None
+                            }
+                        }
                     }
-                }
-                Err(err) => {
-                    tracing::warn!(order_uid = %order.uid, ?err, "failed to solve order");
+                }),
+        )
+        .buffer_unordered(MAX_CONCURRENT_ORDERS);
+
+        while let Some(result) = stream.next().await {
+            if let Some(solution) = result {
+                if sender.send(solution).is_err() {
+                    tracing::debug!("deadline hit, receiver dropped");
+                    return;
                 }
             }
         }
@@ -222,31 +235,60 @@ impl Inner {
             .and_then(|t| t.decimals)
             .unwrap_or(18);
 
-        // 1. Query Curve API for optimal route
-        let route = self
-            .api_client
-            .get_route(
-                self.chain_id,
-                order.sell.token.0,
-                order.buy.token.0,
-                order.sell.amount,
-                sell_token_decimals,
-                buy_token_decimals,
-            )
-            .await
-            .map_err(SolveError::Api)?;
+        // 1. Query Curve API for route + on-chain verify, and fetch price in
+        //    parallel (price is only needed if auction has no reference price).
+        let route_and_verify = async {
+            let route = self
+                .api_client
+                .get_route(
+                    self.chain_id,
+                    order.sell.token.0,
+                    order.buy.token.0,
+                    order.sell.amount,
+                    sell_token_decimals,
+                    buy_token_decimals,
+                )
+                .await
+                .map_err(SolveError::Api)?;
 
-        tracing::debug!(
-            expected_output = %route.expected_output,
-            "got route from Curve API"
-        );
+            tracing::debug!(
+                expected_output = %route.expected_output,
+                "got route from Curve API"
+            );
 
-        // 2. Verify quote on-chain via get_dy
-        let onchain_output = self
-            .verify_quote_onchain(&route, order.sell.amount)
-            .await?;
+            // Fast-fail: if even the API quote with slippage can't fill the
+            // order, skip the expensive on-chain get_dy call.
+            if self.apply_slippage(route.expected_output) < order.buy.amount {
+                return Err(SolveError::InsufficientOutput {
+                    min_output: self.apply_slippage(route.expected_output),
+                    required: order.buy.amount,
+                });
+            }
 
-        // 3. Check deviation between API and on-chain quote
+            let onchain_output = self
+                .verify_quote_onchain(&route, order.sell.amount)
+                .await?;
+
+            Ok::<_, SolveError>((route, onchain_output))
+        };
+
+        let needs_price = tokens.reference_price(&order.sell.token).is_none();
+        let price_fetch = async {
+            if needs_price {
+                self.price_client
+                    .get_eth_price("ethereum", order.sell.token.0)
+                    .await
+                    .ok()
+            } else {
+                None
+            }
+        };
+
+        let (route_result, fetched_price) =
+            tokio::join!(route_and_verify, price_fetch);
+        let (route, onchain_output) = route_result?;
+
+        // 2. Check deviation between API and on-chain quote
         let deviation_bps = self.calculate_deviation_bps(route.expected_output, onchain_output);
         if deviation_bps > self.max_quote_deviation_bps {
             return Err(SolveError::QuoteDeviation {
@@ -256,10 +298,9 @@ impl Inner {
             });
         }
 
-        // 4. Apply slippage buffer to on-chain quote (more accurate)
+        // 3. Apply slippage buffer to on-chain quote (more accurate)
         let min_output = self.apply_slippage(onchain_output);
 
-        // Check if min_output satisfies order's buy amount
         if min_output < order.buy.amount {
             return Err(SolveError::InsufficientOutput {
                 min_output,
@@ -267,7 +308,7 @@ impl Inner {
             });
         }
 
-        // 5. Build solution with custom interaction
+        // 4. Build solution with custom interaction
         let interaction = interactions::build_exchange_interaction(
             &route,
             order.sell.token,
@@ -277,22 +318,14 @@ impl Inner {
             self.settlement_contract,
         );
 
-        // 6. Calculate gas estimate
-        // Curve Router swaps typically use 250k-400k gas depending on complexity
+        // 5. Calculate gas estimate
         let estimated_gas = eth::Gas(U256::from(350_000)) + self.solution_gas_offset;
 
-        // 7. Calculate fee based on gas
-        // Try auction's reference price first, fall back to Curve price API
+        // 6. Calculate fee based on gas
         let sell_token_price = match tokens.reference_price(&order.sell.token) {
             Some(price) => price,
             None => {
-                // Fetch ETH-denominated price from Curve price API
-                // (converts USD prices to wei-per-token using WETH/USD)
-                let eth_price = self
-                    .price_client
-                    .get_eth_price("ethereum", order.sell.token.0)
-                    .await
-                    .map_err(|_| SolveError::NoPriceForSellToken)?;
+                let eth_price = fetched_price.ok_or(SolveError::NoPriceForSellToken)?;
                 auction::Price(eth::Ether(eth_price))
             }
         };
