@@ -78,6 +78,7 @@ mkdir -p ./processed
 echo "Processing config files..."
 
 envsubst < curve-lp.prod.toml > ./processed/curve-lp.toml
+envsubst < curve-lp.staging.toml > ./processed/curve-lp-staging.toml
 
 echo -e "${GREEN}✓ Config files processed${NC}"
 

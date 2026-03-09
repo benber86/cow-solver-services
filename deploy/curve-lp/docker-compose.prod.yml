@@ -38,6 +38,8 @@ services:
         condition: service_completed_successfully
       solver:
         condition: service_started
+      solver-staging:
+        condition: service_started
     restart: unless-stopped
     entrypoint: /bin/sh
     command: >
@@ -105,6 +107,28 @@ services:
       - "7872"
     volumes:
       - ./processed/curve-lp.toml:/config/curve-lp.toml:ro
+    environment:
+      - NODE_URL=${NODE_URL}
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  solver-staging:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: solvers
+    command: >
+      --addr 0.0.0.0:7872
+      curvelp
+      --config /config/curve-lp-staging.toml
+    expose:
+      - "7872"
+    volumes:
+      - ./processed/curve-lp-staging.toml:/config/curve-lp-staging.toml:ro
     environment:
       - NODE_URL=${NODE_URL}
     restart: unless-stopped

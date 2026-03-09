@@ -1,0 +1,58 @@
+# Curve LP Solver - Staging Configuration
+#
+# SECRETS: This file contains NO secrets.
+# NODE_URL is injected via environment variable.
+
+# Chain ID (1 = Ethereum mainnet)
+chain-id = 1
+
+# RPC for on-chain verification (injected from environment)
+node-url = "${NODE_URL}"
+
+# Curve APIs (public, no auth needed)
+curve-api-url = "https://www.curve.finance/api/router/v1/routes"
+curve-price-api-url = "https://prices.curve.finance/"
+
+# Token filtering: keep this solver scoped to known Curve LP sell tokens.
+# Running without lp-tokens means every sell order is attempted, which can
+# cause frequent deadline timeouts.
+lp-tokens = [
+    "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4",  # TricryptoUSDT
+    "0xc4AD29ba4B3c580e6D59105FFf484999997675Ff",  # crv3crypto
+    "0x7F86Bf177Dd4F3494b841a37e810A34dD56c829B",  # TricryptoUSDC
+    "0x3A283D9c08E8b55966afb64C515f5143cf907611",  # crvCVXETH
+    "0x4eBdF703948ddCEA3B11f675B4D1Fba9d2414A14",  # TriCRV
+    "0xb85010193FD15aF8390dbD62790Da70F46c1126B",  # COIL/FRAXBP
+    "0x7ea4aD8C803653498bF6AC1D2dEbc04DCe8Fd2aD",  # TOKE/ETH
+    "0x8Bc3F1e82Ca3d63987dc12F90538c6bF818FcD0f",  # DCHF/3CRV
+    "0x8a4f252812dFF2A8636E4F7EB249d8FC2E3bd77f",  # TricryptoGHO
+    "0x5271045F7B73c17825A7A7aee6917eE46b0B7520",  # OHM/FRAXBP
+    "0x6663b6D50992ef4fc0380199397c87C2f5256075",  # ALD/ETH
+    "0xB8ac7ce449Ed72FF61dE8043d67B507f9F523Fa2",  # TriOGN
+    "0xf985005a3793DbA4cCe241B3C19ddcd3Fe069ff4",  # ALCX/FraxBP
+    "0xdD468A1DDc392dcdbEf6db6e34E89AA338F9F186",  # Mezo USD
+    "0x01Ba69727E2860b37bc1a2bd56999c1aFb4C15D8",  # ynRWAx
+    "0x9de1c3D446237ab9BaFF74127eb4F303802a2683",  # STG/FRAX-USDC
+    "0x527331F3F550f6f85ACFEcAB9Cc0889180C6f1d5",  # cvxCrv/FraxBP
+    "0x4647B6D835f3B393C7A955df51EEfcf0db961606",  # KP3R/ETH
+    "0xb79565c01b7Ae53618d9B847b9443aAf4f9011e7",  # LDO/ETH
+    "0x2889302a794dA87fBF1D6Db415C1492194663D13",  # TricryptoLLAMA
+    "0x29059568bB40344487d62f7450E78b8E6C74e0e5",  # YFI/ETH
+    "0xCb08717451aaE9EF950a2524E33B6DCaBA60147B",  # crvTETH
+    "0x2570f1bD5D2735314FC102eb12Fc1aFe9e6E7193",  # TryLSD
+    "0x6C280dB098dB673d30d5B34eC04B6387185D3620",  # CLEV/ETH
+    "0x4de2ab8177fC5fFAFB7aD11FB8BeB1e5fB95F71C",  # LPXCVX/CVX
+    "0xE8449F1495012eE18dB7Aa18cD5706b47e69627c",  # dYFI/ETH
+]
+
+# Optional buy-token filtering:
+# allowed-buy-tokens = [
+#     "0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E",  # crvUSD
+# ]
+
+# Safety settings
+slippage-bps = 100              # 1% slippage buffer
+max-quote-deviation-bps = 300   # 3% max deviation between API and on-chain quote
+
+# CoW Protocol Settlement contract (Staging)
+settlement-contract = "0xf553d092b50bdcbdded1a99af2ca29fbe5e2cb13"

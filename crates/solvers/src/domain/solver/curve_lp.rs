@@ -17,7 +17,7 @@ use {
     alloy::{primitives::U256, providers::Provider, rpc::types::TransactionRequest},
     futures::stream::StreamExt,
     reqwest::Url,
-    std::{collections::HashSet, fmt, sync::Arc},
+    std::{collections::HashSet, fmt, sync::Arc, time::Duration},
     tracing::Instrument,
 };
 
@@ -26,6 +26,12 @@ const DEADLINE_SLACK: chrono::Duration = chrono::Duration::milliseconds(500);
 
 /// Maximum number of orders solved concurrently (bounds network fan-out).
 const MAX_CONCURRENT_ORDERS: usize = 8;
+/// Maximum time spent waiting for the Curve routing API per order.
+const ROUTE_REQUEST_TIMEOUT: Duration = Duration::from_millis(2500);
+/// Maximum time spent waiting for on-chain quote verification per order.
+const ONCHAIN_VERIFY_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Maximum time spent waiting for token price fallback per order.
+const PRICE_FETCH_TIMEOUT: Duration = Duration::from_millis(1200);
 
 /// Curve LP token solver.
 pub struct Solver {
@@ -74,6 +80,19 @@ struct Inner {
 impl Solver {
     /// Creates a new Curve LP solver.
     pub async fn new(config: Config) -> Self {
+        tracing::info!(
+            lp_token_filter_count = config.lp_tokens.as_ref().map_or(0, Vec::len),
+            buy_token_filter_count = config.allowed_buy_tokens.as_ref().map_or(0, Vec::len),
+            "initialized Curve LP token filters"
+        );
+
+        if config.lp_tokens.is_none() && config.allowed_buy_tokens.is_none() {
+            tracing::warn!(
+                "Curve LP solver is running without token filters; \
+                 all sell orders will be attempted and this can cause timeouts"
+            );
+        }
+
         let api_client = api::Client::new(config.curve_api_url);
         let price_client = price_api::Client::new(config.curve_price_api_url);
         let web3 = ethrpc::web3(
@@ -107,6 +126,19 @@ impl Solver {
             .reduce(DEADLINE_SLACK)
             .remaining()
             .unwrap_or_default();
+        let total_orders = auction.orders.len();
+        let supported_orders = auction
+            .orders
+            .iter()
+            .filter(|order| self.inner.is_supported_order(order))
+            .count();
+
+        tracing::info!(
+            total_orders,
+            supported_orders,
+            remaining_ms = remaining.as_millis(),
+            "starting Curve LP solver"
+        );
 
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
 
@@ -123,7 +155,12 @@ impl Solver {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(?e, "solver task panicked"),
             Err(_) => {
-                tracing::debug!("reached timeout while solving Curve LP orders");
+                tracing::debug!(
+                    total_orders,
+                    supported_orders,
+                    remaining_ms = remaining.as_millis(),
+                    "reached timeout while solving Curve LP orders"
+                );
                 handle.abort();
             }
         }
@@ -235,19 +272,26 @@ impl Inner {
             .and_then(|t| t.decimals)
             .unwrap_or(18);
 
-        // 1. Get route from Curve API
-        let route = self
-            .api_client
-            .get_route(
+        // 1. Get route from Curve API (fail fast if upstream is slow).
+        let route = tokio::time::timeout(
+            ROUTE_REQUEST_TIMEOUT,
+            self.api_client.get_route(
                 self.chain_id,
                 order.sell.token.0,
                 order.buy.token.0,
                 order.sell.amount,
                 sell_token_decimals,
                 buy_token_decimals,
-            )
-            .await
-            .map_err(SolveError::Api)?;
+            ),
+        )
+        .await
+        .map_err(|_| {
+            SolveError::Api(api::Error::Network(format!(
+                "route request timed out after {}ms",
+                ROUTE_REQUEST_TIMEOUT.as_millis()
+            )))
+        })?
+        .map_err(SolveError::Api)?;
 
         tracing::debug!(
             expected_output = %route.expected_output,
@@ -275,18 +319,28 @@ impl Inner {
         let needs_price = tokens.reference_price(&order.sell.token).is_none();
         let price_fetch = async {
             if needs_price {
-                self.price_client
-                    .get_eth_price("ethereum", order.sell.token.0)
-                    .await
-                    .ok()
+                tokio::time::timeout(
+                    PRICE_FETCH_TIMEOUT,
+                    self.price_client.get_eth_price("ethereum", order.sell.token.0),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
             } else {
                 None
             }
         };
-        let verify = self.verify_quote_onchain(&route, order.sell.amount);
+        let verify =
+            tokio::time::timeout(ONCHAIN_VERIFY_TIMEOUT, self.verify_quote_onchain(&route, order.sell.amount));
 
         let (onchain_result, fetched_price) = tokio::join!(verify, price_fetch);
-        let onchain_output = onchain_result?;
+        let onchain_output = onchain_result
+            .map_err(|_| {
+                SolveError::OnchainVerification(format!(
+                    "verification timed out after {}ms",
+                    ONCHAIN_VERIFY_TIMEOUT.as_millis()
+                ))
+            })??;
 
         // 2. Check deviation between API and on-chain quote
         let deviation_bps = self.calculate_deviation_bps(route.expected_output, onchain_output);
