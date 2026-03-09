@@ -235,43 +235,43 @@ impl Inner {
             .and_then(|t| t.decimals)
             .unwrap_or(18);
 
-        // 1. Query Curve API for route + on-chain verify, and fetch price in
-        //    parallel (price is only needed if auction has no reference price).
-        let route_and_verify = async {
-            let route = self
-                .api_client
-                .get_route(
-                    self.chain_id,
-                    order.sell.token.0,
-                    order.buy.token.0,
-                    order.sell.amount,
-                    sell_token_decimals,
-                    buy_token_decimals,
-                )
-                .await
-                .map_err(SolveError::Api)?;
+        // 1. Get route from Curve API
+        let route = self
+            .api_client
+            .get_route(
+                self.chain_id,
+                order.sell.token.0,
+                order.buy.token.0,
+                order.sell.amount,
+                sell_token_decimals,
+                buy_token_decimals,
+            )
+            .await
+            .map_err(SolveError::Api)?;
 
-            tracing::debug!(
-                expected_output = %route.expected_output,
-                "got route from Curve API"
-            );
+        tracing::debug!(
+            expected_output = %route.expected_output,
+            "got route from Curve API"
+        );
 
-            // Fast-fail: if even the API quote with slippage can't fill the
-            // order, skip the expensive on-chain get_dy call.
-            if self.apply_slippage(route.expected_output) < order.buy.amount {
-                return Err(SolveError::InsufficientOutput {
-                    min_output: self.apply_slippage(route.expected_output),
-                    required: order.buy.amount,
-                });
-            }
+        // Fast-fail: if even the best-case API quote (allowing max deviation
+        // upward) can't fill the order after slippage, skip the expensive
+        // on-chain get_dy call.
+        let optimistic_output = route.expected_output.saturating_add(
+            route
+                .expected_output
+                .saturating_mul(U256::from(self.max_quote_deviation_bps))
+                / U256::from(10_000u32),
+        );
+        if self.apply_slippage(optimistic_output) < order.buy.amount {
+            return Err(SolveError::InsufficientOutput {
+                min_output: self.apply_slippage(optimistic_output),
+                required: order.buy.amount,
+            });
+        }
 
-            let onchain_output = self
-                .verify_quote_onchain(&route, order.sell.amount)
-                .await?;
-
-            Ok::<_, SolveError>((route, onchain_output))
-        };
-
+        // 2. Verify on-chain, fetching price in parallel (price is only
+        //    needed when the auction has no reference price for this token).
         let needs_price = tokens.reference_price(&order.sell.token).is_none();
         let price_fetch = async {
             if needs_price {
@@ -283,10 +283,10 @@ impl Inner {
                 None
             }
         };
+        let verify = self.verify_quote_onchain(&route, order.sell.amount);
 
-        let (route_result, fetched_price) =
-            tokio::join!(route_and_verify, price_fetch);
-        let (route, onchain_output) = route_result?;
+        let (onchain_result, fetched_price) = tokio::join!(verify, price_fetch);
+        let onchain_output = onchain_result?;
 
         // 2. Check deviation between API and on-chain quote
         let deviation_bps = self.calculate_deviation_bps(route.expected_output, onchain_output);
@@ -450,5 +450,161 @@ impl std::error::Error for SolveError {}
 impl From<api::Error> for SolveError {
     fn from(e: api::Error) -> Self {
         SolveError::Api(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn slippage_100bps() {
+        let inner = test_inner(100, 500);
+        let amount = U256::from(10_000u64);
+        // 1% slippage: 10000 * 9900 / 10000 = 9900
+        assert_eq!(inner.apply_slippage(amount), U256::from(9_900u64));
+    }
+
+    #[tokio::test]
+    async fn deviation_bps_symmetric() {
+        let inner = test_inner(100, 500);
+        // 5% deviation regardless of direction
+        assert_eq!(
+            inner.calculate_deviation_bps(U256::from(1050u64), U256::from(1000u64)),
+            500
+        );
+        assert_eq!(
+            inner.calculate_deviation_bps(U256::from(1000u64), U256::from(1050u64)),
+            500
+        );
+    }
+
+    #[tokio::test]
+    async fn deviation_bps_zero_inputs() {
+        let inner = test_inner(100, 500);
+        assert_eq!(
+            inner.calculate_deviation_bps(U256::ZERO, U256::from(1000u64)),
+            u32::MAX
+        );
+        assert_eq!(
+            inner.calculate_deviation_bps(U256::from(1000u64), U256::ZERO),
+            u32::MAX
+        );
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_partial_results() {
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<u32>();
+
+        let mut handle = tokio::spawn(async move {
+            for i in 0..5 {
+                sender.send(i).ok();
+                if i == 2 {
+                    // Simulate a slow order after sending 3 results
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+            }
+        });
+
+        let timeout = std::time::Duration::from_millis(50);
+        match tokio::time::timeout(timeout, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(?e, "solver task panicked"),
+            Err(_) => {
+                handle.abort();
+            }
+        }
+
+        let mut results = vec![];
+        while let Ok(val) = receiver.try_recv() {
+            results.push(val);
+        }
+
+        // Should have the 3 results sent before the sleep
+        assert_eq!(results, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn streaming_delivers_results_incrementally() {
+        use futures::stream::StreamExt;
+
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<u32>();
+
+        let mut handle = tokio::spawn(async move {
+            let futs = (0..3u32).map(|i| async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10 * (i as u64 + 1))).await;
+                i
+            });
+
+            let mut stream = futures::stream::iter(futs).buffer_unordered(8);
+
+            while let Some(val) = stream.next().await {
+                if sender.send(val).is_err() {
+                    return;
+                }
+            }
+        });
+
+        // Wait for completion (generous timeout)
+        let timeout = std::time::Duration::from_secs(2);
+        match tokio::time::timeout(timeout, &mut handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("task panicked: {:?}", e),
+            Err(_) => panic!("timed out"),
+        }
+
+        let mut results = vec![];
+        while let Ok(val) = receiver.try_recv() {
+            results.push(val);
+        }
+
+        // All 3 results should be present (order may vary due to buffer_unordered)
+        results.sort();
+        assert_eq!(results, vec![0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn receiver_drop_stops_sender() {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<u32>();
+
+        let handle = tokio::spawn(async move {
+            for i in 0..100 {
+                if sender.send(i).is_err() {
+                    return i;
+                }
+                tokio::task::yield_now().await;
+            }
+            100
+        });
+
+        // Drop receiver immediately
+        drop(receiver);
+
+        let sent = handle.await.unwrap();
+        // Task should have stopped early because receiver was dropped
+        assert!(sent < 100, "task should stop when receiver is dropped, sent {sent}");
+    }
+
+    /// Helper to build a minimal Inner for testing pure methods.
+    /// Uses dummy URLs that will never be called.
+    fn test_inner(slippage_bps: u32, max_quote_deviation_bps: u32) -> Inner {
+        Inner {
+            chain_id: 1,
+            lp_tokens: None,
+            allowed_buy_tokens: None,
+            api_client: api::Client::new("http://localhost:1".parse().unwrap()),
+            price_client: price_api::Client::new("http://localhost:1".parse().unwrap()),
+            provider: ethrpc::web3(
+                Default::default(),
+                Default::default(),
+                &"http://localhost:1".parse().unwrap(),
+                "test",
+            )
+            .alloy,
+            slippage_bps,
+            max_quote_deviation_bps,
+            solution_gas_offset: eth::SignedGas::default(),
+            settlement_contract: eth::Address::default(),
+        }
     }
 }
