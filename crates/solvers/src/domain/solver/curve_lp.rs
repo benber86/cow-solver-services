@@ -231,31 +231,43 @@ impl Inner {
         }
     }
 
-    /// Checks if this order is a supported sell order.
+    /// Checks if this order is supported (sell or buy of LP tokens).
     fn is_supported_order(&self, order: &Order) -> bool {
-        // Only handle sell orders
-        if order.side != order::Side::Sell {
-            return false;
-        }
-
-        // If lp_tokens is set, only handle those sell tokens
-        if let Some(ref lp_tokens) = self.lp_tokens {
-            if !lp_tokens.contains(&order.sell.token.0) {
-                return false;
+        match order.side {
+            order::Side::Sell => {
+                // For sell orders: sell token must be an LP token
+                if let Some(ref lp_tokens) = self.lp_tokens {
+                    if !lp_tokens.contains(&order.sell.token.0) {
+                        return false;
+                    }
+                }
+                // If allowed_buy_tokens is set, only allow those buy tokens
+                if let Some(ref allowed) = self.allowed_buy_tokens {
+                    if !allowed.contains(&order.buy.token.0) {
+                        return false;
+                    }
+                }
+                true
+            }
+            order::Side::Buy => {
+                // For buy orders: buy token must be an LP token
+                if let Some(ref lp_tokens) = self.lp_tokens {
+                    if !lp_tokens.contains(&order.buy.token.0) {
+                        return false;
+                    }
+                }
+                // If allowed_buy_tokens is set, sell token must be allowed
+                if let Some(ref allowed) = self.allowed_buy_tokens {
+                    if !allowed.contains(&order.sell.token.0) {
+                        return false;
+                    }
+                }
+                true
             }
         }
-
-        // If allowed_buy_tokens is set, only allow those buy tokens
-        if let Some(ref allowed) = self.allowed_buy_tokens {
-            if !allowed.contains(&order.buy.token.0) {
-                return false;
-            }
-        }
-
-        true
     }
 
-    /// Solves a single LP sell order.
+    /// Solves a single LP order (sell or buy).
     async fn solve_order(
         &self,
         order: &Order,
@@ -389,6 +401,14 @@ impl Inner {
             .ok_or(SolveError::FeeCalculation)?;
 
         // 8. Build the solution
+        // For sell orders, output is the slippage-adjusted amount (min_output).
+        // For buy orders, output is the exact desired buy amount — the solution
+        // framework adds the surplus fee to the sell side.
+        let output_amount = match order.side {
+            order::Side::Sell => min_output,
+            order::Side::Buy => order.buy.amount,
+        };
+
         let single = solution::Single {
             order: order.clone(),
             input: eth::Asset {
@@ -397,7 +417,7 @@ impl Inner {
             },
             output: eth::Asset {
                 token: order.buy.token,
-                amount: min_output,
+                amount: output_amount,
             },
             interactions: vec![solution::Interaction::Custom(interaction)],
             gas: estimated_gas,
