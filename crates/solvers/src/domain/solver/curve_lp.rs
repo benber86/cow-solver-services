@@ -235,15 +235,19 @@ impl Inner {
     fn is_supported_order(&self, order: &Order) -> bool {
         match order.side {
             order::Side::Sell => {
-                // For sell orders: sell token must be an LP token
+                // For sell orders: at least one side must be an LP token
                 if let Some(ref lp_tokens) = self.lp_tokens {
-                    if !lp_tokens.contains(&order.sell.token.0) {
+                    let sell_is_lp = lp_tokens.contains(&order.sell.token.0);
+                    let buy_is_lp = lp_tokens.contains(&order.buy.token.0);
+                    if !sell_is_lp && !buy_is_lp {
                         return false;
                     }
                 }
-                // If allowed_buy_tokens is set, only allow those buy tokens
+                // If allowed_buy_tokens is set, the non-LP side must be allowed
                 if let Some(ref allowed) = self.allowed_buy_tokens {
-                    if !allowed.contains(&order.buy.token.0) {
+                    if !allowed.contains(&order.buy.token.0)
+                        && !allowed.contains(&order.sell.token.0)
+                    {
                         return false;
                     }
                 }
