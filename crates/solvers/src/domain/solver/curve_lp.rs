@@ -401,19 +401,27 @@ impl Inner {
             .ok_or(SolveError::FeeCalculation)?;
 
         // 8. Build the solution
-        // For sell orders, output is the slippage-adjusted amount (min_output).
-        // For buy orders, output is the exact desired buy amount — the solution
-        // framework adds the surplus fee to the sell side.
-        let output_amount = match order.side {
-            order::Side::Sell => min_output,
-            order::Side::Buy => order.buy.amount,
+        // For sell orders: input is the full sell amount, output is slippage-adjusted.
+        // For buy orders: output is the exact desired buy amount. Input must be
+        // sell_amount minus fee, because into_solution() adds the surplus fee back
+        // to the sell side (input + fee must not exceed order.sell.amount).
+        let (input_amount, output_amount) = match order.side {
+            order::Side::Sell => (order.sell.amount, min_output),
+            order::Side::Buy => (
+                order
+                    .sell
+                    .amount
+                    .checked_sub(fee_in_sell_token)
+                    .ok_or(SolveError::FeeCalculation)?,
+                order.buy.amount,
+            ),
         };
 
         let single = solution::Single {
             order: order.clone(),
             input: eth::Asset {
                 token: order.sell.token,
-                amount: order.sell.amount,
+                amount: input_amount,
             },
             output: eth::Asset {
                 token: order.buy.token,
