@@ -95,7 +95,7 @@ ${top_errors}
     orders=$(echo "$logs" | grep -c "processing Curve LP order" || true)
     errors=$(echo "$logs" | grep -c "failed to solve order" || true)
 
-    # Send solution details immediately
+    # Send solution details for real auctions (skip quotes)
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         uid=$(echo "$line" | grep -oP 'order_uid=\K\S+' || echo "???")
@@ -112,8 +112,8 @@ ${top_errors}
 \`${sell_short}\` → \`${buy_short}\`
 Sell: ${sell_amt} | Buy: ${buy_amt}
 [Order](https://explorer.cow.fi/orders/${uid})"
-        send_tg "$TG_STATS_THREAD" "$msg"
-    done < <(echo "$logs" | grep "solved order" || true)
+        send_tg "$TG_TRADES_THREAD" "$msg"
+    done < <(echo "$logs" | grep "solved order" | grep -v "auction{id=quote}" || true)
 
     # Accumulate hourly stats
     hourly_auctions=$((hourly_auctions + auctions))
