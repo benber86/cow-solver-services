@@ -114,7 +114,7 @@ ${top_errors}
 Side: ${side} | Sell: ${sell_amt} | Output: ${buy_amt}
 [Order](https://explorer.cow.fi/orders/${uid})"
         send_tg "$TG_TRADES_THREAD" "$msg"
-    done < <(echo "$logs" | grep '"solved order"' | grep -v '"is_quote":true' || true)
+    done < <(echo "$logs" | grep '"solved order"' | grep '"is_quote":false' || true)
 
     # Accumulate hourly stats
     hourly_auctions=$((hourly_auctions + auctions))

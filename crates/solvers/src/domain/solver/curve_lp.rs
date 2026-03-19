@@ -257,6 +257,7 @@ impl Inner {
                                     sell_amount = %order.sell.amount,
                                     order_buy_min = %order.buy.amount,
                                     solution_output = %output_amount,
+                                    is_quote,
                                     "solved order"
                                 );
                                 Some((solution.with_id(solution::Id(i as u64)), order))
