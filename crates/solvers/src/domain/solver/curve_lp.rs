@@ -182,6 +182,7 @@ impl Inner {
         auction: Auction,
         sender: tokio::sync::mpsc::UnboundedSender<Solution>,
     ) {
+        let is_quote = matches!(auction.id, auction::Id::Quote);
         let mut stream = futures::stream::iter(
             auction
                 .orders
@@ -199,7 +200,7 @@ impl Inner {
                             "processing Curve LP order"
                         );
 
-                        match self.solve_order(&order, tokens, gas_price).await {
+                        match self.solve_order(&order, tokens, gas_price, is_quote).await {
                             Ok(solution) => {
                                 tracing::info!(
                                     order_uid = %order.uid,
@@ -272,11 +273,17 @@ impl Inner {
     }
 
     /// Solves a single LP order (sell or buy).
+    ///
+    /// When `is_quote` is true, skip the expensive on-chain `get_dy`
+    /// verification and use the Curve API output directly. Quotes are
+    /// not executed on-chain, so the extra safety check is unnecessary
+    /// and the ~750ms RPC call causes deadline timeouts.
     async fn solve_order(
         &self,
         order: &Order,
         tokens: &auction::Tokens,
         gas_price: &auction::GasPrice,
+        is_quote: bool,
     ) -> Result<Solution, SolveError> {
         // Get token decimals (default to 18 for LP tokens, 6 for stables)
         let sell_token_decimals = tokens
@@ -330,8 +337,7 @@ impl Inner {
             });
         }
 
-        // 2. Verify on-chain, fetching price in parallel (price is only
-        //    needed when the auction has no reference price for this token).
+        // 2. Verify on-chain (skipped for quotes to avoid deadline timeouts).
         let needs_price = tokens.reference_price(&order.sell.token).is_none();
         let price_fetch = async {
             if needs_price {
@@ -346,30 +352,46 @@ impl Inner {
                 None
             }
         };
-        let verify =
-            tokio::time::timeout(ONCHAIN_VERIFY_TIMEOUT, self.verify_quote_onchain(&route, order.sell.amount));
 
-        let (onchain_result, fetched_price) = tokio::join!(verify, price_fetch);
-        let onchain_output = onchain_result
-            .map_err(|_| {
-                SolveError::OnchainVerification(format!(
-                    "verification timed out after {}ms",
-                    ONCHAIN_VERIFY_TIMEOUT.as_millis()
-                ))
-            })??;
+        let (min_output, fetched_price) = if is_quote {
+            // For quotes, trust the Curve API output and skip on-chain
+            // verification. Apply slippage to the API estimate directly.
+            let fetched_price = price_fetch.await;
+            let min_output = self.apply_slippage(route.expected_output);
+            tracing::debug!(
+                api_output = %route.expected_output,
+                min_output = %min_output,
+                "skipping on-chain verification for quote"
+            );
+            (min_output, fetched_price)
+        } else {
+            let verify = tokio::time::timeout(
+                ONCHAIN_VERIFY_TIMEOUT,
+                self.verify_quote_onchain(&route, order.sell.amount),
+            );
 
-        // 2. Check deviation between API and on-chain quote
-        let deviation_bps = self.calculate_deviation_bps(route.expected_output, onchain_output);
-        if deviation_bps > self.max_quote_deviation_bps {
-            return Err(SolveError::QuoteDeviation {
-                api_output: route.expected_output,
-                onchain_output,
-                deviation_bps,
-            });
-        }
+            let (onchain_result, fetched_price) = tokio::join!(verify, price_fetch);
+            let onchain_output = onchain_result
+                .map_err(|_| {
+                    SolveError::OnchainVerification(format!(
+                        "verification timed out after {}ms",
+                        ONCHAIN_VERIFY_TIMEOUT.as_millis()
+                    ))
+                })??;
 
-        // 3. Apply slippage buffer to on-chain quote (more accurate)
-        let min_output = self.apply_slippage(onchain_output);
+            // Check deviation between API and on-chain quote
+            let deviation_bps =
+                self.calculate_deviation_bps(route.expected_output, onchain_output);
+            if deviation_bps > self.max_quote_deviation_bps {
+                return Err(SolveError::QuoteDeviation {
+                    api_output: route.expected_output,
+                    onchain_output,
+                    deviation_bps,
+                });
+            }
+
+            (self.apply_slippage(onchain_output), fetched_price)
+        };
 
         if min_output < order.buy.amount {
             return Err(SolveError::InsufficientOutput {
