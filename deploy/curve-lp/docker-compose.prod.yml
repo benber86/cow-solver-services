@@ -109,6 +109,7 @@ services:
       - ./processed/curve-lp.toml:/config/curve-lp.toml:ro
     environment:
       - NODE_URL=${NODE_URL}
+      - USE_JSON_LOGS=true
     restart: unless-stopped
     logging:
       driver: "json-file"
@@ -131,6 +132,7 @@ services:
       - ./processed/curve-lp-staging.toml:/config/curve-lp-staging.toml:ro
     environment:
       - NODE_URL=${NODE_URL}
+      - USE_JSON_LOGS=true
     restart: unless-stopped
     logging:
       driver: "json-file"

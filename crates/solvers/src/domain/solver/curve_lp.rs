@@ -120,6 +120,7 @@ impl Solver {
 
     /// Solves the auction, returning solutions for LP token orders.
     pub async fn solve(&self, auction: Auction) -> Vec<Solution> {
+        let start = std::time::Instant::now();
         let deadline = auction.deadline.clone();
         let remaining = deadline
             .clone()
@@ -130,8 +131,21 @@ impl Solver {
         let supported_orders = auction
             .orders
             .iter()
-            .filter(|order| self.inner.is_supported_order(order))
+            .filter(|order| self.inner.rejection_reason(order).is_none())
             .count();
+        let auction_id = auction.id;
+        let is_quote = matches!(auction.id, auction::Id::Quote);
+
+        // For quote auctions, extract token info before moving auction
+        let (quote_sell_token, quote_buy_token, quote_sell_amount) = if is_quote {
+            auction
+                .orders
+                .first()
+                .map(|o| (Some(o.sell.token), Some(o.buy.token), Some(o.sell.amount)))
+                .unwrap_or((None, None, None))
+        } else {
+            (None, None, None)
+        };
 
         tracing::info!(
             total_orders,
@@ -151,10 +165,12 @@ impl Solver {
         let mut handle = tokio::spawn(background_work);
 
         // Wait for completion or timeout
+        let mut timed_out = false;
         match tokio::time::timeout(remaining, &mut handle).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(?e, "solver task panicked"),
             Err(_) => {
+                timed_out = true;
                 tracing::debug!(
                     total_orders,
                     supported_orders,
@@ -171,7 +187,21 @@ impl Solver {
             solutions.push(solution);
         }
 
-        tracing::info!(num_solutions = solutions.len(), "Curve LP solver completed");
+        let elapsed = start.elapsed();
+        tracing::info!(
+            auction_id = %auction_id,
+            is_quote,
+            total_orders,
+            supported_orders,
+            num_solutions = solutions.len(),
+            elapsed_ms = elapsed.as_millis() as u64,
+            budget_ms = remaining.as_millis() as u64,
+            timed_out,
+            sell_token = ?quote_sell_token,
+            buy_token = ?quote_buy_token,
+            sell_amount = ?quote_sell_amount,
+            "solve_completed"
+        );
         solutions
     }
 }
@@ -183,12 +213,29 @@ impl Inner {
         sender: tokio::sync::mpsc::UnboundedSender<Solution>,
     ) {
         let is_quote = matches!(auction.id, auction::Id::Quote);
+        let mut sent_count: usize = 0;
+        let mut receiver_dropped = false;
         let mut stream = futures::stream::iter(
             auction
                 .orders
                 .into_iter()
                 .enumerate()
-                .filter(|(_, order)| self.is_supported_order(order))
+                .filter(|(_, order)| {
+                    match self.rejection_reason(order) {
+                        None => true,
+                        Some(reason) if is_quote => {
+                            tracing::debug!(
+                                order_uid = %order.uid,
+                                sell_token = ?order.sell.token,
+                                buy_token = ?order.buy.token,
+                                reason,
+                                "order not supported"
+                            );
+                            false
+                        }
+                        Some(_) => false,
+                    }
+                })
                 .map(|(i, order)| {
                     let tokens = &auction.tokens;
                     let gas_price = &auction.gas_price;
@@ -201,16 +248,18 @@ impl Inner {
                         );
 
                         match self.solve_order(&order, tokens, gas_price, is_quote).await {
-                            Ok(solution) => {
+                            Ok((solution, output_amount)) => {
                                 tracing::info!(
                                     order_uid = %order.uid,
                                     sell_token = ?order.sell.token,
                                     buy_token = ?order.buy.token,
+                                    side = ?order.side,
                                     sell_amount = %order.sell.amount,
-                                    buy_amount = %order.buy.amount,
+                                    order_buy_min = %order.buy.amount,
+                                    solution_output = %output_amount,
                                     "solved order"
                                 );
-                                Some(solution.with_id(solution::Id(i as u64)))
+                                Some((solution.with_id(solution::Id(i as u64)), order))
                             }
                             Err(err) => {
                                 tracing::warn!(order_uid = %order.uid, ?err, "failed to solve order");
@@ -223,51 +272,65 @@ impl Inner {
         .buffer_unordered(MAX_CONCURRENT_ORDERS);
 
         while let Some(result) = stream.next().await {
-            if let Some(solution) = result {
+            if let Some((solution, order)) = result {
                 if sender.send(solution).is_err() {
-                    tracing::debug!("deadline hit, receiver dropped");
-                    return;
+                    tracing::debug!(
+                        order_uid = %order.uid,
+                        sell_token = ?order.sell.token,
+                        buy_token = ?order.buy.token,
+                        is_quote,
+                        solutions_sent = sent_count,
+                        "deadline hit, receiver dropped"
+                    );
+                    receiver_dropped = true;
+                    break;
                 }
+                sent_count += 1;
             }
+        }
+
+        if receiver_dropped {
+            tracing::info!(
+                is_quote,
+                solutions_sent = sent_count,
+                "solve_inner_interrupted"
+            );
         }
     }
 
-    /// Checks if this order is supported (sell or buy of LP tokens).
-    fn is_supported_order(&self, order: &Order) -> bool {
+    /// Returns `None` if the order is supported, or a static reason string if
+    /// it should be rejected.
+    fn rejection_reason(&self, order: &Order) -> Option<&'static str> {
         match order.side {
             order::Side::Sell => {
-                // For sell orders: at least one side must be an LP token
                 if let Some(ref lp_tokens) = self.lp_tokens {
                     let sell_is_lp = lp_tokens.contains(&order.sell.token.0);
                     let buy_is_lp = lp_tokens.contains(&order.buy.token.0);
                     if !sell_is_lp && !buy_is_lp {
-                        return false;
+                        return Some("no_lp_token_match");
                     }
                 }
-                // If allowed_buy_tokens is set, the non-LP side must be allowed
                 if let Some(ref allowed) = self.allowed_buy_tokens {
                     if !allowed.contains(&order.buy.token.0)
                         && !allowed.contains(&order.sell.token.0)
                     {
-                        return false;
+                        return Some("buy_token_not_allowed");
                     }
                 }
-                true
+                None
             }
             order::Side::Buy => {
-                // For buy orders: buy token must be an LP token
                 if let Some(ref lp_tokens) = self.lp_tokens {
                     if !lp_tokens.contains(&order.buy.token.0) {
-                        return false;
+                        return Some("buy_token_not_in_lp_list");
                     }
                 }
-                // If allowed_buy_tokens is set, sell token must be allowed
                 if let Some(ref allowed) = self.allowed_buy_tokens {
                     if !allowed.contains(&order.sell.token.0) {
-                        return false;
+                        return Some("sell_token_not_allowed");
                     }
                 }
-                true
+                None
             }
         }
     }
@@ -284,7 +347,7 @@ impl Inner {
         tokens: &auction::Tokens,
         gas_price: &auction::GasPrice,
         is_quote: bool,
-    ) -> Result<Solution, SolveError> {
+    ) -> Result<(Solution, eth::U256), SolveError> {
         // Get token decimals (default to 18 for LP tokens, 6 for stables)
         let sell_token_decimals = tokens
             .get(&order.sell.token)
@@ -458,9 +521,10 @@ impl Inner {
             wrappers: order.wrappers.clone(),
         };
 
-        single
+        let solution = single
             .into_solution(eth::SellTokenAmount(fee_in_sell_token))
-            .ok_or(SolveError::SolutionConstruction)
+            .ok_or(SolveError::SolutionConstruction)?;
+        Ok((solution, output_amount))
     }
 
     /// Verifies the quote on-chain by calling Router.get_dy().
