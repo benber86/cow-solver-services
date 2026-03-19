@@ -32,6 +32,7 @@ IDLE_REPORT_CYCLES=6    # report idle every 30 min
 idle_cycles=0
 stats_cycle=0
 hourly_auctions=0
+hourly_quotes=0
 hourly_orders=0
 hourly_solutions=0
 hourly_errors=0
@@ -89,13 +90,17 @@ ${top_errors}
         continue
     fi
 
-    # Count stats (JSON log format)
-    auctions=$(echo "$logs" | grep -c '"solve_completed"' || true)
-    solutions=$(echo "$logs" | grep -oP '"num_solutions":\K[0-9]+' | awk '{s+=$1} END {print s+0}' || true)
+    # Count stats (JSON log format — exclude quotes from auction counts)
+    auctions=$(echo "$logs" | grep '"solve_completed"' | grep -c '"is_quote":false' || true)
+    quotes=$(echo "$logs" | grep '"solve_completed"' | grep -c '"is_quote":true' || true)
+    solutions=$(echo "$logs" | grep '"solve_completed"' | grep '"is_quote":false' | grep -oP '"num_solutions":\K[0-9]+' | awk '{s+=$1} END {print s+0}' || true)
     orders=$(echo "$logs" | grep -c '"processing Curve LP order"' || true)
     errors=$(echo "$logs" | grep -c '"failed to solve order"' || true)
 
-    # Send solution details for real auctions (skip quotes)
+    # Log candidate solutions for real auctions (not quotes).
+    # Note: "solved order" means the solver produced a candidate, NOT that it
+    # won the competition or was settled on-chain. The driver selects among
+    # competing solvers; we have no visibility into that outcome here.
     while IFS= read -r line; do
         [ -z "$line" ] && continue
         uid=$(echo "$line" | grep -oP '"order_uid":"\K[^"]+' || echo "???")
@@ -109,7 +114,7 @@ ${top_errors}
         sell_short="${sell_tok:0:6}...${sell_tok: -4}"
         buy_short="${buy_tok:0:6}...${buy_tok: -4}"
 
-        msg="✅ *Solution Submitted*
+        msg="🔧 *Solution Candidate*
 \`${sell_short}\` → \`${buy_short}\`
 Side: ${side} | Sell: ${sell_amt} | Output: ${buy_amt}
 [Order](https://explorer.cow.fi/orders/${uid})"
@@ -118,13 +123,14 @@ Side: ${side} | Sell: ${sell_amt} | Output: ${buy_amt}
 
     # Accumulate hourly stats
     hourly_auctions=$((hourly_auctions + auctions))
+    hourly_quotes=$((hourly_quotes + quotes))
     hourly_orders=$((hourly_orders + orders))
     hourly_solutions=$((hourly_solutions + solutions))
     hourly_errors=$((hourly_errors + errors))
     stats_cycle=$((stats_cycle + 1))
 
-    # Track idle
-    if [ "$auctions" -gt 0 ] || [ "$orders" -gt 0 ]; then
+    # Track idle (only real auctions count as activity)
+    if [ "$auctions" -gt 0 ]; then
         idle_cycles=0
     else
         idle_cycles=$((idle_cycles + 1))
@@ -138,11 +144,13 @@ Side: ${side} | Sell: ${sell_amt} | Output: ${buy_amt}
     if [ $((stats_cycle % STATS_REPORT_CYCLES)) -eq 0 ]; then
         stats="📊 *Solver Stats (last 1h)*
 Auctions: ${hourly_auctions}
-Orders: ${hourly_orders}
-Solutions: ${hourly_solutions}
+Quotes: ${hourly_quotes}
+Orders processed: ${hourly_orders}
+Solution candidates: ${hourly_solutions}
 Errors: ${hourly_errors}"
         send_tg "$TG_STATS_THREAD" "$stats"
         hourly_auctions=0
+        hourly_quotes=0
         hourly_orders=0
         hourly_solutions=0
         hourly_errors=0
