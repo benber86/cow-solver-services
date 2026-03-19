@@ -89,20 +89,21 @@ ${top_errors}
         continue
     fi
 
-    # Count stats
-    auctions=$(echo "$logs" | grep -c "Curve LP solver completed" || true)
-    solutions=$(echo "$logs" | grep -oP 'num_solutions=\K[0-9]+' | awk '{s+=$1} END {print s+0}' || true)
-    orders=$(echo "$logs" | grep -c "processing Curve LP order" || true)
-    errors=$(echo "$logs" | grep -c "failed to solve order" || true)
+    # Count stats (JSON log format)
+    auctions=$(echo "$logs" | grep -c '"solve_completed"' || true)
+    solutions=$(echo "$logs" | grep -oP '"num_solutions":\K[0-9]+' | awk '{s+=$1} END {print s+0}' || true)
+    orders=$(echo "$logs" | grep -c '"processing Curve LP order"' || true)
+    errors=$(echo "$logs" | grep -c '"failed to solve order"' || true)
 
     # Send solution details for real auctions (skip quotes)
     while IFS= read -r line; do
         [ -z "$line" ] && continue
-        uid=$(echo "$line" | grep -oP 'order_uid=\K\S+' || echo "???")
-        sell_tok=$(echo "$line" | grep -oP 'sell_token=TokenAddress\(\K0x[a-fA-F0-9]+' || echo "???")
-        buy_tok=$(echo "$line" | grep -oP 'buy_token=TokenAddress\(\K0x[a-fA-F0-9]+' || echo "???")
-        sell_amt=$(echo "$line" | grep -oP 'sell_amount=\K[0-9]+' || echo "???")
-        buy_amt=$(echo "$line" | grep -oP 'buy_amount=\K[0-9]+' || echo "???")
+        uid=$(echo "$line" | grep -oP '"order_uid":"\K[^"]+' || echo "???")
+        sell_tok=$(echo "$line" | grep -oP '"sell_token":"TokenAddress\(\K0x[a-fA-F0-9]+' || echo "???")
+        buy_tok=$(echo "$line" | grep -oP '"buy_token":"TokenAddress\(\K0x[a-fA-F0-9]+' || echo "???")
+        sell_amt=$(echo "$line" | grep -oP '"sell_amount":"\K[0-9]+' || echo "???")
+        buy_amt=$(echo "$line" | grep -oP '"solution_output":"\K[0-9]+' || echo "???")
+        side=$(echo "$line" | grep -oP '"side":"\K[^"]+' || echo "???")
 
         # Shorten addresses for readability
         sell_short="${sell_tok:0:6}...${sell_tok: -4}"
@@ -110,10 +111,10 @@ ${top_errors}
 
         msg="✅ *Solution Submitted*
 \`${sell_short}\` → \`${buy_short}\`
-Sell: ${sell_amt} | Buy: ${buy_amt}
+Side: ${side} | Sell: ${sell_amt} | Output: ${buy_amt}
 [Order](https://explorer.cow.fi/orders/${uid})"
         send_tg "$TG_TRADES_THREAD" "$msg"
-    done < <(echo "$logs" | grep "solved order" | grep -v "auction{id=quote}" || true)
+    done < <(echo "$logs" | grep '"solved order"' | grep -v '"is_quote":true' || true)
 
     # Accumulate hourly stats
     hourly_auctions=$((hourly_auctions + auctions))
