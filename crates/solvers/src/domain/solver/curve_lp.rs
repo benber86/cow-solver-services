@@ -248,7 +248,7 @@ impl Inner {
                         );
 
                         match self.solve_order(&order, tokens, gas_price, is_quote).await {
-                            Ok((solution, output_amount)) => {
+                            Ok((solution, output_amount, route_ms, price_fetch_ms)) => {
                                 tracing::info!(
                                     order_uid = %order.uid,
                                     sell_token = ?order.sell.token,
@@ -257,6 +257,8 @@ impl Inner {
                                     sell_amount = %order.sell.amount,
                                     order_buy_min = %order.buy.amount,
                                     solution_output = %output_amount,
+                                    route_ms,
+                                    price_fetch_ms,
                                     is_quote,
                                     "solved order"
                                 );
@@ -348,7 +350,7 @@ impl Inner {
         tokens: &auction::Tokens,
         gas_price: &auction::GasPrice,
         is_quote: bool,
-    ) -> Result<(Solution, eth::U256), SolveError> {
+    ) -> Result<(Solution, eth::U256, u64, u64), SolveError> {
         // Get token decimals (default to 18 for LP tokens, 6 for stables)
         let sell_token_decimals = tokens
             .get(&order.sell.token)
@@ -360,81 +362,109 @@ impl Inner {
             .unwrap_or(18);
 
         // 1. Get route from Curve API (fail fast if upstream is slow).
-        let route = tokio::time::timeout(
-            ROUTE_REQUEST_TIMEOUT,
-            self.api_client.get_route(
-                self.chain_id,
-                order.sell.token.0,
-                order.buy.token.0,
-                order.sell.amount,
-                sell_token_decimals,
-                buy_token_decimals,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            SolveError::Api(api::Error::Network(format!(
-                "route request timed out after {}ms",
-                ROUTE_REQUEST_TIMEOUT.as_millis()
-            )))
-        })?
-        .map_err(SolveError::Api)?;
+        let route_start = std::time::Instant::now();
+        let route_fut = async {
+            let result = tokio::time::timeout(
+                ROUTE_REQUEST_TIMEOUT,
+                self.api_client.get_route(
+                    self.chain_id,
+                    order.sell.token.0,
+                    order.buy.token.0,
+                    order.sell.amount,
+                    sell_token_decimals,
+                    buy_token_decimals,
+                ),
+            )
+            .await;
+            let route_ms = route_start.elapsed().as_millis() as u64;
+            (result, route_ms)
+        };
 
-        tracing::debug!(
-            expected_output = %route.expected_output,
-            "got route from Curve API"
-        );
-
-        // Fast-fail: if even the best-case API quote (allowing max deviation
-        // upward) can't fill the order after slippage, skip the expensive
-        // on-chain get_dy call.
-        let optimistic_output = route.expected_output.saturating_add(
-            route
-                .expected_output
-                .saturating_mul(U256::from(self.max_quote_deviation_bps))
-                / U256::from(10_000u32),
-        );
-        if self.apply_slippage(optimistic_output) < order.buy.amount {
-            return Err(SolveError::InsufficientOutput {
-                min_output: self.apply_slippage(optimistic_output),
-                required: order.buy.amount,
-            });
-        }
-
-        // 2. Verify on-chain (skipped for quotes to avoid deadline timeouts).
+        // Start price fetch concurrently with route — it doesn't depend on the
+        // route result and can take 200-800ms on its own.
         let needs_price = tokens.reference_price(&order.sell.token).is_none();
+        let price_start = std::time::Instant::now();
         let price_fetch = async {
             if needs_price {
-                tokio::time::timeout(
+                let result = tokio::time::timeout(
                     PRICE_FETCH_TIMEOUT,
                     self.price_client.get_eth_price("ethereum", order.sell.token.0),
                 )
                 .await
                 .ok()
-                .and_then(Result::ok)
+                .and_then(Result::ok);
+                let price_ms = price_start.elapsed().as_millis() as u64;
+                (result, price_ms)
             } else {
-                None
+                (None, 0)
             }
         };
 
-        let (min_output, fetched_price) = if is_quote {
-            // For quotes, trust the Curve API output and skip on-chain
+        let (route, min_output, fetched_price, route_ms, price_fetch_ms) = if is_quote {
+            // For quotes: run route + price fetch in parallel, skip on-chain
             // verification. Apply slippage to the API estimate directly.
-            let fetched_price = price_fetch.await;
-            let min_output = self.apply_slippage(route.expected_output);
+            let ((route_result, route_ms), (fetched_price, price_fetch_ms)) =
+                tokio::join!(route_fut, price_fetch);
+            let route = route_result
+                .map_err(|_| {
+                    SolveError::Api(api::Error::Network(format!(
+                        "route request timed out after {}ms",
+                        ROUTE_REQUEST_TIMEOUT.as_millis()
+                    )))
+                })?
+                .map_err(SolveError::Api)?;
+
             tracing::debug!(
-                api_output = %route.expected_output,
-                min_output = %min_output,
-                "skipping on-chain verification for quote"
+                expected_output = %route.expected_output,
+                route_ms,
+                price_fetch_ms,
+                "got route from Curve API (quote)"
             );
-            (min_output, fetched_price)
+
+            let min_output = self.apply_slippage(route.expected_output);
+            (route, min_output, fetched_price, route_ms, price_fetch_ms)
         } else {
+            // For real auctions: get route first (need it for on-chain verify),
+            // then run verify + price fetch in parallel.
+            let (route_result, route_ms) = route_fut.await;
+            let route = route_result
+                .map_err(|_| {
+                    SolveError::Api(api::Error::Network(format!(
+                        "route request timed out after {}ms",
+                        ROUTE_REQUEST_TIMEOUT.as_millis()
+                    )))
+                })?
+                .map_err(SolveError::Api)?;
+
+            tracing::debug!(
+                expected_output = %route.expected_output,
+                route_ms,
+                "got route from Curve API"
+            );
+
+            // Fast-fail: if even the best-case API quote (allowing max deviation
+            // upward) can't fill the order after slippage, skip the expensive
+            // on-chain get_dy call.
+            let optimistic_output = route.expected_output.saturating_add(
+                route
+                    .expected_output
+                    .saturating_mul(U256::from(self.max_quote_deviation_bps))
+                    / U256::from(10_000u32),
+            );
+            if self.apply_slippage(optimistic_output) < order.buy.amount {
+                return Err(SolveError::InsufficientOutput {
+                    min_output: self.apply_slippage(optimistic_output),
+                    required: order.buy.amount,
+                });
+            }
+
             let verify = tokio::time::timeout(
                 ONCHAIN_VERIFY_TIMEOUT,
                 self.verify_quote_onchain(&route, order.sell.amount),
             );
 
-            let (onchain_result, fetched_price) = tokio::join!(verify, price_fetch);
+            let (onchain_result, (fetched_price, price_fetch_ms)) =
+                tokio::join!(verify, price_fetch);
             let onchain_output = onchain_result
                 .map_err(|_| {
                     SolveError::OnchainVerification(format!(
@@ -454,7 +484,13 @@ impl Inner {
                 });
             }
 
-            (self.apply_slippage(onchain_output), fetched_price)
+            (
+                route,
+                self.apply_slippage(onchain_output),
+                fetched_price,
+                route_ms,
+                price_fetch_ms,
+            )
         };
 
         if min_output < order.buy.amount {
@@ -525,7 +561,7 @@ impl Inner {
         let solution = single
             .into_solution(eth::SellTokenAmount(fee_in_sell_token))
             .ok_or(SolveError::SolutionConstruction)?;
-        Ok((solution, output_amount))
+        Ok((solution, output_amount, route_ms, price_fetch_ms))
     }
 
     /// Verifies the quote on-chain by calling Router.get_dy().
