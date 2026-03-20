@@ -97,7 +97,7 @@ echo "Starting services..."
 export DOCKER_BUILDKIT=1
 export COMPOSE_DOCKER_CLI_BUILD=1
 
-docker compose -f docker-compose.prod.yml up -d --build
+docker compose -f docker-compose.prod.yml up -d --build --force-recreate
 
 echo ""
 echo -e "${GREEN}=== Deployment Complete ===${NC}"
