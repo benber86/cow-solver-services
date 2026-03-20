@@ -324,13 +324,17 @@ impl Inner {
             }
             order::Side::Buy => {
                 if let Some(ref lp_tokens) = self.lp_tokens {
-                    if !lp_tokens.contains(&order.buy.token.0) {
-                        return Some("buy_token_not_in_lp_list");
+                    let sell_is_lp = lp_tokens.contains(&order.sell.token.0);
+                    let buy_is_lp = lp_tokens.contains(&order.buy.token.0);
+                    if !sell_is_lp && !buy_is_lp {
+                        return Some("no_lp_token_match");
                     }
                 }
                 if let Some(ref allowed) = self.allowed_buy_tokens {
-                    if !allowed.contains(&order.sell.token.0) {
-                        return Some("sell_token_not_allowed");
+                    if !allowed.contains(&order.sell.token.0)
+                        && !allowed.contains(&order.buy.token.0)
+                    {
+                        return Some("buy_token_not_allowed");
                     }
                 }
                 None
