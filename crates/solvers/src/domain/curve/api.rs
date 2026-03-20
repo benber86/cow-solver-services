@@ -85,12 +85,16 @@ impl Client {
 
         tracing::debug!(%url, "fetching Curve route");
 
+        let http_start = std::time::Instant::now();
         let response = self
             .http
             .get(&url)
             .send()
             .await
             .map_err(|e| Error::Network(e.to_string()))?;
+        let http_ms = http_start.elapsed().as_millis() as u64;
+
+        tracing::debug!(http_ms, status = response.status().as_u16(), "curve API response");
 
         if !response.status().is_success() {
             let status = response.status();
