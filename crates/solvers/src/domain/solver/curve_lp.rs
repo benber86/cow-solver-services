@@ -15,6 +15,7 @@ use {
         },
     },
     alloy::{primitives::U256, providers::Provider, rpc::types::TransactionRequest},
+    alloy::primitives::address,
     futures::stream::StreamExt,
     reqwest::Url,
     std::{collections::HashSet, fmt, sync::Arc, time::Duration},
@@ -32,6 +33,12 @@ const ROUTE_REQUEST_TIMEOUT: Duration = Duration::from_millis(2500);
 const ONCHAIN_VERIFY_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Maximum time spent waiting for token price fallback per order.
 const PRICE_FETCH_TIMEOUT: Duration = Duration::from_millis(1200);
+
+// CoW native-price probe detection constants
+/// The sentinel sell_amount CoW uses for native price probes (2^144).
+const NATIVE_PRICE_SELL_SENTINEL: U256 = U256::from_limbs([0, 0, 65536, 0]);
+/// WETH address on Ethereum mainnet.
+const WETH: eth::Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
 
 /// Curve LP token solver.
 pub struct Solver {
@@ -206,6 +213,17 @@ impl Solver {
     }
 }
 
+/// Detects whether an order is a CoW native-price probe.
+///
+/// The CoW driver generates these Buy-side quote probes to discover native
+/// token prices. All five conditions must match.
+fn is_native_price_probe(order: &Order, is_quote: bool) -> bool {
+    is_quote
+        && order.side == order::Side::Buy
+        && order.sell.amount == NATIVE_PRICE_SELL_SENTINEL
+        && order.buy.token.0 == WETH
+}
+
 impl Inner {
     async fn solve(
         &self,
@@ -364,6 +382,119 @@ impl Inner {
             .get(&order.buy.token)
             .and_then(|t| t.decimals)
             .unwrap_or(18);
+
+        // Native-price probe: reverse-then-forward routing.
+        if is_native_price_probe(order, is_quote) {
+            let route_start = std::time::Instant::now();
+
+            // Step 1: Reverse route (buy_token → sell_token) to estimate sell cost
+            let reverse_route = tokio::time::timeout(
+                ROUTE_REQUEST_TIMEOUT,
+                self.api_client.get_route(
+                    self.chain_id,
+                    order.buy.token.0,
+                    order.sell.token.0,
+                    order.buy.amount,
+                    buy_token_decimals,
+                    sell_token_decimals,
+                ),
+            )
+            .await
+            .map_err(|_| {
+                SolveError::Api(api::Error::Network(format!(
+                    "reverse route timed out after {}ms",
+                    ROUTE_REQUEST_TIMEOUT.as_millis()
+                )))
+            })?
+            .map_err(SolveError::Api)?;
+
+            let reverse_output = reverse_route.expected_output;
+
+            // Step 2: Forward route with estimated sell amount + padding.
+            // Try 5% padding first, retry with 15% if forward output misses target.
+            let padding_bps_attempts = [500u32, 1500u32];
+            let mut forward_route = None;
+
+            for (attempt, &padding_bps) in padding_bps_attempts.iter().enumerate() {
+                let estimated_sell = reverse_output
+                    .saturating_mul(U256::from(10_000 + padding_bps))
+                    / U256::from(10_000u32);
+
+                let result = tokio::time::timeout(
+                    ROUTE_REQUEST_TIMEOUT,
+                    self.api_client.get_route(
+                        self.chain_id,
+                        order.sell.token.0,
+                        order.buy.token.0,
+                        estimated_sell,
+                        sell_token_decimals,
+                        buy_token_decimals,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    SolveError::Api(api::Error::Network(format!(
+                        "forward route timed out after {}ms",
+                        ROUTE_REQUEST_TIMEOUT.as_millis()
+                    )))
+                })?
+                .map_err(SolveError::Api)?;
+
+                tracing::debug!(
+                    reverse_output = %reverse_output,
+                    estimated_sell = %estimated_sell,
+                    forward_output = %result.expected_output,
+                    attempt,
+                    padding_bps,
+                    "native price probe routing"
+                );
+
+                if result.expected_output >= order.buy.amount {
+                    forward_route = Some((result, estimated_sell));
+                    break;
+                }
+            }
+
+            let (fwd_route, estimated_sell) =
+                forward_route.ok_or(SolveError::InsufficientOutput {
+                    min_output: U256::ZERO,
+                    required: order.buy.amount,
+                })?;
+
+            let route_ms = route_start.elapsed().as_millis() as u64;
+
+            // Build interaction from the FORWARD route (correct direction).
+            let interaction = interactions::build_exchange_interaction(
+                &fwd_route,
+                order.sell.token,
+                estimated_sell,
+                order.buy.token,
+                order.buy.amount,
+                self.settlement_contract,
+            );
+
+            let single = solution::Single {
+                order: order.clone(),
+                input: eth::Asset {
+                    token: order.sell.token,
+                    amount: estimated_sell,
+                },
+                output: eth::Asset {
+                    token: order.buy.token,
+                    amount: order.buy.amount,
+                },
+                interactions: vec![solution::Interaction::Custom(interaction)],
+                gas: eth::Gas(U256::from(350_000)) + self.solution_gas_offset,
+                wrappers: order.wrappers.clone(),
+            };
+
+            // Zero fee: native-price probe, not a real settlement.
+            let solution = single
+                .into_solution(eth::SellTokenAmount(U256::ZERO))
+                .ok_or(SolveError::SolutionConstruction)?;
+
+            return Ok((solution, order.buy.amount, route_ms, 0));
+        }
 
         // 1. Get route from Curve API (fail fast if upstream is slow).
         let route_start = std::time::Instant::now();
@@ -796,6 +927,52 @@ mod tests {
         let sent = handle.await.unwrap();
         // Task should have stopped early because receiver was dropped
         assert!(sent < 100, "task should stop when receiver is dropped, sent {sent}");
+    }
+
+    #[test]
+    fn test_native_price_probe_detection() {
+        let probe_order = Order {
+            uid: order::Uid([0u8; 56]),
+            sell: eth::Asset {
+                token: eth::TokenAddress(address!("ecb0f0d68c19bdaadaebe24f6752a4db34e2c2cb")),
+                amount: NATIVE_PRICE_SELL_SENTINEL,
+            },
+            buy: eth::Asset {
+                token: eth::TokenAddress(WETH),
+                amount: U256::from(100_000_000_000_000_000u128), // 0.1 ETH
+            },
+            side: order::Side::Buy,
+            class: order::Class::Market,
+            partially_fillable: false,
+            flashloan_hint: None,
+            wrappers: vec![],
+        };
+
+        // All four conditions met → true
+        assert!(is_native_price_probe(&probe_order, true));
+
+        // Different buy_amount still matches (not part of predicate)
+        let mut o = probe_order.clone();
+        o.buy.amount = U256::from(200_000_000_000_000_000u128);
+        assert!(is_native_price_probe(&o, true));
+
+        // is_quote = false → false
+        assert!(!is_native_price_probe(&probe_order, false));
+
+        // Wrong sell_amount → false
+        let mut o = probe_order.clone();
+        o.sell.amount = U256::from(1_000_000u64);
+        assert!(!is_native_price_probe(&o, true));
+
+        // Wrong buy_token (not WETH) → false
+        let mut o = probe_order.clone();
+        o.buy.token = eth::TokenAddress(address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"));
+        assert!(!is_native_price_probe(&o, true));
+
+        // Wrong side (Sell) → false
+        let mut o = probe_order.clone();
+        o.side = order::Side::Sell;
+        assert!(!is_native_price_probe(&o, true));
     }
 
     /// Helper to build a minimal Inner for testing pure methods.
