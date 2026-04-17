@@ -12,13 +12,14 @@ ARG RUSTFLAGS=""
 # Install dependencies
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked apt-get update && \
     apt-get install -y git libssl-dev pkg-config build-essential
-# Install Rust toolchain
-RUN rustup install stable && rustup default stable
 
 # Copy and Build Code
 COPY . .
+# Build with the toolchain already present in the Rust image instead of the
+# floating `stable` alias, which can trigger an in-build rustup update.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    CARGO_PROFILE_RELEASE_DEBUG=1 RUSTFLAGS="${RUSTFLAGS}" cargo build --release --bin solvers ${CARGO_BUILD_FEATURES} && \
+    TOOLCHAIN="$(rustup show active-toolchain | cut -d' ' -f1)" && \
+    CARGO_PROFILE_RELEASE_DEBUG=1 RUSTFLAGS="${RUSTFLAGS}" cargo +"${TOOLCHAIN}" build --release --bin solvers ${CARGO_BUILD_FEATURES} && \
     cp target/release/solvers /
 
 # Create an intermediate image to extract the binaries
