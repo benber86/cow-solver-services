@@ -2,6 +2,9 @@
 # This solver handles LP sell orders for specific Curve LP tokens
 
 chain-id = 1
+router-address = "0x45312ea0eFf7E09C83CBE249fa1d7598c4C8cd4e"
+wrapped-native-token = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+price-api-chain = "ethereum"
 
 # Token filtering: omitting lp-tokens and allowed-buy-tokens means the solver
 # accepts any sell order and relies on the Curve Router API + on-chain get_dy

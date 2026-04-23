@@ -1,0 +1,42 @@
+# Curve LP Token Solver Configuration — Gnosis Chain
+#
+# This solver handles LP sell orders for Curve LP tokens on Gnosis.
+# Note: the native token is xDAI, and the wrapped native is WXDAI (not WETH).
+# CoW's native-price probe on Gnosis uses WXDAI as the reference token.
+
+chain-id = 100
+router-address = "0x0DCDED3545D565bA3B19E683431381007245d983"
+wrapped-native-token = "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"
+price-api-chain = "xdai"
+
+# Token filtering: omitting lp-tokens and allowed-buy-tokens means the solver
+# accepts any sell order. Populate these once a smoke test confirms routing
+# works for the target pools.
+#
+# Candidate Gnosis LP tokens (top TVL):
+# lp-tokens = [
+#     "0x1337BedC9D22ecbe766dF105c9623922A27963EC",  # x3CRV (WXDAI/USDC/USDT)
+#     "0x845C8bc94610807fCbaB5dd2bc7aC9DAbaFf3c55",  # EURe/EURC.e
+#     "0xb5814811dC4fC2aC127A1F8Fb708460bF9Fad619",  # GNO/osGNO
+#     "0x85d62Ba914912803588FCD5A722483235B785263",  # WETH/wstETH
+#     "0x0CA1C1eC4EBf3CC67a9f545fF90a3795b318cA4a",  # EURe/x3CRV
+#     "0x0b9036F639f4E7498aFA34751a2710159373fC7B",  # USDC.e/EURe
+# ]
+
+# Curve Router API URL (chain selected via chainId query param)
+curve-api-url = "https://www.curve.finance/api/router/optimal-route"
+
+# Curve Price API (for LP token pricing)
+curve-price-api-url = "https://prices.curve.finance/"
+
+# RPC node URL for on-chain verification
+node-url = "https://gnosis-mainnet.g.alchemy.com/v2/YOUR_API_KEY"
+
+# Slippage buffer (basis points) - 1% for crypto pools
+slippage-bps = 100
+
+# Max deviation between API quote and on-chain get_dy (basis points)
+max-quote-deviation-bps = 50
+
+# CoW Protocol Settlement contract (same on all chains)
+settlement-contract = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"

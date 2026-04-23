@@ -1,17 +1,13 @@
 //! Curve Router contract interface for on-chain quote verification.
+//!
+//! The router address is per-chain and supplied by the caller
+//! (see `ChainConfig::router_address`). This module only owns the ABI + encode/decode.
 
 use {
     crate::domain::{curve::api::Route, eth},
-    alloy::{
-        primitives::{Address, U256},
-        sol,
-        sol_types::SolCall,
-    },
+    alloy::{primitives::U256, sol, sol_types::SolCall},
     std::fmt,
 };
-
-/// Curve Router contract address on mainnet (v1.2).
-pub const ROUTER_ADDRESS: Address = alloy::primitives::address!("45312ea0eFf7E09C83CBE249fa1d7598c4C8cd4e");
 
 // Define the Curve Router contract interface using alloy's sol! macro
 sol! {
@@ -97,7 +93,7 @@ impl std::error::Error for DecodeError {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {super::*, alloy::primitives::Address};
 
     #[test]
     fn test_encode_get_dy() {

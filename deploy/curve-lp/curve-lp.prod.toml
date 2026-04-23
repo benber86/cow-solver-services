@@ -5,6 +5,9 @@
 
 # Chain ID (1 = Ethereum mainnet)
 chain-id = 1
+router-address = "0x45312ea0eFf7E09C83CBE249fa1d7598c4C8cd4e"
+wrapped-native-token = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+price-api-chain = "ethereum"
 
 # RPC for on-chain verification (injected from environment)
 node-url = "${NODE_URL}"

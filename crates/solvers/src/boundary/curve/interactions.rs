@@ -1,10 +1,8 @@
 //! Build CustomInteraction for Curve Router exchange calls.
 
-use {
-    crate::{
-        boundary::curve::router::{self, ROUTER_ADDRESS},
-        domain::{curve::api::Route, eth, solution},
-    },
+use crate::{
+    boundary::curve::router,
+    domain::{curve::api::Route, eth, solution},
 };
 
 /// Builds a CustomInteraction for executing a swap through the Curve Router.
@@ -15,11 +13,12 @@ pub fn build_exchange_interaction(
     buy_token: eth::TokenAddress,
     min_output: eth::U256,
     receiver: eth::Address,
+    router_address: eth::Address,
 ) -> solution::CustomInteraction {
     let calldata = router::encode_exchange(route, sell_amount, min_output, receiver);
 
     solution::CustomInteraction {
-        target: ROUTER_ADDRESS,
+        target: router_address,
         value: eth::Ether(eth::U256::ZERO),
         calldata,
         internalize: false,
@@ -32,7 +31,7 @@ pub fn build_exchange_interaction(
             amount: min_output,
         }],
         allowances: vec![solution::Allowance {
-            spender: ROUTER_ADDRESS,
+            spender: router_address,
             asset: eth::Asset {
                 token: sell_token,
                 amount: sell_amount,
@@ -58,6 +57,7 @@ mod tests {
         let sell_token = eth::TokenAddress(Address::repeat_byte(1));
         let buy_token = eth::TokenAddress(Address::repeat_byte(2));
         let receiver = Address::repeat_byte(3);
+        let router_address = Address::repeat_byte(4);
 
         let interaction = build_exchange_interaction(
             &route,
@@ -66,13 +66,15 @@ mod tests {
             buy_token,
             eth::U256::from(990u64),
             receiver,
+            router_address,
         );
 
-        assert_eq!(interaction.target, ROUTER_ADDRESS);
+        assert_eq!(interaction.target, router_address);
         assert_eq!(interaction.inputs.len(), 1);
         assert_eq!(interaction.outputs.len(), 1);
         assert_eq!(interaction.allowances.len(), 1);
         assert_eq!(interaction.inputs[0].token, sell_token);
         assert_eq!(interaction.outputs[0].token, buy_token);
+        assert_eq!(interaction.allowances[0].spender, router_address);
     }
 }

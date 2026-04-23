@@ -12,10 +12,6 @@ use {
     },
 };
 
-/// WETH address on Ethereum mainnet.
-const WETH_ADDRESS: eth::Address =
-    alloy::primitives::address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
-
 /// Curve Price API client.
 pub struct Client {
     http: reqwest::Client,
@@ -57,46 +53,50 @@ impl Client {
         }
     }
 
-    /// Fetches the ETH-denominated price for a token.
-    /// Returns price as U256 representing wei needed to buy 10^18 of the token.
-    /// This is compatible with `auction::Price`.
+    /// Fetches the native-token-denominated price for `token`.
+    /// Returns price as U256 representing wrapped-native wei needed to buy
+    /// 10^18 of the token. This is compatible with `auction::Price`.
+    ///
+    /// `chain` is the Curve Price API chain slug ("ethereum" | "arbitrum" | "xdai").
+    /// `wrapped_native` is the pivot token: WETH on Ethereum/Arbitrum, WXDAI on Gnosis.
     pub async fn get_eth_price(
         &self,
         chain: &str,
+        wrapped_native: eth::Address,
         token: eth::Address,
     ) -> Result<eth::U256, Error> {
         if let Some(price) = self.cached_price(token) {
             return Ok(price);
         }
 
-        // Fetch both token and WETH USD prices in parallel
-        let (token_usd, weth_usd) = tokio::join!(
+        // Fetch both token and wrapped-native USD prices in parallel.
+        let (token_usd, native_usd) = tokio::join!(
             self.get_usd_price_raw(chain, token),
-            self.get_usd_price_raw(chain, WETH_ADDRESS),
+            self.get_usd_price_raw(chain, wrapped_native),
         );
         let token_usd = token_usd?;
-        let weth_usd = weth_usd?;
+        let native_usd = native_usd?;
 
-        if weth_usd <= 0.0 {
-            return Err(Error::Parse("invalid WETH price".to_string()));
+        if native_usd <= 0.0 {
+            return Err(Error::Parse("invalid wrapped-native price".to_string()));
         }
 
-        // Convert: eth_price = (token_usd / weth_usd) * 10^18
-        // This gives us wei needed to buy 10^18 of the token
-        let eth_price = (token_usd / weth_usd) * 1e18;
+        // Convert: native_price = (token_usd / native_usd) * 10^18
+        // This gives us wei of the wrapped native needed to buy 10^18 of the token.
+        let native_price = (token_usd / native_usd) * 1e18;
 
-        if !eth_price.is_finite() || eth_price <= 0.0 {
+        if !native_price.is_finite() || native_price <= 0.0 {
             return Err(Error::Parse(format!(
-                "invalid ETH price calculation: token_usd={}, weth_usd={}",
-                token_usd, weth_usd
+                "invalid native price calculation: token_usd={}, native_usd={}",
+                token_usd, native_usd
             )));
         }
 
-        if eth_price >= 2.0_f64.powi(128) {
+        if native_price >= 2.0_f64.powi(128) {
             return Err(Error::Parse("price overflow".to_string()));
         }
 
-        let as_u256 = eth::U256::from(eth_price as u128);
+        let as_u256 = eth::U256::from(native_price as u128);
         self.insert_cache(token, as_u256);
         Ok(as_u256)
     }

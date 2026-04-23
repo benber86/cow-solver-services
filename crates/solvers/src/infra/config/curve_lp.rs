@@ -1,7 +1,10 @@
 //! Configuration for the Curve LP solver.
 
 use {
-    crate::domain::{eth, solver::curve_lp},
+    crate::domain::{
+        eth,
+        solver::curve_lp::{self, ChainConfig, CurvePriceApiChain},
+    },
     reqwest::Url,
     serde::Deserialize,
     shared::price_estimation::gas::SETTLEMENT_OVERHEAD,
@@ -12,8 +15,20 @@ use {
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct Config {
-    /// Chain ID (1 for mainnet).
+    /// Chain ID (1 for mainnet, 100 for Gnosis, 42161 for Arbitrum).
     chain_id: u64,
+
+    /// Curve router contract address (per-chain; see curve-router-ng).
+    router_address: eth::Address,
+
+    /// Wrapped native token address (WETH on Ethereum/Arbitrum, WXDAI on Gnosis).
+    /// Not validated against a canonical deployment; the solver trusts the
+    /// config so forks / test deployments can override.
+    wrapped_native_token: eth::Address,
+
+    /// Curve Price API chain slug. Note: Curve uses "arbitrum" (not Coingecko's
+    /// "arbitrum-one") and "xdai" for Gnosis.
+    price_api_chain: CurvePriceApiChain,
 
     /// Whitelisted LP tokens that this solver handles.
     /// Omit to accept any sell token.
@@ -46,7 +61,9 @@ struct Config {
     #[serde(default = "default_gas_offset")]
     solution_gas_offset: i64,
 
-    /// Settlement contract address.
+    /// Settlement contract address. Not validated against a canonical
+    /// deployment; the solver trusts the config so forks / test deployments
+    /// can override.
     settlement_contract: eth::Address,
 }
 
@@ -83,8 +100,18 @@ pub async fn load(path: &Path) -> curve_lp::Config {
         }
     });
 
-    curve_lp::Config {
+    let chain = ChainConfig {
         chain_id: config.chain_id,
+        router_address: config.router_address,
+        wrapped_native_token: config.wrapped_native_token,
+        price_api_chain: config.price_api_chain,
+        settlement_contract: config.settlement_contract,
+    }
+    .validated()
+    .unwrap_or_else(|e| panic!("invalid chain config in {path:?}: {e}"));
+
+    curve_lp::Config {
+        chain,
         lp_tokens: config.lp_tokens,
         allowed_buy_tokens: config.allowed_buy_tokens,
         curve_api_url: config.curve_api_url,
@@ -93,6 +120,65 @@ pub async fn load(path: &Path) -> curve_lp::Config {
         slippage_bps: config.slippage_bps,
         max_quote_deviation_bps: config.max_quote_deviation_bps,
         solution_gas_offset: config.solution_gas_offset.into(),
-        settlement_contract: config.settlement_contract,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parses a TOML string (substituting in a dummy value for any
+    /// `${NODE_URL}`) and runs it through the same validation pipeline as
+    /// `load`. Catches shape / missing-field / validation errors without
+    /// needing a filesystem or env setup.
+    fn parse_and_validate(raw_toml: &str) -> Result<ChainConfig, String> {
+        let substituted = raw_toml.replace("${NODE_URL}", "https://dummy.invalid/");
+        let parsed: Config = toml::de::from_str(&substituted)
+            .map_err(|e| format!("parse error: {e:#?}"))?;
+        ChainConfig {
+            chain_id: parsed.chain_id,
+            router_address: parsed.router_address,
+            wrapped_native_token: parsed.wrapped_native_token,
+            price_api_chain: parsed.price_api_chain,
+            settlement_contract: parsed.settlement_contract,
+        }
+        .validated()
+        .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn example_mainnet_config_is_valid() {
+        let raw = include_str!("../../../config/example.curve-lp.toml");
+        parse_and_validate(raw).expect("mainnet example should parse and validate");
+    }
+
+    #[test]
+    fn example_arbitrum_config_is_valid() {
+        let raw = include_str!("../../../config/example.curve-lp.arbitrum.toml");
+        parse_and_validate(raw).expect("arbitrum example should parse and validate");
+    }
+
+    #[test]
+    fn example_gnosis_config_is_valid() {
+        let raw = include_str!("../../../config/example.curve-lp.gnosis.toml");
+        parse_and_validate(raw).expect("gnosis example should parse and validate");
+    }
+
+    #[test]
+    fn local_config_is_valid() {
+        let raw = include_str!("../../../../../configs/local/curve-lp.local.toml");
+        parse_and_validate(raw).expect("local config should parse and validate");
+    }
+
+    #[test]
+    fn prod_config_is_valid() {
+        let raw = include_str!("../../../../../deploy/curve-lp/curve-lp.prod.toml");
+        parse_and_validate(raw).expect("prod config should parse and validate");
+    }
+
+    #[test]
+    fn staging_config_is_valid() {
+        let raw = include_str!("../../../../../deploy/curve-lp/curve-lp.staging.toml");
+        parse_and_validate(raw).expect("staging config should parse and validate");
     }
 }

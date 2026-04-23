@@ -15,9 +15,9 @@ use {
         },
     },
     alloy::{primitives::U256, providers::Provider, rpc::types::TransactionRequest},
-    alloy::primitives::address,
     futures::stream::StreamExt,
     reqwest::Url,
+    serde::Deserialize,
     std::{collections::HashSet, fmt, sync::Arc, time::Duration},
     tracing::Instrument,
 };
@@ -37,8 +37,105 @@ const PRICE_FETCH_TIMEOUT: Duration = Duration::from_millis(1200);
 // CoW native-price probe detection constants
 /// The sentinel sell_amount CoW uses for native price probes (2^144).
 const NATIVE_PRICE_SELL_SENTINEL: U256 = U256::from_limbs([0, 0, 65536, 0]);
-/// WETH address on Ethereum mainnet.
-const WETH: eth::Address = address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+
+/// Curve Price API chain slug used in the URL path.
+///
+/// Distinct from other chain mappings in the codebase: Coingecko, for example,
+/// uses `arbitrum-one` where Curve uses `arbitrum`. Do not share slugs across
+/// APIs.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum CurvePriceApiChain {
+    Ethereum,
+    Arbitrum,
+    Xdai,
+}
+
+impl CurvePriceApiChain {
+    pub fn as_slug(self) -> &'static str {
+        match self {
+            Self::Ethereum => "ethereum",
+            Self::Arbitrum => "arbitrum",
+            Self::Xdai => "xdai",
+        }
+    }
+}
+
+/// Chain-scoped configuration. All values here are specific to the chain the
+/// solver is running against and are validated together in
+/// [`ChainConfig::validated`].
+#[derive(Debug, Clone)]
+pub struct ChainConfig {
+    pub chain_id: u64,
+    pub router_address: eth::Address,
+    pub wrapped_native_token: eth::Address,
+    pub price_api_chain: CurvePriceApiChain,
+    pub settlement_contract: eth::Address,
+}
+
+#[derive(Debug)]
+pub enum ChainConfigError {
+    UnsupportedChain(u64),
+    PriceApiChainMismatch {
+        chain_id: u64,
+        slug: &'static str,
+    },
+    ZeroRouterAddress,
+}
+
+impl fmt::Display for ChainConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedChain(id) => {
+                write!(f, "unsupported chain_id {id}; expected one of 1, 100, 42161")
+            }
+            Self::PriceApiChainMismatch { chain_id, slug } => write!(
+                f,
+                "price_api_chain {slug} does not match chain_id {chain_id}"
+            ),
+            Self::ZeroRouterAddress => write!(
+                f,
+                "router_address must be a non-zero 20-byte address"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ChainConfigError {}
+
+impl ChainConfig {
+    /// Validates internal consistency of the TOML:
+    /// - `chain_id` is one we support
+    /// - `price_api_chain` matches `chain_id` (it's the dual of chain_id for
+    ///   the Curve Price API's URL scheme, so mismatch is always a bug)
+    /// - `router_address` is non-zero (cheap typo / empty-string guard)
+    ///
+    /// Does **not** validate `wrapped_native_token` or `settlement_contract`
+    /// against canonical on-chain deployments — the solver trusts its config
+    /// for those, so forks / test deployments can override without patching
+    /// code.
+    pub fn validated(self) -> Result<Self, ChainConfigError> {
+        let expected_slug = match self.chain_id {
+            1 => CurvePriceApiChain::Ethereum,
+            42161 => CurvePriceApiChain::Arbitrum,
+            100 => CurvePriceApiChain::Xdai,
+            _ => return Err(ChainConfigError::UnsupportedChain(self.chain_id)),
+        };
+
+        if self.price_api_chain != expected_slug {
+            return Err(ChainConfigError::PriceApiChainMismatch {
+                chain_id: self.chain_id,
+                slug: self.price_api_chain.as_slug(),
+            });
+        }
+
+        if self.router_address == eth::Address::default() {
+            return Err(ChainConfigError::ZeroRouterAddress);
+        }
+
+        Ok(self)
+    }
+}
 
 /// Curve LP token solver.
 pub struct Solver {
@@ -47,8 +144,7 @@ pub struct Solver {
 
 /// Configuration for the Curve LP solver.
 pub struct Config {
-    /// Chain ID (1 for mainnet).
-    pub chain_id: u64,
+    pub chain: ChainConfig,
     /// Whitelisted LP tokens that this solver handles.
     /// `None` means accept any sell token.
     pub lp_tokens: Option<Vec<eth::Address>>,
@@ -67,12 +163,10 @@ pub struct Config {
     pub max_quote_deviation_bps: u32,
     /// Gas offset for solution gas estimation.
     pub solution_gas_offset: eth::SignedGas,
-    /// The settlement contract address (receiver for swaps).
-    pub settlement_contract: eth::Address,
 }
 
 struct Inner {
-    chain_id: u64,
+    chain: ChainConfig,
     lp_tokens: Option<HashSet<eth::Address>>,
     allowed_buy_tokens: Option<HashSet<eth::Address>>,
     api_client: api::Client,
@@ -81,7 +175,6 @@ struct Inner {
     slippage_bps: u32,
     max_quote_deviation_bps: u32,
     solution_gas_offset: eth::SignedGas,
-    settlement_contract: eth::Address,
 }
 
 impl Solver {
@@ -111,7 +204,7 @@ impl Solver {
 
         Self {
             inner: Arc::new(Inner {
-                chain_id: config.chain_id,
+                chain: config.chain,
                 lp_tokens: config.lp_tokens.map(|v| v.into_iter().collect()),
                 allowed_buy_tokens: config.allowed_buy_tokens.map(|v| v.into_iter().collect()),
                 api_client,
@@ -120,7 +213,6 @@ impl Solver {
                 slippage_bps: config.slippage_bps,
                 max_quote_deviation_bps: config.max_quote_deviation_bps,
                 solution_gas_offset: config.solution_gas_offset,
-                settlement_contract: config.settlement_contract,
             }),
         }
     }
@@ -216,12 +308,13 @@ impl Solver {
 /// Detects whether an order is a CoW native-price probe.
 ///
 /// The CoW driver generates these Buy-side quote probes to discover native
-/// token prices. All five conditions must match.
-fn is_native_price_probe(order: &Order, is_quote: bool) -> bool {
+/// token prices. All four conditions must match. `wrapped_native` is the
+/// chain's wrapped native token (WETH on Ethereum/Arbitrum, WXDAI on Gnosis).
+fn is_native_price_probe(order: &Order, is_quote: bool, wrapped_native: eth::Address) -> bool {
     is_quote
         && order.side == order::Side::Buy
         && order.sell.amount == NATIVE_PRICE_SELL_SENTINEL
-        && order.buy.token.0 == WETH
+        && order.buy.token.0 == wrapped_native
 }
 
 impl Inner {
@@ -384,14 +477,14 @@ impl Inner {
             .unwrap_or(18);
 
         // Native-price probe: reverse-then-forward routing.
-        if is_native_price_probe(order, is_quote) {
+        if is_native_price_probe(order, is_quote, self.chain.wrapped_native_token) {
             let route_start = std::time::Instant::now();
 
             // Step 1: Reverse route (buy_token → sell_token) to estimate sell cost
             let reverse_route = tokio::time::timeout(
                 ROUTE_REQUEST_TIMEOUT,
                 self.api_client.get_route(
-                    self.chain_id,
+                    self.chain.chain_id,
                     order.buy.token.0,
                     order.sell.token.0,
                     order.buy.amount,
@@ -423,7 +516,7 @@ impl Inner {
                 let result = tokio::time::timeout(
                     ROUTE_REQUEST_TIMEOUT,
                     self.api_client.get_route(
-                        self.chain_id,
+                        self.chain.chain_id,
                         order.sell.token.0,
                         order.buy.token.0,
                         estimated_sell,
@@ -470,7 +563,8 @@ impl Inner {
                 estimated_sell,
                 order.buy.token,
                 order.buy.amount,
-                self.settlement_contract,
+                self.chain.settlement_contract,
+                self.chain.router_address,
             );
 
             let single = solution::Single {
@@ -502,7 +596,7 @@ impl Inner {
             let result = tokio::time::timeout(
                 ROUTE_REQUEST_TIMEOUT,
                 self.api_client.get_route(
-                    self.chain_id,
+                    self.chain.chain_id,
                     order.sell.token.0,
                     order.buy.token.0,
                     order.sell.amount,
@@ -523,7 +617,11 @@ impl Inner {
             if needs_price {
                 let result = tokio::time::timeout(
                     PRICE_FETCH_TIMEOUT,
-                    self.price_client.get_eth_price("ethereum", order.sell.token.0),
+                    self.price_client.get_eth_price(
+                        self.chain.price_api_chain.as_slug(),
+                        self.chain.wrapped_native_token,
+                        order.sell.token.0,
+                    ),
                 )
                 .await
                 .ok()
@@ -642,7 +740,8 @@ impl Inner {
             order.sell.amount,
             order.buy.token,
             min_output,
-            self.settlement_contract,
+            self.chain.settlement_contract,
+            self.chain.router_address,
         );
 
         // 5. Calculate gas estimate
@@ -708,7 +807,7 @@ impl Inner {
         let calldata = router::encode_get_dy(route, amount);
 
         let tx = TransactionRequest::default()
-            .to(router::ROUTER_ADDRESS)
+            .to(self.chain.router_address)
             .input(calldata.into());
 
         let result = self
@@ -929,57 +1028,89 @@ mod tests {
         assert!(sent < 100, "task should stop when receiver is dropped, sent {sent}");
     }
 
-    #[test]
-    fn test_native_price_probe_detection() {
-        let probe_order = Order {
+    const WETH_MAINNET: eth::Address =
+        alloy::primitives::address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+    const WXDAI_GNOSIS: eth::Address =
+        alloy::primitives::address!("e91D153E0b41518A2Ce8Dd3D7944Fa863463a97d");
+
+    fn probe_order_with_buy_token(buy_token: eth::Address) -> Order {
+        Order {
             uid: order::Uid([0u8; 56]),
             sell: eth::Asset {
-                token: eth::TokenAddress(address!("ecb0f0d68c19bdaadaebe24f6752a4db34e2c2cb")),
+                token: eth::TokenAddress(alloy::primitives::address!(
+                    "ecb0f0d68c19bdaadaebe24f6752a4db34e2c2cb"
+                )),
                 amount: NATIVE_PRICE_SELL_SENTINEL,
             },
             buy: eth::Asset {
-                token: eth::TokenAddress(WETH),
-                amount: U256::from(100_000_000_000_000_000u128), // 0.1 ETH
+                token: eth::TokenAddress(buy_token),
+                amount: U256::from(100_000_000_000_000_000u128),
             },
             side: order::Side::Buy,
             class: order::Class::Market,
             partially_fillable: false,
             flashloan_hint: None,
             wrappers: vec![],
-        };
+        }
+    }
 
-        // All four conditions met → true
-        assert!(is_native_price_probe(&probe_order, true));
+    #[test]
+    fn test_native_price_probe_detection_ethereum() {
+        let probe_order = probe_order_with_buy_token(WETH_MAINNET);
 
-        // Different buy_amount still matches (not part of predicate)
+        assert!(is_native_price_probe(&probe_order, true, WETH_MAINNET));
+
         let mut o = probe_order.clone();
         o.buy.amount = U256::from(200_000_000_000_000_000u128);
-        assert!(is_native_price_probe(&o, true));
+        assert!(is_native_price_probe(&o, true, WETH_MAINNET));
 
-        // is_quote = false → false
-        assert!(!is_native_price_probe(&probe_order, false));
+        assert!(!is_native_price_probe(&probe_order, false, WETH_MAINNET));
 
-        // Wrong sell_amount → false
         let mut o = probe_order.clone();
         o.sell.amount = U256::from(1_000_000u64);
-        assert!(!is_native_price_probe(&o, true));
+        assert!(!is_native_price_probe(&o, true, WETH_MAINNET));
 
-        // Wrong buy_token (not WETH) → false
         let mut o = probe_order.clone();
-        o.buy.token = eth::TokenAddress(address!("a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"));
-        assert!(!is_native_price_probe(&o, true));
+        o.buy.token = eth::TokenAddress(alloy::primitives::address!(
+            "a0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+        ));
+        assert!(!is_native_price_probe(&o, true, WETH_MAINNET));
 
-        // Wrong side (Sell) → false
         let mut o = probe_order.clone();
         o.side = order::Side::Sell;
-        assert!(!is_native_price_probe(&o, true));
+        assert!(!is_native_price_probe(&o, true, WETH_MAINNET));
+    }
+
+    #[test]
+    fn test_native_price_probe_detection_gnosis() {
+        // On Gnosis, the probe buys WXDAI (not WETH).
+        let probe_order = probe_order_with_buy_token(WXDAI_GNOSIS);
+        assert!(is_native_price_probe(&probe_order, true, WXDAI_GNOSIS));
+
+        // A mainnet probe (buy=WETH) on a Gnosis-configured solver is not a probe.
+        let weth_probe = probe_order_with_buy_token(WETH_MAINNET);
+        assert!(!is_native_price_probe(&weth_probe, true, WXDAI_GNOSIS));
+    }
+
+    fn test_chain_config() -> ChainConfig {
+        ChainConfig {
+            chain_id: 1,
+            router_address: alloy::primitives::address!(
+                "45312ea0eFf7E09C83CBE249fa1d7598c4C8cd4e"
+            ),
+            wrapped_native_token: WETH_MAINNET,
+            price_api_chain: CurvePriceApiChain::Ethereum,
+            settlement_contract: alloy::primitives::address!(
+                "9008D19f58AAbD9eD0D60971565AA8510560ab41"
+            ),
+        }
     }
 
     /// Helper to build a minimal Inner for testing pure methods.
     /// Uses dummy URLs that will never be called.
     fn test_inner(slippage_bps: u32, max_quote_deviation_bps: u32) -> Inner {
         Inner {
-            chain_id: 1,
+            chain: test_chain_config(),
             lp_tokens: None,
             allowed_buy_tokens: None,
             api_client: api::Client::new("http://localhost:1".parse().unwrap()),
@@ -994,7 +1125,128 @@ mod tests {
             slippage_bps,
             max_quote_deviation_bps,
             solution_gas_offset: eth::SignedGas::default(),
-            settlement_contract: eth::Address::default(),
         }
+    }
+
+    #[test]
+    fn chain_config_validates_mainnet() {
+        test_chain_config().validated().expect("mainnet valid");
+    }
+
+    #[test]
+    fn chain_config_validates_arbitrum() {
+        ChainConfig {
+            chain_id: 42161,
+            router_address: alloy::primitives::address!(
+                "2191718CD32d02B8E60BAdFFeA33E4B5DD9A0A0D"
+            ),
+            wrapped_native_token: alloy::primitives::address!(
+                "82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+            ),
+            price_api_chain: CurvePriceApiChain::Arbitrum,
+            settlement_contract: alloy::primitives::address!(
+                "9008D19f58AAbD9eD0D60971565AA8510560ab41"
+            ),
+        }
+        .validated()
+        .expect("arbitrum valid");
+    }
+
+    #[test]
+    fn chain_config_validates_gnosis() {
+        ChainConfig {
+            chain_id: 100,
+            router_address: alloy::primitives::address!(
+                "0DCDED3545D565bA3B19E683431381007245d983"
+            ),
+            wrapped_native_token: WXDAI_GNOSIS,
+            price_api_chain: CurvePriceApiChain::Xdai,
+            settlement_contract: alloy::primitives::address!(
+                "9008D19f58AAbD9eD0D60971565AA8510560ab41"
+            ),
+        }
+        .validated()
+        .expect("gnosis valid");
+    }
+
+    #[test]
+    fn chain_config_rejects_unknown_chain() {
+        let bad = ChainConfig {
+            chain_id: 137, // polygon — not supported by this solver yet
+            ..test_chain_config()
+        };
+        assert!(matches!(
+            bad.validated(),
+            Err(ChainConfigError::UnsupportedChain(137))
+        ));
+    }
+
+    #[test]
+    fn chain_config_rejects_zero_router_address() {
+        let bad = ChainConfig {
+            router_address: eth::Address::default(),
+            ..test_chain_config()
+        };
+        assert!(matches!(
+            bad.validated(),
+            Err(ChainConfigError::ZeroRouterAddress)
+        ));
+    }
+
+    #[test]
+    fn chain_config_allows_noncanonical_settlement_and_wrapped_native() {
+        // The validator deliberately does not compare these fields to
+        // canonical on-chain addresses — a fork or test deployment must be
+        // able to override without patching code. Only chain consistency and
+        // the non-zero router shape are enforced.
+        let fork = ChainConfig {
+            wrapped_native_token: eth::Address::repeat_byte(0xaa),
+            settlement_contract: eth::Address::repeat_byte(0xbb),
+            ..test_chain_config()
+        };
+        fork.validated().expect("fork-style override should validate");
+    }
+
+    #[test]
+    fn chain_config_rejects_slug_chain_mismatch() {
+        let bad = ChainConfig {
+            price_api_chain: CurvePriceApiChain::Arbitrum,
+            ..test_chain_config()
+        };
+        assert!(matches!(
+            bad.validated(),
+            Err(ChainConfigError::PriceApiChainMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn curve_price_api_chain_parses_valid_slugs() {
+        #[derive(Deserialize)]
+        struct Wrap {
+            chain: CurvePriceApiChain,
+        }
+        fn parse(s: &str) -> Result<CurvePriceApiChain, toml::de::Error> {
+            toml::from_str::<Wrap>(&format!(r#"chain = "{s}""#)).map(|w| w.chain)
+        }
+        assert_eq!(parse("ethereum").unwrap(), CurvePriceApiChain::Ethereum);
+        assert_eq!(parse("arbitrum").unwrap(), CurvePriceApiChain::Arbitrum);
+        assert_eq!(parse("xdai").unwrap(), CurvePriceApiChain::Xdai);
+    }
+
+    #[test]
+    fn curve_price_api_chain_rejects_coingecko_slug() {
+        // Coingecko uses "arbitrum-one" but Curve uses "arbitrum". Reject the
+        // Coingecko form at load time so it can't sneak into config.
+        #[derive(Deserialize)]
+        struct Wrap {
+            #[allow(dead_code)]
+            chain: CurvePriceApiChain,
+        }
+        fn parse(s: &str) -> Result<(), toml::de::Error> {
+            toml::from_str::<Wrap>(&format!(r#"chain = "{s}""#)).map(|_| ())
+        }
+        assert!(parse("arbitrum-one").is_err());
+        assert!(parse("mainnet").is_err());
+        assert!(parse("gnosis").is_err());
     }
 }
