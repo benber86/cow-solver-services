@@ -36,10 +36,10 @@ services:
     depends_on:
       certbot-init:
         condition: service_completed_successfully
-      solver:
-        condition: service_started
-      solver-staging:
-        condition: service_started
+    # Solver services are intentionally NOT in depends_on. Nginx resolves them
+    # lazily via Docker's embedded DNS (see nginx.conf `resolver` directive),
+    # so it can start / restart without every backend being present, and a
+    # chain deploy can happen without touching ingress.
     restart: unless-stopped
     entrypoint: /bin/sh
     command: >
@@ -132,6 +132,52 @@ services:
       - ./processed/curve-lp-staging.toml:/config/curve-lp-staging.toml:ro
     environment:
       - NODE_URL=${NODE_URL}
+      - USE_JSON_LOGS=true
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  arbitrum:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: solvers
+    command: >
+      --addr 0.0.0.0:7872
+      curvelp
+      --config /config/curve-lp-arbitrum.toml
+    expose:
+      - "7872"
+    volumes:
+      - ./processed/curve-lp-arbitrum.toml:/config/curve-lp-arbitrum.toml:ro
+    environment:
+      - NODE_URL=${NODE_URL_ARBITRUM}
+      - USE_JSON_LOGS=true
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  gnosis:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: solvers
+    command: >
+      --addr 0.0.0.0:7872
+      curvelp
+      --config /config/curve-lp-gnosis.toml
+    expose:
+      - "7872"
+    volumes:
+      - ./processed/curve-lp-gnosis.toml:/config/curve-lp-gnosis.toml:ro
+    environment:
+      - NODE_URL=${NODE_URL_GNOSIS}
       - USE_JSON_LOGS=true
     restart: unless-stopped
     logging:

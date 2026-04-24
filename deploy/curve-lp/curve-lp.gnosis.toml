@@ -1,0 +1,36 @@
+# Curve LP Solver - Gnosis Chain Production Configuration
+#
+# SECRETS: This file contains NO secrets.
+# NODE_URL is injected via environment variable (set by deploy.sh from
+# NODE_URL_GNOSIS in .env).
+#
+# Note: Gnosis native token is xDAI, wrapped native is WXDAI (not WETH).
+# CoW's native-price probe on Gnosis uses WXDAI as the reference token.
+
+chain-id = 100
+router-address = "0x0DCDED3545D565bA3B19E683431381007245d983"
+wrapped-native-token = "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"
+price-api-chain = "xdai"
+
+# RPC for on-chain verification (injected from environment)
+node-url = "${NODE_URL}"
+
+# Curve APIs (public, no auth needed)
+curve-api-url = "https://www.curve.finance/api/router/v1/routes"
+curve-price-api-url = "https://prices.curve.finance/"
+
+# Token filtering: no lp-tokens yet — smoke-test routing on real Gnosis
+# pools first, then restrict. Running without lp-tokens attempts every sell
+# order, which can cause deadline timeouts; accept that trade-off for the
+# first live run.
+
+# Optional buy-token filtering (left disabled):
+# allowed-buy-tokens = [
+# ]
+
+# Safety settings
+slippage-bps = 100              # 1% slippage buffer
+max-quote-deviation-bps = 300   # 3% max deviation between API and on-chain quote
+
+# CoW Protocol Settlement contract (same address on all chains)
+settlement-contract = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"

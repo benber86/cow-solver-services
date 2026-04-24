@@ -1,0 +1,33 @@
+# Curve LP Solver - Arbitrum One Production Configuration
+#
+# SECRETS: This file contains NO secrets.
+# NODE_URL is injected via environment variable (set by deploy.sh from
+# NODE_URL_ARBITRUM in .env).
+
+chain-id = 42161
+router-address = "0x2191718CD32d02B8E60BAdFFeA33E4B5DD9A0A0D"
+wrapped-native-token = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+price-api-chain = "arbitrum"
+
+# RPC for on-chain verification (injected from environment)
+node-url = "${NODE_URL}"
+
+# Curve APIs (public, no auth needed)
+curve-api-url = "https://www.curve.finance/api/router/v1/routes"
+curve-price-api-url = "https://prices.curve.finance/"
+
+# Token filtering: no lp-tokens yet — smoke-test routing on real Arbitrum
+# pools first, then restrict. Running without lp-tokens attempts every sell
+# order, which can cause deadline timeouts; accept that trade-off for the
+# first live run.
+
+# Optional buy-token filtering (left disabled):
+# allowed-buy-tokens = [
+# ]
+
+# Safety settings
+slippage-bps = 100              # 1% slippage buffer
+max-quote-deviation-bps = 300   # 3% max deviation between API and on-chain quote
+
+# CoW Protocol Settlement contract (same address on all chains)
+settlement-contract = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"

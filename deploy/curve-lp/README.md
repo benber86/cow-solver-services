@@ -1,301 +1,227 @@
-# Curve LP Solver - Deployment Guide
+# Curve LP Solver — Ops Memo
 
-## Prerequisites
+Workflow notes for running the Curve LP solver against CoW Protocol. Lives on a
+single VPS, multi-chain (Ethereum, Arbitrum, Gnosis), decoupled solver/ingress
+deploy.
 
-1. **AWS Account** with permissions to create EC2, Security Groups
-2. **Ethereum RPC URL** (Alchemy, Infura, or your own node)
-3. **Solver private key** (dedicated wallet for signing settlements)
-4. **Domain** pointing to your server (solver.momotaro.xyz → EC2 IP)
-5. **AWS CLI** configured locally (`aws configure`)
-
----
-
-## Step 1: Create EC2 Instance
-
-### Via AWS Console:
-
-1. Go to **EC2 → Launch Instance**
-
-2. **Settings:**
-   | Setting | Value |
-   |---------|-------|
-   | Name | `curve-lp-solver` |
-   | AMI | Amazon Linux 2023 or Ubuntu 22.04 |
-   | Instance type | `t3.medium` (4 GB RAM, needed for Rust builds) |
-   | Key pair | Create new or use existing |
-   | Storage | 20 GB gp3 |
-
-3. **Network settings:**
-   - Create new security group
-   - Allow SSH (port 22) from your IP
-   - Allow HTTP (port 80) from `0.0.0.0/0` (for Let's Encrypt)
-   - Allow HTTPS (port 443) from `0.0.0.0/0`
-
-4. **Launch** and note the instance ID
-
-### Via AWS CLI:
-```bash
-# Create security group
-aws ec2 create-security-group \
-  --group-name curve-lp-solver-sg \
-  --description "Curve LP Solver"
-
-# Allow SSH
-aws ec2 authorize-security-group-ingress \
-  --group-name curve-lp-solver-sg \
-  --protocol tcp --port 22 --cidr YOUR_IP/32
-
-# Allow HTTP (for Let's Encrypt)
-aws ec2 authorize-security-group-ingress \
-  --group-name curve-lp-solver-sg \
-  --protocol tcp --port 80 --cidr 0.0.0.0/0
-
-# Allow HTTPS
-aws ec2 authorize-security-group-ingress \
-  --group-name curve-lp-solver-sg \
-  --protocol tcp --port 443 --cidr 0.0.0.0/0
-
-# Launch instance
-aws ec2 run-instances \
-  --image-id ami-0c55b159cbfafe1f0 \
-  --instance-type t3.medium \
-  --key-name YOUR_KEY_NAME \
-  --security-groups curve-lp-solver-sg \
-  --block-device-mappings '[{"DeviceName":"/dev/xvda","Ebs":{"VolumeSize":20,"VolumeType":"gp3"}}]' \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=curve-lp-solver}]'
-```
+For **first-time-from-scratch** setup (AWS instance creation, DNS, initial
+certbot bootstrap, CoW onboarding) see [`COW_README.md`](./COW_README.md). That
+flow still works; this file assumes the VPS exists and Docker is installed.
 
 ---
 
-## Step 2: Allocate Elastic IP
+## What runs on the VPS
 
-```bash
-# Allocate
-aws ec2 allocate-address --domain vpc
+One compose project, six services. Each solver container runs the same binary
+with a per-chain TOML.
 
-# Note the AllocationId, then associate with your instance
-aws ec2 associate-address \
-  --instance-id i-YOUR_INSTANCE_ID \
-  --allocation-id eipalloc-YOUR_ALLOCATION_ID
-```
+| Service          | Chain    | Role                 | Public path               | CoW registered |
+|------------------|----------|----------------------|---------------------------|----------------|
+| `solver`         | Ethereum | Prod (0x9008… settl.) | `/prod/mainnet/`          | **Yes**        |
+| `solver-staging` | Ethereum | Shadow/staging (0xf553… settl.) | `/staging/mainnet/`, `/shadow/mainnet/` | Yes            |
+| `arbitrum`       | Arbitrum | Prod                 | `/prod/arbitrum/`         | No (pending smoke test) |
+| `gnosis`         | Gnosis   | Prod                 | `/prod/gnosis/`           | No (pending smoke test) |
+| `nginx`          | —        | Ingress + TLS        | —                         | —              |
+| `certbot`        | —        | Cert renewal loop    | —                         | —              |
 
-Note down the Elastic IP - this is your solver's public address.
+Public URL pattern follows CoW's convention: `https://$DOMAIN/{env}/{network}/...`.
 
----
+**Legacy `/healthz`** at the domain root still probes the mainnet `solver`
+(back-compat). Per-chain liveness is at `/prod/{chain}/healthz`.
 
-## Step 3: SSH into Instance
+### Chains supported
 
-```bash
-ssh -i ~/.ssh/your-key.pem ec2-user@YOUR_ELASTIC_IP
-# or for Ubuntu:
-ssh -i ~/.ssh/your-key.pem ubuntu@YOUR_ELASTIC_IP
-```
-
----
-
-## Step 4: Install Docker
-
-### Amazon Linux 2023:
-```bash
-sudo yum update -y
-sudo yum install -y docker git
-sudo systemctl start docker
-sudo systemctl enable docker
-sudo usermod -aG docker $USER
-
-# Install docker-compose
-sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-sudo chmod +x /usr/local/bin/docker-compose
-
-# Log out and back in for group to take effect
-exit
-```
-
-### Ubuntu 22.04:
-```bash
-sudo apt update
-sudo apt install -y docker.io docker-compose git
-sudo systemctl start docker
-sudo systemctl enable docker
-sudo usermod -aG docker $USER
-
-# Log out and back in
-exit
-```
+Chain support lives entirely in config (no Rust changes needed to add a 4th).
+To add a new chain you need: a Curve Router deployment, a Curve Price API slug
+(`ethereum`/`arbitrum`/`xdai` today), wrapped-native token, and a compose
+service + nginx location. See `crates/solvers/src/domain/solver/curve_lp.rs`
+for `ChainConfig`.
 
 ---
 
-## Step 5: Clone and Setup
+## Day-2 deploy workflow
 
-```bash
-# SSH back in
-ssh -i ~/.ssh/your-key.pem ec2-user@YOUR_ELASTIC_IP
+The whole thing is `./deploy.sh` with flags.
 
-# Clone the repo
-git clone https://github.com/YOUR_ORG/cow-solver-services.git
-cd cow-solver-services/deploy/curve-lp
-
-# Create .env from template
-cp .env.example .env
-
-# Edit with your secrets
-nano .env
+```
+./deploy.sh [--skip-prod] [--chains=CSV] [--with-ingress | --ingress-only]
 ```
 
-### Fill in `.env`:
-```bash
-NODE_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_ACTUAL_KEY
-SOLVER_ACCOUNT=0xYOUR_ACTUAL_PRIVATE_KEY
-DOMAIN=solver.yourdomain.xyz
-SSL_EMAIL=admin@yourdomain.xyz
+Solver and ingress are **decoupled**: `./deploy.sh` with no flags rebuilds
+solver containers only. Nginx/certbot are untouched unless you ask. This is
+intentional — a chain deploy should never churn ingress, and an ingress
+refresh should never churn solvers.
+
+### Flag matrix
+
+| invocation                                       | rebuilds                              |
+|--------------------------------------------------|---------------------------------------|
+| `./deploy.sh`                                    | all four solvers                       |
+| `./deploy.sh --skip-prod`                        | staging + arbitrum + gnosis            |
+| `./deploy.sh --chains=arbitrum,gnosis`           | those two only                         |
+| `./deploy.sh --chains=mainnet --skip-prod`       | staging only                           |
+| `./deploy.sh --chains=arbitrum --with-ingress`   | arbitrum + nginx + certbot             |
+| `./deploy.sh --with-ingress`                     | all solvers + nginx + certbot          |
+| `./deploy.sh --ingress-only`                     | nginx + certbot, no solvers            |
+
+**When to use `--with-ingress`**: new chain, new public route, or any
+`nginx.conf` edit. Otherwise nginx won't know about your new upstream.
+
+**When to use `--ingress-only`**: nginx/cert troubleshooting, TLS settings,
+adding headers.
+
+`--ingress-only` is mutually exclusive with `--skip-prod` / `--chains` /
+`--with-ingress`; the script errors out if you combine them.
+
+### Typical cutover flows
+
+**Chain code change to arbitrum only** (no routing change):
 ```
-
-**Important:**
-- The `SOLVER_ACCOUNT` wallet needs some ETH for gas (~0.1 ETH to start)
-- This wallet will be used to sign settlement transactions
-- `DOMAIN` must have DNS pointing to your Elastic IP before deploying
-- `SSL_EMAIL` is used for Let's Encrypt certificate notifications
-
----
-
-## Step 6: Deploy
-
-```bash
-# Make sure you're in deploy/curve-lp
-cd ~/cow-solver-services/deploy/curve-lp
-
-# Run deployment
-./deploy.sh
-```
-
-**First build tip:** The Rust build is memory-intensive. Add swap before the first build:
-```bash
-sudo fallocate -l 4G /swapfile
-sudo chmod 600 /swapfile
-sudo mkswap /swapfile
-sudo swapon /swapfile
-```
-
-Use `tmux` so the build survives SSH disconnects:
-```bash
-tmux new -s deploy
-./deploy.sh
-# Ctrl+B then D to detach, reconnect with: tmux attach -t deploy
-```
-
-This will:
-1. Validate your environment variables
-2. Process config files (substitute secrets)
-3. Build the solver image and start all containers (driver, solver, nginx, certbot)
-4. Automatically obtain an SSL certificate from Let's Encrypt
-
----
-
-## Step 7: Verify
-
-```bash
-# Check containers are running
-docker-compose -f docker-compose.prod.yml ps
-
-# Check logs
-docker-compose -f docker-compose.prod.yml logs -f
-
-# Test health endpoint
-curl https://YOUR_DOMAIN/healthz
-```
-
----
-
-## Step 8: Register with CoW Protocol
-
-Your solver is running at `https://YOUR_DOMAIN`
-
-To participate in CoW Protocol auctions, you need to:
-
-1. **Contact CoW Protocol team** via:
-   - Discord: https://discord.com/invite/cowprotocol
-   - Or their solver onboarding process
-
-2. **Provide:**
-   - Your solver endpoint: `https://YOUR_DOMAIN`
-   - Solver name: `curve-lp` (or your choice)
-   - What orders you handle: Curve LP token sells
-
-3. **Bond requirement:**
-   - Check current bonding requirements with CoW team
-   - May need to stake COW tokens
-
----
-
-## Monitoring & Maintenance
-
-### View logs:
-```bash
-docker-compose -f docker-compose.prod.yml logs -f solver  # Solver only
-docker-compose -f docker-compose.prod.yml logs -f driver  # Driver only
-docker-compose -f docker-compose.prod.yml logs -f         # Both
-```
-
-### Restart services:
-```bash
-docker-compose -f docker-compose.prod.yml restart
-```
-
-### Update to latest code:
-```bash
-cd ~/cow-solver-services
 git pull
-cd deploy/curve-lp
-docker-compose -f docker-compose.prod.yml up -d --build
+./deploy.sh --chains=arbitrum
 ```
 
-### Stop services:
-```bash
-docker-compose -f docker-compose.prod.yml down
+**New chain added to code + compose + nginx**:
 ```
+git pull
+./deploy.sh --chains=<new-chain> --with-ingress
+```
+
+**Nginx-only edit (e.g. new header, path rewrite)**:
+```
+git pull
+./deploy.sh --ingress-only
+```
+
+**Emergency: rebuild everything**:
+```
+./deploy.sh --with-ingress
+```
+
+### Nginx resolves backends lazily
+
+`nginx.conf` uses Docker's embedded DNS (`resolver 127.0.0.11`) plus
+variable `proxy_pass`. Consequence: **nginx starts even when a solver
+container is missing**, and a missing backend 502s that one path until the
+backend returns. This is what makes `--chains=arbitrum` safely skip
+touching mainnet containers. It also means you can `docker compose stop
+arbitrum` without nginx falling over.
+
+The `--no-deps` flag on every `docker compose up` call in `deploy.sh`
+prevents compose from implicitly dragging in services.
 
 ---
 
-## Cost Estimate
+## Configuration
 
-| Resource | Monthly Cost |
-|----------|-------------|
-| EC2 t3.medium | ~$30 |
-| Elastic IP | Free (when attached) |
-| Storage 20GB | ~$2 |
-| Data transfer | ~$1-5 |
-| **Total** | **~$35-40/mo** |
+Per-chain TOMLs in `deploy/curve-lp/`:
+
+- `curve-lp.prod.toml`    — ETH mainnet prod
+- `curve-lp.staging.toml` — ETH mainnet staging (different settlement contract)
+- `curve-lp.arbitrum.toml`
+- `curve-lp.gnosis.toml`
+
+These are the source of truth. `deploy.sh` runs them through `envsubst` (only
+`${NODE_URL}` is substituted, scoped per-chain) into `./processed/` and mounts
+the result into the container.
+
+Compile-time tests (`cargo test -p solvers --lib infra::config::curve_lp`)
+parse every deploy TOML at build time, so a malformed or mis-chained config
+breaks the build rather than the running container. Add a test when you add
+a chain.
+
+### Secrets
+
+All secrets live in `deploy/curve-lp/.env` on the VPS. Not a secrets manager,
+not committed. `.env.example` is the template. Required vars:
+
+| var                  | when required                           |
+|----------------------|-----------------------------------------|
+| `NODE_URL`           | rebuilding `solver` or `solver-staging` |
+| `NODE_URL_ARBITRUM`  | rebuilding `arbitrum`                   |
+| `NODE_URL_GNOSIS`    | rebuilding `gnosis`                     |
+| `DOMAIN`             | ingress (nginx/certbot)                 |
+| `SSL_EMAIL`          | ingress                                 |
+| `TG_BOT_TOKEN`, `TG_CHAT_ID`, `TG_*_THREAD` | telegram monitor (optional) |
+
+Moving to AWS Secrets Manager / SSM is a future TODO; see
+`deploy/curve-lp/AWS_SECRETS.md`.
+
+---
+
+## Monitoring
+
+`tg-monitor.sh` tails logs and posts to Telegram. Start it once:
+
+```
+nohup ./tg-monitor.sh > tg-monitor.log 2>&1 &
+```
+
+What it reports (every 5 min tick):
+- Nginx 4xx/5xx over the last 5 min.
+- Solver-candidate trade notifications (per-order, with CoW explorer link).
+- Hourly summary: auctions, quotes, orders processed, solution candidates, errors.
+- Idle heartbeat every 30 min if no activity.
+
+**Caveat**: `tg-monitor.sh` and `monitor.sh` only watch the mainnet
+`solver` container. They do not currently watch `arbitrum`, `gnosis`, or
+`solver-staging`. To extend, the `docker compose logs` calls need to run
+per-container (or use `docker compose logs solver arbitrum gnosis` with
+per-line service prefixes).
+
+`monitor.sh` is an interactive console tail with trade extraction to
+`trades.log`.
 
 ---
 
 ## Troubleshooting
 
-### Container won't start:
-```bash
-docker-compose -f docker-compose.prod.yml logs
+### `./deploy.sh --chains=arbitrum` fails with mount errors on clean host
+Something else is also trying to start. Check `docker compose ps` — any
+service with a `Created`/`Restarting` status and a bind-mount to a file in
+`./processed/` that doesn't exist will crash. If deploy.sh is behaving
+correctly it uses `--no-deps`, so this shouldn't happen; if it does,
+confirm you're on the current `deploy.sh`.
+
+### Nginx won't start
+With lazy DNS this should almost never happen for a missing backend — only
+for syntax errors or missing certs. Check:
+```
+docker compose -f docker-compose.prod.yml logs nginx
 ```
 
-### Can't connect via HTTPS:
-- Check security group allows ports 80 and 443
-- Check `docker-compose -f docker-compose.prod.yml ps` shows containers running (not `Restarting`)
-- Check DNS points to your Elastic IP: `dig YOUR_DOMAIN`
-- Check certbot logs: `docker-compose -f docker-compose.prod.yml logs certbot`
+### A `/prod/{chain}/...` path returns 502
+The backend container isn't running or doesn't resolve. Check:
+```
+docker compose -f docker-compose.prod.yml ps {chain}
+docker compose -f docker-compose.prod.yml logs {chain} --tail 100
+```
 
-### Solver not finding routes:
-- Check Curve API is accessible: `curl https://api.curve.fi`
-- Check RPC is working: logs will show RPC errors
+### Cert renewal failing
+Cert lives in the `certbot-etc` volume, renewed in a loop by the `certbot`
+service. Logs:
+```
+docker compose -f docker-compose.prod.yml logs certbot
+```
+Force a refresh by recreating the ingress: `./deploy.sh --ingress-only`.
 
-### Out of memory during build:
-- Ensure swap is enabled: `swapon --show`
-- If no swap, add it: `sudo fallocate -l 4G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile`
-- Or upgrade to t3.large (stop instance, change type, start)
+### CoW driver sends traffic that all 404s or times out
+Confirm CoW has the right URL(s) registered. For mainnet today that's
+`https://$DOMAIN/prod/mainnet/` and `/staging/mainnet/`. Arbitrum and
+Gnosis are **not yet registered** — smoke test first, then onboard via CoW
+discord.
+
+### Swap / memory pressure on a t3.medium
+Three parallel Rust rebuilds can OOM on 4 GB. Up the swap file or deploy
+serially with `--chains` one at a time.
 
 ---
 
-## Security Hardening (Optional)
+## Pointers
 
-1. **Restrict SSH access** to your IP only
-2. **Restrict HTTPS** to CoW Protocol IPs once registered (ask them for IP ranges)
-3. **Enable CloudWatch** for log monitoring
-4. **Set up alerts** for container restarts
-5. **Use AWS Secrets Manager** instead of .env file (see AWS_SECRETS.md)
+- Compose file: `docker-compose.prod.yml`
+- Nginx template: `nginx/nginx.conf` (the literal `$DOMAIN` is substituted
+  by the nginx container's entrypoint at startup).
+- Rust solver code: `crates/solvers/src/domain/solver/curve_lp.rs`
+- Config loader: `crates/solvers/src/infra/config/curve_lp.rs`
+- Chain-abstract type: `ChainConfig` in the solver crate.

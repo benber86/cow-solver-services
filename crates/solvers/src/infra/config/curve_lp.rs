@@ -181,4 +181,16 @@ mod tests {
         let raw = include_str!("../../../../../deploy/curve-lp/curve-lp.staging.toml");
         parse_and_validate(raw).expect("staging config should parse and validate");
     }
+
+    #[test]
+    fn arbitrum_deploy_config_is_valid() {
+        let raw = include_str!("../../../../../deploy/curve-lp/curve-lp.arbitrum.toml");
+        parse_and_validate(raw).expect("arbitrum deploy config should parse and validate");
+    }
+
+    #[test]
+    fn gnosis_deploy_config_is_valid() {
+        let raw = include_str!("../../../../../deploy/curve-lp/curve-lp.gnosis.toml");
+        parse_and_validate(raw).expect("gnosis deploy config should parse and validate");
+    }
 }
