@@ -192,54 +192,13 @@ services:
         max-size: "100m"
         max-file: "3"
 
-  # Staging containers for arbi/gnosis. Same chain, same RPC, same router
-  # and token-allowlist as the prod counterpart — only settlement differs
-  # (CoW staging/shadow settlement, see curve-lp.<chain>-staging.toml).
-  arbitrum-staging:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
-      target: solvers
-    command: >
-      --addr 0.0.0.0:7872
-      curvelp
-      --config /config/curve-lp-arbitrum-staging.toml
-    expose:
-      - "7872"
-    volumes:
-      - ./processed/curve-lp-arbitrum-staging.toml:/config/curve-lp-arbitrum-staging.toml:ro
-    environment:
-      - NODE_URL=${NODE_URL_ARBITRUM}
-      - USE_JSON_LOGS=true
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "100m"
-        max-file: "3"
-
-  gnosis-staging:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
-      target: solvers
-    command: >
-      --addr 0.0.0.0:7872
-      curvelp
-      --config /config/curve-lp-gnosis-staging.toml
-    expose:
-      - "7872"
-    volumes:
-      - ./processed/curve-lp-gnosis-staging.toml:/config/curve-lp-gnosis-staging.toml:ro
-    environment:
-      - NODE_URL=${NODE_URL_GNOSIS}
-      - USE_JSON_LOGS=true
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "100m"
-        max-file: "3"
+  # No separate staging containers on arbitrum/gnosis: CoW has not
+  # deployed a shadow-settlement on those chains, so staging would be a
+  # byte-for-byte mirror of prod. Nginx serves /staging/{arbi,gnosis}/
+  # by pointing at the prod containers directly. When CoW ships a real
+  # shadow-settlement, bring back an `arbitrum-staging`/`gnosis-staging`
+  # service here and flip the nginx upstream. See `solver-staging` for
+  # the ETH shape.
 
 volumes:
   certbot-etc:

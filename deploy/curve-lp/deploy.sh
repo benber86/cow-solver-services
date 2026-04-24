@@ -99,14 +99,10 @@ fi
 # ---------- compute the solver service set ----------
 
 SOLVER_SERVICES=()
-# Prod containers (one per chain).
-REBUILD_PROD=0             # ETH mainnet prod — `solver`
-REBUILD_ARBITRUM=0         # Arbitrum prod   — `arbitrum`
-REBUILD_GNOSIS=0           # Gnosis prod     — `gnosis`
-# Staging containers (one per chain; same chain, CoW shadow settlement).
-REBUILD_STAGING=0          # ETH mainnet staging — `solver-staging`
-REBUILD_ARBITRUM_STAGING=0 # Arbitrum staging   — `arbitrum-staging`
-REBUILD_GNOSIS_STAGING=0   # Gnosis staging     — `gnosis-staging`
+REBUILD_PROD=0      # ETH mainnet prod    — `solver`
+REBUILD_STAGING=0   # ETH mainnet staging — `solver-staging`
+REBUILD_ARBITRUM=0  # Arbitrum prod       — `arbitrum` (also serves /staging/arbitrum/)
+REBUILD_GNOSIS=0    # Gnosis prod         — `gnosis`   (also serves /staging/gnosis/)
 
 if [ "$INGRESS_ONLY" = "0" ]; then
     declare -A CHAIN_ENABLED=([mainnet]=0 [arbitrum]=0 [gnosis]=0)
@@ -127,9 +123,11 @@ if [ "$INGRESS_ONLY" = "0" ]; then
         done
     fi
 
-    # --skip-prod is symmetric across chains now — every chain has a
-    # prod/staging pair, and --skip-prod drops the *-prod half of each
-    # enabled chain.
+    # --skip-prod today only drops the ETH prod `solver` container. Arbi
+    # and gnosis have no separate staging container (their /staging/ URL
+    # proxies to the prod container via nginx), so --skip-prod has no
+    # effect on them — passing `--chains=arbitrum --skip-prod` leaves
+    # nothing to rebuild and errors out below.
     if [ "${CHAIN_ENABLED[mainnet]}" = "1" ]; then
         if [ "$SKIP_PROD" = "0" ]; then
             SOLVER_SERVICES+=(solver)
@@ -138,21 +136,13 @@ if [ "$INGRESS_ONLY" = "0" ]; then
         SOLVER_SERVICES+=(solver-staging)
         REBUILD_STAGING=1
     fi
-    if [ "${CHAIN_ENABLED[arbitrum]}" = "1" ]; then
-        if [ "$SKIP_PROD" = "0" ]; then
-            SOLVER_SERVICES+=(arbitrum)
-            REBUILD_ARBITRUM=1
-        fi
-        SOLVER_SERVICES+=(arbitrum-staging)
-        REBUILD_ARBITRUM_STAGING=1
+    if [ "${CHAIN_ENABLED[arbitrum]}" = "1" ] && [ "$SKIP_PROD" = "0" ]; then
+        SOLVER_SERVICES+=(arbitrum)
+        REBUILD_ARBITRUM=1
     fi
-    if [ "${CHAIN_ENABLED[gnosis]}" = "1" ]; then
-        if [ "$SKIP_PROD" = "0" ]; then
-            SOLVER_SERVICES+=(gnosis)
-            REBUILD_GNOSIS=1
-        fi
-        SOLVER_SERVICES+=(gnosis-staging)
-        REBUILD_GNOSIS_STAGING=1
+    if [ "${CHAIN_ENABLED[gnosis]}" = "1" ] && [ "$SKIP_PROD" = "0" ]; then
+        SOLVER_SERVICES+=(gnosis)
+        REBUILD_GNOSIS=1
     fi
 
     if [ ${#SOLVER_SERVICES[@]} -eq 0 ]; then
@@ -275,17 +265,9 @@ if [ ${#SOLVER_SERVICES[@]} -gt 0 ]; then
         NODE_URL="$NODE_URL_ARBITRUM" envsubst '${NODE_URL}' \
             < curve-lp.arbitrum.toml > ./processed/curve-lp-arbitrum.toml
     fi
-    if [ "$REBUILD_ARBITRUM_STAGING" = "1" ]; then
-        NODE_URL="$NODE_URL_ARBITRUM" envsubst '${NODE_URL}' \
-            < curve-lp.arbitrum-staging.toml > ./processed/curve-lp-arbitrum-staging.toml
-    fi
     if [ "$REBUILD_GNOSIS" = "1" ]; then
         NODE_URL="$NODE_URL_GNOSIS" envsubst '${NODE_URL}' \
             < curve-lp.gnosis.toml > ./processed/curve-lp-gnosis.toml
-    fi
-    if [ "$REBUILD_GNOSIS_STAGING" = "1" ]; then
-        NODE_URL="$NODE_URL_GNOSIS" envsubst '${NODE_URL}' \
-            < curve-lp.gnosis-staging.toml > ./processed/curve-lp-gnosis-staging.toml
     fi
 
     echo -e "${GREEN}✓ Config files processed${NC}"
@@ -439,17 +421,19 @@ if [ "$MONITOR_JSON_REFRESH" = "1" ]; then
     mkdir -p ./processed/monitor
 
     # JSON files are `{chain}-{env}.json` — the UI fetches them by chain×env
-    # combo. On ingress rebuild we refresh all six so the UI can't be ahead
-    # of reality anywhere. Otherwise refresh only the cells whose solver is
-    # being rebuilt right now.
+    # combo. For arbi/gnosis the staging JSON is emitted from the SAME source
+    # TOML as prod (only the `env` label differs in the output) because those
+    # chains don't have a separate staging container. On ingress rebuild we
+    # refresh all six. Otherwise refresh only the cells whose prod TOML is
+    # in the current rebuild set.
     REFRESHED=()
     if [ ${#INGRESS_SERVICES[@]} -gt 0 ]; then
-        emit_monitor_json mainnet  prod    curve-lp.prod.toml             ./processed/monitor/mainnet-prod.json
-        emit_monitor_json mainnet  staging curve-lp.staging.toml          ./processed/monitor/mainnet-staging.json
-        emit_monitor_json arbitrum prod    curve-lp.arbitrum.toml         ./processed/monitor/arbitrum-prod.json
-        emit_monitor_json arbitrum staging curve-lp.arbitrum-staging.toml ./processed/monitor/arbitrum-staging.json
-        emit_monitor_json gnosis   prod    curve-lp.gnosis.toml           ./processed/monitor/gnosis-prod.json
-        emit_monitor_json gnosis   staging curve-lp.gnosis-staging.toml   ./processed/monitor/gnosis-staging.json
+        emit_monitor_json mainnet  prod    curve-lp.prod.toml     ./processed/monitor/mainnet-prod.json
+        emit_monitor_json mainnet  staging curve-lp.staging.toml  ./processed/monitor/mainnet-staging.json
+        emit_monitor_json arbitrum prod    curve-lp.arbitrum.toml ./processed/monitor/arbitrum-prod.json
+        emit_monitor_json arbitrum staging curve-lp.arbitrum.toml ./processed/monitor/arbitrum-staging.json
+        emit_monitor_json gnosis   prod    curve-lp.gnosis.toml   ./processed/monitor/gnosis-prod.json
+        emit_monitor_json gnosis   staging curve-lp.gnosis.toml   ./processed/monitor/gnosis-staging.json
         REFRESHED=(mainnet-prod mainnet-staging arbitrum-prod arbitrum-staging gnosis-prod gnosis-staging)
     else
         if [ "$REBUILD_PROD" = "1" ]; then
@@ -461,20 +445,16 @@ if [ "$MONITOR_JSON_REFRESH" = "1" ]; then
             REFRESHED+=(mainnet-staging)
         fi
         if [ "$REBUILD_ARBITRUM" = "1" ]; then
-            emit_monitor_json arbitrum prod curve-lp.arbitrum.toml ./processed/monitor/arbitrum-prod.json
-            REFRESHED+=(arbitrum-prod)
-        fi
-        if [ "$REBUILD_ARBITRUM_STAGING" = "1" ]; then
-            emit_monitor_json arbitrum staging curve-lp.arbitrum-staging.toml ./processed/monitor/arbitrum-staging.json
-            REFRESHED+=(arbitrum-staging)
+            # arbi prod container change affects both /prod/ and /staging/
+            # arbitrum routes, so refresh both JSONs.
+            emit_monitor_json arbitrum prod    curve-lp.arbitrum.toml ./processed/monitor/arbitrum-prod.json
+            emit_monitor_json arbitrum staging curve-lp.arbitrum.toml ./processed/monitor/arbitrum-staging.json
+            REFRESHED+=(arbitrum-prod arbitrum-staging)
         fi
         if [ "$REBUILD_GNOSIS" = "1" ]; then
-            emit_monitor_json gnosis prod curve-lp.gnosis.toml ./processed/monitor/gnosis-prod.json
-            REFRESHED+=(gnosis-prod)
-        fi
-        if [ "$REBUILD_GNOSIS_STAGING" = "1" ]; then
-            emit_monitor_json gnosis staging curve-lp.gnosis-staging.toml ./processed/monitor/gnosis-staging.json
-            REFRESHED+=(gnosis-staging)
+            emit_monitor_json gnosis prod    curve-lp.gnosis.toml ./processed/monitor/gnosis-prod.json
+            emit_monitor_json gnosis staging curve-lp.gnosis.toml ./processed/monitor/gnosis-staging.json
+            REFRESHED+=(gnosis-prod gnosis-staging)
         fi
     fi
 
