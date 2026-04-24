@@ -202,6 +202,20 @@ mod tests {
         parse_and_validate(raw).expect("gnosis deploy config should parse and validate");
     }
 
+    #[test]
+    fn arbitrum_staging_deploy_config_is_valid() {
+        let raw = include_str!("../../../../../deploy/curve-lp/curve-lp.arbitrum-staging.toml");
+        parse_and_validate(raw)
+            .expect("arbitrum staging deploy config should parse and validate");
+    }
+
+    #[test]
+    fn gnosis_staging_deploy_config_is_valid() {
+        let raw = include_str!("../../../../../deploy/curve-lp/curve-lp.gnosis-staging.toml");
+        parse_and_validate(raw)
+            .expect("gnosis staging deploy config should parse and validate");
+    }
+
     /// A minimal TOML document with just the required fields, plus whatever
     /// the caller appends. Used by the token-allowlist serde tests to avoid
     /// coupling them to any of the real deploy TOMLs (whose `token-allowlist`

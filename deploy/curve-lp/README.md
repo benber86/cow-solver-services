@@ -12,17 +12,26 @@ flow still works; this file assumes the VPS exists and Docker is installed.
 
 ## What runs on the VPS
 
-One compose project, six services. Each solver container runs the same binary
-with a per-chain TOML.
+One compose project, eight services. Each solver container runs the same
+binary with a per-chain TOML. Every chain has a prod + staging pair; the
+only thing that differs between them is the settlement contract the
+container points at.
 
-| Service          | Chain    | Role                 | Public path               | CoW registered |
-|------------------|----------|----------------------|---------------------------|----------------|
-| `solver`         | Ethereum | Prod (0x9008… settl.) | `/prod/mainnet/`          | **Yes**        |
-| `solver-staging` | Ethereum | Shadow/staging (0xf553… settl.) | `/staging/mainnet/`, `/shadow/mainnet/` | Yes            |
-| `arbitrum`       | Arbitrum | Prod                 | `/prod/arbitrum/`         | No (pending smoke test) |
-| `gnosis`         | Gnosis   | Prod                 | `/prod/gnosis/`           | No (pending smoke test) |
-| `nginx`          | —        | Ingress + TLS        | —                         | —              |
-| `certbot`        | —        | Cert renewal loop    | —                         | —              |
+| Service             | Chain    | Settlement    | Public paths                                         | CoW registered |
+|---------------------|----------|---------------|------------------------------------------------------|----------------|
+| `solver`            | Ethereum | prod `0x9008…`  | `/prod/mainnet/`                                     | **Yes**        |
+| `solver-staging`    | Ethereum | shadow `0xf553…`| `/staging/mainnet/`, `/shadow/mainnet/`              | Yes            |
+| `arbitrum`          | Arbitrum | prod `0x9008…`  | `/prod/arbitrum/`                                    | No (pending smoke test) |
+| `arbitrum-staging`  | Arbitrum | shadow `0xf553…`| `/staging/arbitrum/`, `/shadow/arbitrum/`            | No             |
+| `gnosis`            | Gnosis   | prod `0x9008…`  | `/prod/gnosis/`                                      | No (pending smoke test) |
+| `gnosis-staging`    | Gnosis   | shadow `0xf553…`| `/staging/gnosis/`, `/shadow/gnosis/`                | No             |
+| `nginx`             | —        | —             | —                                                    | —              |
+| `certbot`           | —        | —             | —                                                    | —              |
+
+Prod and staging for the same chain share everything except settlement —
+same RPC (`NODE_URL_*`), same router, same token-allowlist. Staging exists
+so we can smoke-test code changes without exposing CoW production auctions
+to half-baked solver behavior.
 
 Public URL pattern follows CoW's convention: `https://$DOMAIN/{env}/{network}/...`.
 
@@ -54,15 +63,21 @@ refresh should never churn solvers.
 
 ### Flag matrix
 
-| invocation                                       | rebuilds                              |
-|--------------------------------------------------|---------------------------------------|
-| `./deploy.sh`                                    | all four solvers                       |
-| `./deploy.sh --skip-prod`                        | staging + arbitrum + gnosis            |
-| `./deploy.sh --chains=arbitrum,gnosis`           | those two only                         |
-| `./deploy.sh --chains=mainnet --skip-prod`       | staging only                           |
-| `./deploy.sh --chains=arbitrum --with-ingress`   | arbitrum + nginx + certbot             |
-| `./deploy.sh --with-ingress`                     | all solvers + nginx + certbot          |
-| `./deploy.sh --ingress-only`                     | nginx + certbot, no solvers            |
+`--skip-prod` is symmetric across chains — it drops the `*-prod` container
+for every enabled chain. `--chains=X` enables both X-prod and X-staging
+together (staging comes for free; there's nothing to gain from excluding it
+independently).
+
+| invocation                                       | rebuilds                                                                 |
+|--------------------------------------------------|--------------------------------------------------------------------------|
+| `./deploy.sh`                                    | all six solvers (prod + staging for each of mainnet/arbi/gnosis)          |
+| `./deploy.sh --skip-prod`                        | the three `*-staging` containers only                                    |
+| `./deploy.sh --chains=arbitrum`                  | arbitrum + arbitrum-staging                                              |
+| `./deploy.sh --chains=arbitrum,gnosis`           | those four: arbitrum, arbitrum-staging, gnosis, gnosis-staging           |
+| `./deploy.sh --chains=mainnet --skip-prod`       | solver-staging only                                                       |
+| `./deploy.sh --chains=arbitrum --with-ingress`   | arbitrum + arbitrum-staging + nginx + certbot                            |
+| `./deploy.sh --with-ingress`                     | all six solvers + nginx + certbot                                        |
+| `./deploy.sh --ingress-only`                     | nginx + certbot, no solvers                                              |
 
 **When to use `--with-ingress`**: new chain, new public route, or any
 `nginx.conf` edit. Otherwise nginx won't know about your new upstream.

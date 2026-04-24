@@ -27,12 +27,18 @@
   }
   header h1 { margin: 0; font-size: 16px; font-weight: 600; }
   header .sub { color: var(--muted); font-size: 12px; }
-  nav.chains { display: flex; gap: 4px; margin-left: auto; }
-  nav.chains button {
-    background: var(--panel); color: var(--fg); border: 1px solid var(--border);
-    padding: 6px 14px; font: inherit; cursor: pointer; border-radius: 4px;
+  nav.tabs {
+    padding: 10px 20px; border-bottom: 1px solid var(--border);
+    display: flex; gap: 18px; align-items: center; flex-wrap: wrap;
   }
-  nav.chains button.active { background: var(--accent); color: #0e1116; border-color: var(--accent); }
+  nav.tabs .group { display: flex; gap: 4px; align-items: center; }
+  nav.tabs .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-right: 4px; }
+  nav.tabs button {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+    padding: 5px 12px; font: inherit; font-size: 13px; cursor: pointer; border-radius: 4px;
+  }
+  nav.tabs button.active { background: var(--accent); color: #0e1116; border-color: var(--accent); }
+  nav.tabs button[disabled] { opacity: 0.35; cursor: not-allowed; }
   main { padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
   @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
   section.panel {
@@ -85,8 +91,19 @@
 <header>
   <h1>curve-lp monitor</h1>
   <span class="sub">day-2 sanity checks · read / run presets · no logs (v1)</span>
-  <nav class="chains" id="chains"></nav>
 </header>
+
+<nav class="tabs">
+  <div class="group">
+    <span class="label">chain</span>
+    <div id="chain-tabs" class="group"></div>
+  </div>
+  <div class="group">
+    <span class="label">env</span>
+    <div id="env-tabs" class="group"></div>
+  </div>
+  <span class="muted" id="selected-path"></span>
+</nav>
 
 <main>
 
@@ -131,38 +148,44 @@
 "use strict";
 
 /*
- * Config
- * ------
- * Keep it dumb on purpose. Presets are hard-coded JSON blobs per chain so that
- * a solver schema change doesn't silently break this file — we'll see the
- * failure in the UI and update the blobs by hand.
+ * curve-lp monitor UI
  *
- * Chain IDs here match deploy/curve-lp/curve-lp.<chain>.toml.
+ * Model: chain × env matrix. Chain = mainnet | arbitrum | gnosis.
+ * Env   = prod | staging. Every combination has a backend container and
+ * a public route today. If we ever add more chains or envs, update CHAINS
+ * and the path helper below.
+ *
+ * URL structure for the solvers:
+ *   /prod/{chain}/    -> {chain} container (canonical settlement)
+ *   /staging/{chain}/ -> {chain}-staging container (CoW shadow settlement)
+ * Both subtrees forward the remaining path to the backend's own /solve,
+ * /healthz, etc.
+ *
+ * Presets are hard-coded JSON blobs per chain (payload is identical for
+ * prod and staging — the only difference is the settlement contract, and
+ * that's entirely inside the container, not in the request). A schema
+ * change from CoW will break them visibly; update the blobs by hand.
  */
-const CHAINS = ["mainnet", "staging", "arbitrum", "gnosis"];
-const CHAIN_LABEL = {
-  mainnet:  "Ethereum prod",
-  staging:  "Ethereum staging",
-  arbitrum: "Arbitrum prod",
-  gnosis:   "Gnosis prod",
-};
+const CHAINS = ["mainnet", "arbitrum", "gnosis"];
+const ENVS = ["prod", "staging"];
 
-/* Path on our own origin. /prod/{chain}/, /staging/mainnet/, etc. */
-const CHAIN_PATH = {
-  mainnet:  "/prod/mainnet/",
-  staging:  "/staging/mainnet/",
-  arbitrum: "/prod/arbitrum/",
-  gnosis:   "/prod/gnosis/",
-};
+const CHAIN_LABEL = { mainnet: "Ethereum", arbitrum: "Arbitrum", gnosis: "Gnosis" };
+const ENV_LABEL   = { prod: "prod", staging: "staging" };
 
-/*
- * Preset payloads. Keep small sell amounts, huge deadline, real addresses
- * from each chain's token-allowlist. "Negative" presets use addresses NOT
- * in the allowlist so we can see the rejection path work.
- */
+function pathFor(chain, env) {
+  return "/" + env + "/" + chain + "/";
+}
+
+function configUrlFor(chain, env) {
+  return "/monitor/config/" + chain + "-" + env + ".json";
+}
+
+/* ---- presets (per chain; applied identically to prod and staging) ---- */
+
 function basePayload(sellToken, sellAmount, sellDecimals, sellSymbol, buyToken, buyDecimals, buySymbol) {
   return {
-    id: "monitor-" + Math.random().toString(16).slice(2, 10),
+    // /solve expects `id` to parse as an integer (or be null for quote mode).
+    id: String(Date.now()),
     tokens: {
       [sellToken]: { decimals: sellDecimals, symbol: sellSymbol, availableBalance: "0", trusted: false },
       [buyToken]:  { decimals: buyDecimals,  symbol: buySymbol,  availableBalance: "0", trusted: true  },
@@ -189,10 +212,7 @@ function basePayload(sellToken, sellAmount, sellDecimals, sellSymbol, buyToken, 
 
 const PRESETS = {
   mainnet: [
-    { label: "(no presets — prod is CoW-registered; use test_quote.json manually)", payload: null },
-  ],
-  staging: [
-    { label: "(no presets — shares addresses with prod)", payload: null },
+    { label: "(no presets — CoW-registered; edit test_quote.json and curl)", payload: null },
   ],
   arbitrum: [
     {
@@ -236,9 +256,10 @@ const PRESETS = {
   ],
 };
 
-/* State */
+/* ---- state ---- */
 let currentChain = "arbitrum";
-let healthTimer = null;
+let currentEnv   = "prod";
+let healthTimer  = null;
 
 /* ---- rendering helpers ---- */
 const $ = (id) => document.getElementById(id);
@@ -248,22 +269,31 @@ function setBadge(el, kind, text) {
 }
 function setText(el, s) { el.textContent = s; }
 
-/* Chain tabs */
-function renderChainTabs() {
-  const nav = $("chains");
-  nav.innerHTML = "";
+function renderTabs() {
+  const chainDiv = $("chain-tabs");
+  chainDiv.innerHTML = "";
   for (const c of CHAINS) {
     const b = document.createElement("button");
-    b.textContent = c;
+    b.textContent = CHAIN_LABEL[c];
     b.className = c === currentChain ? "active" : "";
-    b.onclick = () => { currentChain = c; onChainChange(); };
-    nav.appendChild(b);
+    b.onclick = () => { currentChain = c; onSelectionChange(); };
+    chainDiv.appendChild(b);
   }
+  const envDiv = $("env-tabs");
+  envDiv.innerHTML = "";
+  for (const e of ENVS) {
+    const b = document.createElement("button");
+    b.textContent = ENV_LABEL[e];
+    b.className = e === currentEnv ? "active" : "";
+    b.onclick = () => { currentEnv = e; onSelectionChange(); };
+    envDiv.appendChild(b);
+  }
+  setText($("selected-path"), pathFor(currentChain, currentEnv));
 }
 
 /* ---- health ---- */
 async function runHealth() {
-  const path = CHAIN_PATH[currentChain] + "healthz";
+  const path = pathFor(currentChain, currentEnv) + "healthz";
   setText($("health-url"), "GET " + path);
   setBadge($("health-status"), "pending", "…");
   setText($("health-latency"), "");
@@ -298,7 +328,7 @@ async function loadConfig() {
   $("allowlist").innerHTML = "";
   $("config-summary").innerHTML = "<span class='muted'>loading…</span>";
   try {
-    const resp = await fetch("/monitor/config/" + currentChain + ".json", { cache: "no-store" });
+    const resp = await fetch(configUrlFor(currentChain, currentEnv), { cache: "no-store" });
     if (!resp.ok) throw new Error(resp.status + " " + resp.statusText);
     const cfg = await resp.json();
     renderConfig(cfg);
@@ -311,6 +341,7 @@ async function loadConfig() {
 function renderConfig(cfg) {
   const t = document.createElement("table");
   const rows = [
+    ["chain", cfg.chain + " (" + (cfg.env || "?") + ")"],
     ["chain_id", cfg.chain_id],
     ["router_address", cfg.router_address],
     ["wrapped_native_token", cfg.wrapped_native_token],
@@ -347,15 +378,17 @@ function renderConfig(cfg) {
 function renderPresetOptions() {
   const sel = $("preset");
   sel.innerHTML = "";
-  for (const [i, p] of PRESETS[currentChain].entries()) {
+  // Presets are chain-level; prod/staging share them because only the
+  // settlement contract differs and that lives in the container.
+  const list = PRESETS[currentChain] || [];
+  for (const [i, p] of list.entries()) {
     const opt = document.createElement("option");
     opt.value = String(i);
     opt.textContent = p.label;
     opt.disabled = p.payload === null;
     sel.appendChild(opt);
   }
-  // Default to the first runnable preset.
-  const first = PRESETS[currentChain].findIndex(p => p.payload !== null);
+  const first = list.findIndex(p => p.payload !== null);
   sel.value = first >= 0 ? String(first) : "0";
   $("preset-run").disabled = first < 0;
   $("preset-body").style.display = "none";
@@ -366,14 +399,15 @@ function renderPresetOptions() {
 }
 
 function currentPreset() {
+  const list = PRESETS[currentChain] || [];
   const i = Number($("preset").value);
-  return PRESETS[currentChain][i];
+  return list[i];
 }
 
 async function runPreset() {
   const p = currentPreset();
   if (!p || !p.payload) return;
-  const path = CHAIN_PATH[currentChain] + "solve";
+  const path = pathFor(currentChain, currentEnv) + "solve";
   setBadge($("preset-status"), "pending", "…");
   setText($("preset-latency"), "");
   setText($("preset-response"), "(in flight…)");
@@ -416,8 +450,8 @@ function togglePresetBody() {
 }
 
 /* ---- wiring ---- */
-function onChainChange() {
-  renderChainTabs();
+function onSelectionChange() {
+  renderTabs();
   runHealth();
   loadConfig();
   renderPresetOptions();
@@ -436,7 +470,7 @@ $("preset").onchange = () => {
 };
 
 /* init */
-onChainChange();
+onSelectionChange();
 </script>
 </body>
 </html>

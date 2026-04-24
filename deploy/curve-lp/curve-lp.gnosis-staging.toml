@@ -1,0 +1,69 @@
+# Curve LP Solver - Gnosis Chain Staging Configuration
+#
+# Shares the same chain, RPC, router and token-allowlist as the prod
+# Gnosis config; only the settlement contract differs (CoW staging /
+# shadow settlement at 0xf553…cb13 — orders routed to this container go
+# through CoW shadow competitions, not real settlement).
+#
+# SECRETS: This file contains NO secrets.
+# NODE_URL is injected via environment variable — same NODE_URL_GNOSIS as
+# the prod gnosis container; RPC quota is shared between the two.
+#
+# Note: Gnosis native token is xDAI, wrapped native is WXDAI (not WETH).
+# CoW's native-price probe on Gnosis uses WXDAI as the reference token.
+
+chain-id = 100
+router-address = "0x0DCDED3545D565bA3B19E683431381007245d983"
+wrapped-native-token = "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"
+price-api-chain = "xdai"
+
+# RPC for on-chain verification (injected from environment)
+node-url = "${NODE_URL}"
+
+# Curve APIs (public, no auth needed)
+curve-api-url = "https://www.curve.finance/api/router/v1/routes"
+curve-price-api-url = "https://prices.curve.finance/"
+
+# Token filtering — see curve-lp.arbitrum.toml / README for how the three
+# filters interact. We use token-allowlist (both-sides) to confine the
+# solver to Curve-relevant Gnosis tokens + their pool LPs.
+#
+# Source: curve.finance Gnosis pool universe (deduped by address).
+token-allowlist = [
+    # ERC-20 coins
+    "0xa555d5344f6FB6c65da19e403Cb4c1eC4a1a5Ee3",  # BREAD
+    "0x712b3d230F3C1c19db860d80619288b1F0BDd0Bd",  # CRV
+    "0x54E4cB2a4Fa0ee46E3d9A98D13Bea119666E09f6",  # EURC.e
+    "0xcB444e90D8198415266c6a2724b7900fb12FC56E",  # EURe
+    "0x420CA0f9B9b604cE0fd9C18EF134C705e5Fa3430",  # EURe (variant)
+    "0x9C58BAcC331c9aa871AFD802DB6379a98e80CEdb",  # GNO
+    "0xF490c80aAE5f2616d3e3BDa2483E30C4CB21d1A0",  # osGNO
+    "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83",  # USDC
+    "0x2a22f9c3b484c3629090FeED35F17Ff8F88f76F0",  # USDC.e
+    "0x4ECaBa5870353805a9F068101A40E0f32ed605C6",  # USDT
+    "0xC6ed4f520f6A4e4DC27273509239b7F8A68d2068",  # UUSD
+    "0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1",  # WETH
+    "0x6C76971f98945AE98dD7d4DFcA8711ebea946eA6",  # wstETH
+    "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d",  # WXDAI (also wrapped-native-token above)
+    # LP tokens
+    "0x1337BedC9D22ecbe766dF105c9623922A27963EC",  # x3CRV
+    "0xf3D8F3dE71657D342db60dd714c8a2aE37Eac6B4",  # BUTTER
+    "0x592878b920101946Fb5915aB97961bC546f211CC",  # CRVEURe
+    "0x0CA1C1eC4EBf3CC67a9f545fF90a3795b318cA4a",  # crvEUReUSD
+    "0x845C8bc94610807fCbaB5dd2bc7aC9DAbaFf3c55",  # EUReEURC
+    "0xb5814811dC4fC2aC127A1F8Fb708460bF9Fad619",  # osGNOGNO
+    "0x0b9036F639f4E7498aFA34751a2710159373fC7B",  # USDCeEURe
+    "0x85d62Ba914912803588FCD5A722483235B785263",  # WETHwstETH
+    "0xf3e3376B15aCA6dC3852B131B7dE4851754062eB",  # WXDAIUUSD
+]
+
+# Optional buy-token either-side filter (left disabled):
+# allowed-buy-tokens = [
+# ]
+
+# Safety settings
+slippage-bps = 100              # 1% slippage buffer
+max-quote-deviation-bps = 300   # 3% max deviation between API and on-chain quote
+
+# CoW Protocol Staging / Shadow settlement contract (same on all chains)
+settlement-contract = "0xf553d092b50bdcbdded1a99af2ca29fbe5e2cb13"
