@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>curve-lp monitor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0e1116;
+    --panel: #161a22;
+    --border: #262c38;
+    --fg: #d7dbe0;
+    --muted: #7b8391;
+    --accent: #6ee7b7;
+    --warn: #fbbf24;
+    --bad: #f87171;
+    --link: #60a5fa;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: var(--bg); color: var(--fg);
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+  }
+  header h1 { margin: 0; font-size: 16px; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  nav.chains { display: flex; gap: 4px; margin-left: auto; }
+  nav.chains button {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--border);
+    padding: 6px 14px; font: inherit; cursor: pointer; border-radius: 4px;
+  }
+  nav.chains button.active { background: var(--accent); color: #0e1116; border-color: var(--accent); }
+  main { padding: 16px; display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  section.panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+    padding: 14px; min-width: 0;
+  }
+  section.panel h2 {
+    margin: 0 0 10px; font-size: 13px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600;
+  }
+  section.panel.wide { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table th, table td { text-align: left; padding: 4px 8px; vertical-align: top; }
+  table th { color: var(--muted); font-weight: 500; width: 170px; }
+  table td { word-break: break-all; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 3px;
+    font-size: 11px; font-weight: 600;
+  }
+  .badge.ok { background: rgba(110, 231, 183, 0.15); color: var(--accent); }
+  .badge.bad { background: rgba(248, 113, 113, 0.15); color: var(--bad); }
+  .badge.pending { background: rgba(123, 131, 145, 0.15); color: var(--muted); }
+  button.action {
+    background: var(--link); color: #0e1116; border: none; padding: 6px 12px;
+    font: inherit; font-weight: 600; cursor: pointer; border-radius: 4px;
+  }
+  button.action[disabled] { opacity: 0.5; cursor: default; }
+  button.secondary {
+    background: transparent; color: var(--fg); border: 1px solid var(--border);
+    padding: 5px 10px; font: inherit; cursor: pointer; border-radius: 4px;
+  }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row > * { flex-shrink: 0; }
+  select { background: var(--bg); color: var(--fg); border: 1px solid var(--border); padding: 5px 8px; font: inherit; border-radius: 4px; }
+  pre {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+    padding: 10px; margin: 10px 0 0; overflow: auto; max-height: 400px;
+    font-size: 12px; white-space: pre-wrap; word-break: break-all;
+  }
+  .allowlist {
+    max-height: 260px; overflow: auto; border: 1px solid var(--border);
+    border-radius: 4px; padding: 8px; font-size: 11px; line-height: 1.5;
+  }
+  .allowlist code { color: var(--muted); }
+  .muted { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>curve-lp monitor</h1>
+  <span class="sub">day-2 sanity checks · read / run presets · no logs (v1)</span>
+  <nav class="chains" id="chains"></nav>
+</header>
+
+<main>
+
+  <section class="panel">
+    <h2>Health</h2>
+    <div class="row">
+      <button class="action" id="health-refresh">Check</button>
+      <label class="muted"><input type="checkbox" id="health-auto"> auto (10s)</label>
+      <span id="health-status" class="badge pending">—</span>
+      <span id="health-latency" class="muted"></span>
+    </div>
+    <div class="muted" id="health-url" style="margin-top:6px"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Config</h2>
+    <div id="config-summary"></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Token allowlist</h2>
+    <div class="muted" id="allowlist-count"></div>
+    <div class="allowlist" id="allowlist"></div>
+  </section>
+
+  <section class="panel wide">
+    <h2>Preset query runner</h2>
+    <div class="row">
+      <select id="preset"></select>
+      <button class="action" id="preset-run">POST /solve</button>
+      <span id="preset-status" class="badge pending">—</span>
+      <span id="preset-latency" class="muted"></span>
+      <button class="secondary" id="preset-show">Show payload</button>
+    </div>
+    <pre id="preset-body" style="display:none"></pre>
+    <pre id="preset-response" class="muted">(no request sent yet)</pre>
+  </section>
+
+</main>
+
+<script>
+"use strict";
+
+/*
+ * Config
+ * ------
+ * Keep it dumb on purpose. Presets are hard-coded JSON blobs per chain so that
+ * a solver schema change doesn't silently break this file — we'll see the
+ * failure in the UI and update the blobs by hand.
+ *
+ * Chain IDs here match deploy/curve-lp/curve-lp.<chain>.toml.
+ */
+const CHAINS = ["mainnet", "staging", "arbitrum", "gnosis"];
+const CHAIN_LABEL = {
+  mainnet:  "Ethereum prod",
+  staging:  "Ethereum staging",
+  arbitrum: "Arbitrum prod",
+  gnosis:   "Gnosis prod",
+};
+
+/* Path on our own origin. /prod/{chain}/, /staging/mainnet/, etc. */
+const CHAIN_PATH = {
+  mainnet:  "/prod/mainnet/",
+  staging:  "/staging/mainnet/",
+  arbitrum: "/prod/arbitrum/",
+  gnosis:   "/prod/gnosis/",
+};
+
+/*
+ * Preset payloads. Keep small sell amounts, huge deadline, real addresses
+ * from each chain's token-allowlist. "Negative" presets use addresses NOT
+ * in the allowlist so we can see the rejection path work.
+ */
+function basePayload(sellToken, sellAmount, sellDecimals, sellSymbol, buyToken, buyDecimals, buySymbol) {
+  return {
+    id: "monitor-" + Math.random().toString(16).slice(2, 10),
+    tokens: {
+      [sellToken]: { decimals: sellDecimals, symbol: sellSymbol, availableBalance: "0", trusted: false },
+      [buyToken]:  { decimals: buyDecimals,  symbol: buySymbol,  availableBalance: "0", trusted: true  },
+    },
+    orders: [{
+      uid: "0x" + "02".repeat(56),
+      sellToken, buyToken,
+      sellAmount, fullSellAmount: sellAmount,
+      buyAmount: "1", fullBuyAmount: "1",
+      feePolicies: [], validTo: 0, kind: "sell",
+      owner: "0x5b1e2c2762667331bc91648052f646d1b0d35984",
+      partiallyFillable: false, preInteractions: [], postInteractions: [],
+      sellTokenSource: "erc20", buyTokenDestination: "erc20",
+      class: "market",
+      appData: "0x" + "0".repeat(64),
+      signingScheme: "presign", signature: "0x",
+    }],
+    liquidity: [],
+    effectiveGasPrice: "15000000000",
+    deadline: "2099-01-01T00:00:00.000Z",
+    surplusCapturingJitOrderOwners: [],
+  };
+}
+
+const PRESETS = {
+  mainnet: [
+    { label: "(no presets — prod is CoW-registered; use test_quote.json manually)", payload: null },
+  ],
+  staging: [
+    { label: "(no presets — shares addresses with prod)", payload: null },
+  ],
+  arbitrum: [
+    {
+      label: "1e18 2CRV → USDC (allowed)",
+      payload: basePayload(
+        "0x7f90122BF0700F9E7e1F688fe926940E8839F353", "1000000000000000000", 18, "2CRV",
+        "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", 6, "USDC"),
+    },
+    {
+      label: "1e18 crvUSD → USDC (allowed)",
+      payload: basePayload(
+        "0x498Bf2B1e120FeD3ad3D42EA2165E9b73f99C1e5", "1000000000000000000", 18, "crvUSD",
+        "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", 6, "USDC"),
+    },
+    {
+      label: "negative: shitcoin → USDC (should reject)",
+      payload: basePayload(
+        "0xdeAdBeef00000000000000000000000000000001", "1000000000000000000", 18, "SHIT",
+        "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", 6, "USDC"),
+    },
+  ],
+  gnosis: [
+    {
+      label: "1e18 x3CRV → WXDAI (allowed)",
+      payload: basePayload(
+        "0x1337BedC9D22ecbe766dF105c9623922A27963EC", "1000000000000000000", 18, "x3CRV",
+        "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d", 18, "WXDAI"),
+    },
+    {
+      label: "1e18 EURe → WXDAI (allowed)",
+      payload: basePayload(
+        "0xcB444e90D8198415266c6a2724b7900fb12FC56E", "1000000000000000000", 18, "EURe",
+        "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d", 18, "WXDAI"),
+    },
+    {
+      label: "negative: shitcoin → WXDAI (should reject)",
+      payload: basePayload(
+        "0xdeAdBeef00000000000000000000000000000001", "1000000000000000000", 18, "SHIT",
+        "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d", 18, "WXDAI"),
+    },
+  ],
+};
+
+/* State */
+let currentChain = "arbitrum";
+let healthTimer = null;
+
+/* ---- rendering helpers ---- */
+const $ = (id) => document.getElementById(id);
+function setBadge(el, kind, text) {
+  el.className = "badge " + kind;
+  el.textContent = text;
+}
+function setText(el, s) { el.textContent = s; }
+
+/* Chain tabs */
+function renderChainTabs() {
+  const nav = $("chains");
+  nav.innerHTML = "";
+  for (const c of CHAINS) {
+    const b = document.createElement("button");
+    b.textContent = c;
+    b.className = c === currentChain ? "active" : "";
+    b.onclick = () => { currentChain = c; onChainChange(); };
+    nav.appendChild(b);
+  }
+}
+
+/* ---- health ---- */
+async function runHealth() {
+  const path = CHAIN_PATH[currentChain] + "healthz";
+  setText($("health-url"), "GET " + path);
+  setBadge($("health-status"), "pending", "…");
+  setText($("health-latency"), "");
+  const t0 = performance.now();
+  try {
+    const resp = await fetch(path, { cache: "no-store" });
+    const dt = (performance.now() - t0).toFixed(0);
+    if (resp.ok) {
+      setBadge($("health-status"), "ok", resp.status + " " + resp.statusText);
+    } else {
+      setBadge($("health-status"), "bad", resp.status + " " + resp.statusText);
+    }
+    setText($("health-latency"), dt + " ms");
+  } catch (e) {
+    const dt = (performance.now() - t0).toFixed(0);
+    setBadge($("health-status"), "bad", "fetch error");
+    setText($("health-latency"), dt + " ms — " + (e && e.message || e));
+  }
+}
+
+function toggleAutoHealth() {
+  if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
+  if ($("health-auto").checked) {
+    runHealth();
+    healthTimer = setInterval(runHealth, 10000);
+  }
+}
+
+/* ---- config ---- */
+async function loadConfig() {
+  setText($("allowlist-count"), "loading…");
+  $("allowlist").innerHTML = "";
+  $("config-summary").innerHTML = "<span class='muted'>loading…</span>";
+  try {
+    const resp = await fetch("/monitor/config/" + currentChain + ".json", { cache: "no-store" });
+    if (!resp.ok) throw new Error(resp.status + " " + resp.statusText);
+    const cfg = await resp.json();
+    renderConfig(cfg);
+  } catch (e) {
+    $("config-summary").innerHTML = "<span class='badge bad'>config load failed</span> " +
+      "<span class='muted'>" + escapeHtml(String(e && e.message || e)) + "</span>";
+    setText($("allowlist-count"), "");
+  }
+}
+function renderConfig(cfg) {
+  const t = document.createElement("table");
+  const rows = [
+    ["chain_id", cfg.chain_id],
+    ["router_address", cfg.router_address],
+    ["wrapped_native_token", cfg.wrapped_native_token],
+    ["settlement_contract", cfg.settlement_contract],
+    ["price_api_chain", cfg.price_api_chain],
+  ];
+  for (const [k, v] of rows) {
+    const tr = document.createElement("tr");
+    const th = document.createElement("th"); th.textContent = k;
+    const td = document.createElement("td"); td.textContent = String(v);
+    tr.appendChild(th); tr.appendChild(td); t.appendChild(tr);
+  }
+  $("config-summary").innerHTML = "";
+  $("config-summary").appendChild(t);
+
+  const list = cfg.token_allowlist || [];
+  setText($("allowlist-count"), list.length + " address" + (list.length === 1 ? "" : "es"));
+  const frag = document.createDocumentFragment();
+  for (const a of list) {
+    const line = document.createElement("div");
+    const c = document.createElement("code");
+    c.textContent = a;
+    line.appendChild(c);
+    frag.appendChild(line);
+  }
+  $("allowlist").innerHTML = "";
+  $("allowlist").appendChild(frag);
+  if (list.length === 0) {
+    $("allowlist").innerHTML = "<span class='muted'>(empty — this chain uses lp-tokens instead of token-allowlist, or has no filter set)</span>";
+  }
+}
+
+/* ---- presets ---- */
+function renderPresetOptions() {
+  const sel = $("preset");
+  sel.innerHTML = "";
+  for (const [i, p] of PRESETS[currentChain].entries()) {
+    const opt = document.createElement("option");
+    opt.value = String(i);
+    opt.textContent = p.label;
+    opt.disabled = p.payload === null;
+    sel.appendChild(opt);
+  }
+  // Default to the first runnable preset.
+  const first = PRESETS[currentChain].findIndex(p => p.payload !== null);
+  sel.value = first >= 0 ? String(first) : "0";
+  $("preset-run").disabled = first < 0;
+  $("preset-body").style.display = "none";
+  $("preset-body").textContent = "";
+  setText($("preset-response"), "(no request sent yet)");
+  setBadge($("preset-status"), "pending", "—");
+  setText($("preset-latency"), "");
+}
+
+function currentPreset() {
+  const i = Number($("preset").value);
+  return PRESETS[currentChain][i];
+}
+
+async function runPreset() {
+  const p = currentPreset();
+  if (!p || !p.payload) return;
+  const path = CHAIN_PATH[currentChain] + "solve";
+  setBadge($("preset-status"), "pending", "…");
+  setText($("preset-latency"), "");
+  setText($("preset-response"), "(in flight…)");
+  const t0 = performance.now();
+  try {
+    const resp = await fetch(path, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(p.payload),
+      cache: "no-store",
+    });
+    const dt = (performance.now() - t0).toFixed(0);
+    const text = await resp.text();
+    let pretty = text;
+    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch {}
+    if (resp.ok) {
+      setBadge($("preset-status"), "ok", resp.status + " " + resp.statusText);
+    } else {
+      setBadge($("preset-status"), "bad", resp.status + " " + resp.statusText);
+    }
+    setText($("preset-latency"), dt + " ms · POST " + path);
+    setText($("preset-response"), pretty);
+  } catch (e) {
+    const dt = (performance.now() - t0).toFixed(0);
+    setBadge($("preset-status"), "bad", "fetch error");
+    setText($("preset-latency"), dt + " ms");
+    setText($("preset-response"), String(e && e.message || e));
+  }
+}
+
+function togglePresetBody() {
+  const pre = $("preset-body");
+  if (pre.style.display === "none") {
+    const p = currentPreset();
+    pre.textContent = p && p.payload ? JSON.stringify(p.payload, null, 2) : "(no payload)";
+    pre.style.display = "";
+  } else {
+    pre.style.display = "none";
+  }
+}
+
+/* ---- wiring ---- */
+function onChainChange() {
+  renderChainTabs();
+  runHealth();
+  loadConfig();
+  renderPresetOptions();
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"})[c]);
+}
+
+$("health-refresh").onclick = runHealth;
+$("health-auto").onchange = toggleAutoHealth;
+$("preset-run").onclick = runPreset;
+$("preset-show").onclick = togglePresetBody;
+$("preset").onchange = () => {
+  $("preset-body").style.display = "none";
+};
+
+/* init */
+onChainChange();
+</script>
+</body>
+</html>

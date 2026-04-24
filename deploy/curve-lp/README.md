@@ -162,6 +162,22 @@ not committed. `.env.example` is the template. Required vars:
 Moving to AWS Secrets Manager / SSM is a future TODO; see
 `deploy/curve-lp/AWS_SECRETS.md`.
 
+**Quote values containing shell metacharacters.** `deploy.sh` sources `.env`
+with `set -a; source .env; set +a`, so unquoted values get interpreted by
+bash. If your RPC URL has `?`, `&`, `=`, `#`, or spaces in it — typical for
+query-string API keys — wrap the entire value in double quotes:
+
+```
+NODE_URL_ARBITRUM="https://rpc.example.com/v1?api_key=abc&chain=arb"   # safe
+NODE_URL_ARBITRUM=https://rpc.example.com/v1?api_key=abc&chain=arb     # broken
+```
+
+Symptom of forgetting to quote: `./deploy.sh` errors with `Missing required
+environment variables: - NODE_URL_ARBITRUM` even though the line is in
+`.env`. What happened: `&` forked `chain=arb` into the background, the
+value silently truncated at the `?`, and the `-z` check saw it as empty.
+When in doubt, quote.
+
 ---
 
 ## Monitoring
@@ -187,9 +203,68 @@ per-line service prefixes).
 `monitor.sh` is an interactive console tail with trade extraction to
 `trades.log`.
 
+### Monitor UI (`/monitor/`)
+
+Browser-side day-2 sanity dashboard at `https://$DOMAIN/monitor/`, behind
+HTTP Basic auth. Shows per-chain health + latency, renders each chain's
+`token-allowlist`, and runs preset `/solve` smoke queries. v1 doesn't have
+logs, metrics history, or a form-based payload builder — use `tg-monitor`
+for logs, `curl` for custom payloads.
+
+**Enable**:
+1. Set `MONITOR_USER` and `MONITOR_PASSWORD` in `.env` (both, or neither).
+2. `./deploy.sh --ingress-only` — regenerates the htpasswd file and
+   sanitized config JSONs, restarts nginx. Solver containers untouched.
+3. Navigate to `https://$DOMAIN/monitor/` and log in.
+
+**Rotate the password**: edit `.env`, rerun `./deploy.sh --ingress-only`.
+
+**Disable**: remove both env vars, rerun `./deploy.sh --ingress-only`. The
+htpasswd file becomes empty and nginx rejects every login.
+
+**Freshness**: the `/monitor/config/*.json` files are regenerated on any
+deploy that rebuilds the corresponding solver — so `./deploy.sh
+--chains=arbitrum` updates `arbitrum.json` too, even though it doesn't
+touch ingress. This keeps the UI honest after a solver-only config edit.
+The trigger is "monitor was set up at some point" (non-empty
+`./processed/htpasswd`); if you've never enabled the monitor, solver-only
+deploys skip the regen to stay fast.
+
+**Security notes**:
+- The `/monitor/config/*.json` files are NOT the processed TOMLs. They're
+  a positive-allowlist subset (six fields: chain_id, router_address,
+  wrapped_native_token, settlement_contract, price_api_chain,
+  token_allowlist). `node-url` — which contains the RPC API key after
+  envsubst — is never included.
+- Preset payloads POST to `/prod/{chain}/solve`, which is already public
+  (CoW drivers hit it). Basic auth leaking doesn't escalate blast radius.
+- If you add a new field to the deploy TOMLs that the UI should show,
+  update both the generator in `deploy.sh` (`emit_monitor_json`) and the
+  UI in `nginx/monitor/index.html`. No auto-sync.
+- Preset payloads are hard-coded JSON blobs in the HTML. If CoW's `/solve`
+  request schema changes, update the blobs by hand.
+
 ---
 
 ## Troubleshooting
+
+### `./deploy.sh` errors with "Missing required environment variables" for a var that IS in `.env`
+
+Almost always an unquoted value containing `?`, `&`, `=`, `#`, or a space
+— classic for RPC URLs with query-string keys. Bash interprets those when
+`source`-ing `.env`, truncating the value. Wrap the whole value in double
+quotes: `NODE_URL_FOO="https://..."`. See Secrets section above.
+
+Quick check on the VPS:
+```
+cd ~/cow-solver-services/deploy/curve-lp
+set -a; source .env; set +a
+echo "[$NODE_URL_ARBITRUM]"   # empty brackets => quoting bug
+```
+
+Other (rarer) causes: CRLF line endings if the file was edited on Windows
+(fix: `sed -i 's/\r$//' .env`); UTF-8 BOM (`file .env` reports "UTF-8
+Unicode (with BOM)"; fix: re-save without BOM).
 
 ### `./deploy.sh --chains=arbitrum` fails with mount errors on clean host
 Something else is also trying to start. Check `docker compose ps` — any

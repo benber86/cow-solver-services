@@ -274,6 +274,173 @@ if [ ${#SOLVER_SERVICES[@]} -gt 0 ]; then
     echo -e "${GREEN}✓ No placeholder values in configs${NC}"
 fi
 
+# ---------- monitor UI assets ----------
+#
+# Two triggers, two concerns:
+#
+#   1. htpasswd (Basic-auth): written only when the ingress is being rebuilt.
+#      Writing it at solver-only-deploy time would be useless — nginx has
+#      already loaded it and won't reload without a recycle.
+#
+#   2. Sanitized per-chain config JSON: written whenever the corresponding
+#      chain's solver is rebuilt, OR when ingress is rebuilt. This is what
+#      keeps the /monitor/ page honest after solver-only deploys — if we
+#      skipped it on `--chains=arbitrum`, the UI would show yesterday's
+#      allowlist for arbitrum until someone ran --with-ingress.
+#
+# Positive-allowlist generator: only six fields cross over from the TOML,
+# so NODE_URL (which contains the API key after envsubst) can't leak.
+# Reads the UNSUBSTITUTED source TOMLs, never the processed ones.
+
+MONITOR_ENABLED=0
+if [ ${#INGRESS_SERVICES[@]} -gt 0 ]; then
+    if [ -n "${MONITOR_USER:-}" ] && [ -n "${MONITOR_PASSWORD:-}" ]; then
+        MONITOR_ENABLED=1
+    elif [ -n "${MONITOR_USER:-}" ] || [ -n "${MONITOR_PASSWORD:-}" ]; then
+        echo -e "${RED}ERROR: set both MONITOR_USER and MONITOR_PASSWORD (or neither)${NC}" >&2
+        exit 1
+    fi
+fi
+
+# For solver-only deploys, "is monitor set up?" = "does processed/htpasswd
+# exist and have content?". A previous ingress deploy with MONITOR_* set
+# will have populated it; if it's missing or empty, nothing's watching the
+# JSON files so we skip regen to keep the solver-only flow fast and quiet.
+MONITOR_JSON_REFRESH=0
+if [ "$MONITOR_ENABLED" = "1" ]; then
+    MONITOR_JSON_REFRESH=1
+elif [ ${#SOLVER_SERVICES[@]} -gt 0 ] && [ -s ./processed/htpasswd ]; then
+    MONITOR_JSON_REFRESH=1
+fi
+
+# ---- generator helpers (used by both triggers below) ----
+
+# extract_scalar <toml-file> <kebab-key>
+# Emits the raw right-hand-side of `key = value` for a single line.
+# Strips surrounding whitespace and trailing `# comment` only; callers
+# handle quoting/typing.
+extract_scalar() {
+    # shellcheck disable=SC2016
+    awk -v k="$2" '
+        $0 ~ "^[[:space:]]*" k "[[:space:]]*=" {
+            sub(/^[^=]*=[[:space:]]*/, "");
+            sub(/[[:space:]]*#.*$/, "");
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "");
+            print;
+            exit;
+        }
+    ' "$1"
+}
+
+# extract_token_allowlist <toml-file>
+# Prints the addresses inside `token-allowlist = [...]`, one per line,
+# still double-quoted. Multi-line array safe. Empty if the key is absent
+# or commented out.
+extract_token_allowlist() {
+    awk '
+        /^[[:space:]]*token-allowlist[[:space:]]*=[[:space:]]*\[/ { in_list = 1; next; }
+        in_list && /^[[:space:]]*\]/ { exit; }
+        in_list {
+            if (match($0, /"0x[0-9a-fA-F]+"/)) {
+                print substr($0, RSTART, RLENGTH);
+            }
+        }
+    ' "$1"
+}
+
+# emit_monitor_json <chain-label> <source-toml> <output-json>
+emit_monitor_json() {
+    local chain="$1"
+    local src="$2"
+    local dst="$3"
+    if [ ! -f "$src" ]; then
+        return 0
+    fi
+
+    local chain_id router wrapped settle slug allowlist_items
+    chain_id="$(extract_scalar "$src" "chain-id")"
+    router="$(extract_scalar "$src" "router-address")"
+    wrapped="$(extract_scalar "$src" "wrapped-native-token")"
+    settle="$(extract_scalar "$src" "settlement-contract")"
+    slug="$(extract_scalar "$src" "price-api-chain")"
+    allowlist_items="$(extract_token_allowlist "$src" | paste -sd, -)"
+
+    {
+        printf '{\n'
+        printf '  "chain": "%s",\n' "$chain"
+        printf '  "chain_id": %s,\n' "$chain_id"
+        printf '  "router_address": %s,\n' "$router"
+        printf '  "wrapped_native_token": %s,\n' "$wrapped"
+        printf '  "settlement_contract": %s,\n' "$settle"
+        printf '  "price_api_chain": %s,\n' "$slug"
+        printf '  "token_allowlist": [%s]\n' "$allowlist_items"
+        printf '}\n'
+    } > "$dst"
+}
+
+# ---- trigger 1: htpasswd (ingress branch) ----
+
+if [ ${#INGRESS_SERVICES[@]} -gt 0 ]; then
+    mkdir -p ./processed ./processed/monitor
+
+    if [ "$MONITOR_ENABLED" = "1" ]; then
+        if ! command -v openssl >/dev/null 2>&1; then
+            echo -e "${RED}ERROR: openssl is required for Basic auth htpasswd generation${NC}" >&2
+            exit 1
+        fi
+        MONITOR_HASH="$(openssl passwd -apr1 "$MONITOR_PASSWORD")"
+        printf "%s:%s\n" "$MONITOR_USER" "$MONITOR_HASH" > ./processed/htpasswd
+        chmod 600 ./processed/htpasswd
+        echo -e "${GREEN}✓ Monitor htpasswd generated${NC} (user=$MONITOR_USER)"
+    else
+        # Ingress rebuild requested but monitor disabled: empty htpasswd so
+        # nginx's auth_basic_user_file rejects every login. (Monitor is off.)
+        : > ./processed/htpasswd
+        chmod 600 ./processed/htpasswd
+        echo -e "${YELLOW}Monitor disabled (MONITOR_USER / MONITOR_PASSWORD unset)${NC}"
+    fi
+fi
+
+# ---- trigger 2: sanitized JSON (refresh on any deploy that touches
+#      the corresponding chain, as long as monitor is set up) ----
+
+if [ "$MONITOR_JSON_REFRESH" = "1" ]; then
+    mkdir -p ./processed/monitor
+
+    REFRESHED_CHAINS=()
+    # If ingress is being rebuilt, refresh all four so the UI can't be
+    # ahead of reality anywhere. Otherwise refresh only the chains whose
+    # solvers are being rebuilt right now.
+    if [ ${#INGRESS_SERVICES[@]} -gt 0 ]; then
+        emit_monitor_json "mainnet"  curve-lp.prod.toml     ./processed/monitor/mainnet.json
+        emit_monitor_json "staging"  curve-lp.staging.toml  ./processed/monitor/staging.json
+        emit_monitor_json "arbitrum" curve-lp.arbitrum.toml ./processed/monitor/arbitrum.json
+        emit_monitor_json "gnosis"   curve-lp.gnosis.toml   ./processed/monitor/gnosis.json
+        REFRESHED_CHAINS=(mainnet staging arbitrum gnosis)
+    else
+        if [ "$REBUILD_PROD" = "1" ]; then
+            emit_monitor_json "mainnet" curve-lp.prod.toml ./processed/monitor/mainnet.json
+            REFRESHED_CHAINS+=(mainnet)
+        fi
+        if [ "$REBUILD_STAGING" = "1" ]; then
+            emit_monitor_json "staging" curve-lp.staging.toml ./processed/monitor/staging.json
+            REFRESHED_CHAINS+=(staging)
+        fi
+        if [ "$REBUILD_ARBITRUM" = "1" ]; then
+            emit_monitor_json "arbitrum" curve-lp.arbitrum.toml ./processed/monitor/arbitrum.json
+            REFRESHED_CHAINS+=(arbitrum)
+        fi
+        if [ "$REBUILD_GNOSIS" = "1" ]; then
+            emit_monitor_json "gnosis" curve-lp.gnosis.toml ./processed/monitor/gnosis.json
+            REFRESHED_CHAINS+=(gnosis)
+        fi
+    fi
+
+    if [ ${#REFRESHED_CHAINS[@]} -gt 0 ]; then
+        echo -e "${GREEN}✓ Monitor config refreshed for:${NC} ${REFRESHED_CHAINS[*]}"
+    fi
+fi
+
 # ---------- build + bring up ----------
 
 export DOCKER_BUILDKIT=1

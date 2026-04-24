@@ -31,6 +31,12 @@ services:
       - ./nginx/nginx.conf:/etc/nginx/nginx.template:ro
       - certbot-etc:/etc/letsencrypt:ro
       - certbot-www:/var/www/certbot
+      # Monitor UI (static HTML + sanitized config JSON + htpasswd).
+      # All three are optional: if the monitor is disabled via env, the
+      # htpasswd file is empty and nginx rejects every Basic-auth login.
+      - ./nginx/monitor:/usr/share/nginx/monitor:ro
+      - ./processed/monitor:/usr/share/nginx/monitor-config:ro
+      - ./processed/htpasswd:/etc/nginx/htpasswd:ro
     environment:
       - DOMAIN=${DOMAIN}
     depends_on:

@@ -1,0 +1,45 @@
+{
+  "id": "1",
+  "tokens": {
+    "0x1337BedC9D22ecbe766dF105c9623922A27963EC": {
+      "decimals": 18,
+      "symbol": "x3CRV",
+      "availableBalance": "1000000000000000000000",
+      "trusted": false
+    },
+    "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d": {
+      "decimals": 18,
+      "symbol": "WXDAI",
+      "availableBalance": "0",
+      "trusted": true
+    }
+  },
+  "orders": [
+    {
+      "uid": "0x0303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303",
+      "sellToken": "0x1337BedC9D22ecbe766dF105c9623922A27963EC",
+      "buyToken": "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d",
+      "sellAmount": "1000000000000000000",
+      "fullSellAmount": "1000000000000000000",
+      "buyAmount": "1",
+      "fullBuyAmount": "1",
+      "feePolicies": [],
+      "validTo": 0,
+      "kind": "sell",
+      "owner": "0x5b1e2c2762667331bc91648052f646d1b0d35984",
+      "partiallyFillable": false,
+      "preInteractions": [],
+      "postInteractions": [],
+      "sellTokenSource": "erc20",
+      "buyTokenDestination": "erc20",
+      "class": "market",
+      "appData": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "signingScheme": "presign",
+      "signature": "0x"
+    }
+  ],
+  "liquidity": [],
+  "effectiveGasPrice": "2000000000",
+  "deadline": "2099-01-01T00:00:00.000Z",
+  "surplusCapturingJitOrderOwners": []
+}
