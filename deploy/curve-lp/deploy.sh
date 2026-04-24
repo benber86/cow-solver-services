@@ -390,13 +390,16 @@ if [ ${#INGRESS_SERVICES[@]} -gt 0 ]; then
         fi
         MONITOR_HASH="$(openssl passwd -apr1 "$MONITOR_PASSWORD")"
         printf "%s:%s\n" "$MONITOR_USER" "$MONITOR_HASH" > ./processed/htpasswd
-        chmod 600 ./processed/htpasswd
+        # 644 so the nginx container's worker (uid 101) can read the bind-
+        # mount. The file contains only the apr1 hash, not the plaintext —
+        # durable to offline attack, and the host path is not world-reachable.
+        chmod 644 ./processed/htpasswd
         echo -e "${GREEN}✓ Monitor htpasswd generated${NC} (user=$MONITOR_USER)"
     else
         # Ingress rebuild requested but monitor disabled: empty htpasswd so
         # nginx's auth_basic_user_file rejects every login. (Monitor is off.)
         : > ./processed/htpasswd
-        chmod 600 ./processed/htpasswd
+        chmod 644 ./processed/htpasswd
         echo -e "${YELLOW}Monitor disabled (MONITOR_USER / MONITOR_PASSWORD unset)${NC}"
     fi
 fi
