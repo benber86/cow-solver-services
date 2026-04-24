@@ -130,6 +130,21 @@ parse every deploy TOML at build time, so a malformed or mis-chained config
 breaks the build rather than the running container. Add a test when you add
 a chain.
 
+### Token filters
+
+Three independent filters can narrow what the solver engages with. All are
+optional; any combination can be set. Applied together (AND).
+
+| filter                 | semantics                                                            | use when                                          |
+|------------------------|----------------------------------------------------------------------|---------------------------------------------------|
+| `lp-tokens`            | either-side — at least one side must be in this list                 | "I'm the LP specialist; other side unconstrained" |
+| `allowed-buy-tokens`   | either-side — at least one side must be in this list (misleadingly named; symmetric) | historical crvUSD-style filter                    |
+| `token-allowlist`      | **both-sides** — reject if either `sell.token` or `buy.token` is absent | "confine the solver to a known universe"          |
+
+Leaving all three omitted attempts every order and can cause deadline
+timeouts. Mainnet uses `lp-tokens`; Arbitrum/Gnosis are set up to use
+`token-allowlist` instead.
+
 ### Secrets
 
 All secrets live in `deploy/curve-lp/.env` on the VPS. Not a secrets manager,

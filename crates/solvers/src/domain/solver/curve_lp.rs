@@ -151,6 +151,12 @@ pub struct Config {
     /// Allowed buy tokens (crvUSD + pool underlyings).
     /// `None` means accept any buy token.
     pub allowed_buy_tokens: Option<Vec<eth::Address>>,
+    /// Strict both-sides token allowlist: if set, reject any order whose sell
+    /// or buy token is not in this list. Applied independently of
+    /// `lp_tokens` / `allowed_buy_tokens`, which are either-side filters —
+    /// use this one when you want to confine the solver to a known universe
+    /// of tokens regardless of whether an LP is involved.
+    pub token_allowlist: Option<Vec<eth::Address>>,
     /// Curve Router API URL.
     pub curve_api_url: Url,
     /// Curve Price API URL.
@@ -169,6 +175,7 @@ struct Inner {
     chain: ChainConfig,
     lp_tokens: Option<HashSet<eth::Address>>,
     allowed_buy_tokens: Option<HashSet<eth::Address>>,
+    token_allowlist: Option<HashSet<eth::Address>>,
     api_client: api::Client,
     price_client: price_api::Client,
     provider: ethrpc::AlloyProvider,
@@ -183,10 +190,14 @@ impl Solver {
         tracing::info!(
             lp_token_filter_count = config.lp_tokens.as_ref().map_or(0, Vec::len),
             buy_token_filter_count = config.allowed_buy_tokens.as_ref().map_or(0, Vec::len),
+            token_allowlist_count = config.token_allowlist.as_ref().map_or(0, Vec::len),
             "initialized Curve LP token filters"
         );
 
-        if config.lp_tokens.is_none() && config.allowed_buy_tokens.is_none() {
+        if config.lp_tokens.is_none()
+            && config.allowed_buy_tokens.is_none()
+            && config.token_allowlist.is_none()
+        {
             tracing::warn!(
                 "Curve LP solver is running without token filters; \
                  all sell orders will be attempted and this can cause timeouts"
@@ -207,6 +218,7 @@ impl Solver {
                 chain: config.chain,
                 lp_tokens: config.lp_tokens.map(|v| v.into_iter().collect()),
                 allowed_buy_tokens: config.allowed_buy_tokens.map(|v| v.into_iter().collect()),
+                token_allowlist: config.token_allowlist.map(|v| v.into_iter().collect()),
                 api_client,
                 price_client,
                 provider: web3.alloy,
@@ -415,6 +427,17 @@ impl Inner {
     /// Returns `None` if the order is supported, or a static reason string if
     /// it should be rejected.
     fn rejection_reason(&self, order: &Order) -> Option<&'static str> {
+        // Strict both-sides allowlist: reject if either token is absent.
+        // Independent of and stricter than the either-side filters below;
+        // use this when you want to confine the solver to a fixed universe
+        // of tokens.
+        if let Some(ref allowlist) = self.token_allowlist
+            && (!allowlist.contains(&order.sell.token.0)
+                || !allowlist.contains(&order.buy.token.0))
+        {
+            return Some("token_not_allowlisted");
+        }
+
         match order.side {
             order::Side::Sell => {
                 if let Some(ref lp_tokens) = self.lp_tokens {
@@ -1113,6 +1136,7 @@ mod tests {
             chain: test_chain_config(),
             lp_tokens: None,
             allowed_buy_tokens: None,
+            token_allowlist: None,
             api_client: api::Client::new("http://localhost:1".parse().unwrap()),
             price_client: price_api::Client::new("http://localhost:1".parse().unwrap()),
             provider: ethrpc::web3(
@@ -1248,5 +1272,125 @@ mod tests {
         assert!(parse("arbitrum-one").is_err());
         assert!(parse("mainnet").is_err());
         assert!(parse("gnosis").is_err());
+    }
+
+    // --- token_allowlist filter tests ---
+
+    fn sell_order(sell: eth::Address, buy: eth::Address) -> Order {
+        Order {
+            uid: order::Uid([0u8; 56]),
+            sell: eth::Asset {
+                token: eth::TokenAddress(sell),
+                amount: U256::from(1_000_000u128),
+            },
+            buy: eth::Asset {
+                token: eth::TokenAddress(buy),
+                amount: U256::from(1u128),
+            },
+            side: order::Side::Sell,
+            class: order::Class::Market,
+            partially_fillable: false,
+            flashloan_hint: None,
+            wrappers: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn token_allowlist_accepts_when_both_sides_in_list() {
+        let a = eth::Address::repeat_byte(0xaa);
+        let b = eth::Address::repeat_byte(0xbb);
+        let mut inner = test_inner(100, 50);
+        inner.token_allowlist = Some([a, b].into_iter().collect());
+        assert_eq!(inner.rejection_reason(&sell_order(a, b)), None);
+        assert_eq!(inner.rejection_reason(&sell_order(b, a)), None);
+    }
+
+    #[tokio::test]
+    async fn token_allowlist_rejects_when_sell_not_in_list() {
+        let a = eth::Address::repeat_byte(0xaa);
+        let b = eth::Address::repeat_byte(0xbb);
+        let shitcoin = eth::Address::repeat_byte(0xcc);
+        let mut inner = test_inner(100, 50);
+        inner.token_allowlist = Some([a, b].into_iter().collect());
+        assert_eq!(
+            inner.rejection_reason(&sell_order(shitcoin, a)),
+            Some("token_not_allowlisted")
+        );
+    }
+
+    #[tokio::test]
+    async fn token_allowlist_rejects_when_buy_not_in_list() {
+        let a = eth::Address::repeat_byte(0xaa);
+        let b = eth::Address::repeat_byte(0xbb);
+        let shitcoin = eth::Address::repeat_byte(0xcc);
+        let mut inner = test_inner(100, 50);
+        inner.token_allowlist = Some([a, b].into_iter().collect());
+        assert_eq!(
+            inner.rejection_reason(&sell_order(a, shitcoin)),
+            Some("token_not_allowlisted")
+        );
+    }
+
+    #[tokio::test]
+    async fn token_allowlist_rejects_when_neither_side_in_list() {
+        let a = eth::Address::repeat_byte(0xaa);
+        let b = eth::Address::repeat_byte(0xbb);
+        let shitcoin1 = eth::Address::repeat_byte(0xcc);
+        let shitcoin2 = eth::Address::repeat_byte(0xdd);
+        let mut inner = test_inner(100, 50);
+        inner.token_allowlist = Some([a, b].into_iter().collect());
+        assert_eq!(
+            inner.rejection_reason(&sell_order(shitcoin1, shitcoin2)),
+            Some("token_not_allowlisted")
+        );
+    }
+
+    #[tokio::test]
+    async fn token_allowlist_absent_accepts_anything() {
+        // Without the filter, rejection_reason returns None regardless of
+        // tokens (both other filters are also None in test_inner).
+        let inner = test_inner(100, 50);
+        assert_eq!(
+            inner.rejection_reason(&sell_order(
+                eth::Address::repeat_byte(0xcc),
+                eth::Address::repeat_byte(0xdd),
+            )),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn token_allowlist_combines_with_lp_tokens_filter() {
+        // With both filters set, both must pass. `lp-tokens` requires one
+        // side to be an LP; `token_allowlist` requires both sides to be in
+        // the list. An order passing only the LP filter still gets rejected
+        // if its other side isn't allowlisted.
+        let lp = eth::Address::repeat_byte(0x01);
+        let allowlisted = eth::Address::repeat_byte(0x02);
+        let elsewhere = eth::Address::repeat_byte(0x03);
+
+        let mut inner = test_inner(100, 50);
+        inner.lp_tokens = Some([lp].into_iter().collect());
+        inner.token_allowlist = Some([lp, allowlisted].into_iter().collect());
+
+        // LP on sell, allowlisted on buy -> passes both.
+        assert_eq!(inner.rejection_reason(&sell_order(lp, allowlisted)), None);
+
+        // LP on sell, non-allowlisted on buy -> fails allowlist.
+        assert_eq!(
+            inner.rejection_reason(&sell_order(lp, elsewhere)),
+            Some("token_not_allowlisted")
+        );
+
+        // Allowlisted but not LP on both sides -> fails lp_tokens.
+        // Allowlist check runs first, so the allowlist must pass for the
+        // lp-tokens reason to surface. Use two allowlisted tokens neither
+        // of which is an LP:
+        let a2 = eth::Address::repeat_byte(0x04);
+        inner.token_allowlist = Some([lp, allowlisted, a2].into_iter().collect());
+        assert_eq!(
+            inner.rejection_reason(&sell_order(allowlisted, a2)),
+            Some("no_lp_token_match")
+        );
     }
 }

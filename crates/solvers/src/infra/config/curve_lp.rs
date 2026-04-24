@@ -40,6 +40,13 @@ struct Config {
     #[serde(default)]
     allowed_buy_tokens: Option<Vec<eth::Address>>,
 
+    /// Strict both-sides token allowlist. If set, the solver rejects any
+    /// order where either `sell.token` or `buy.token` is not in this list.
+    /// Independent of (and stricter than) `lp_tokens` / `allowed_buy_tokens`,
+    /// which are either-side filters.
+    #[serde(default)]
+    token_allowlist: Option<Vec<eth::Address>>,
+
     /// Curve Router API URL.
     curve_api_url: Url,
 
@@ -114,6 +121,7 @@ pub async fn load(path: &Path) -> curve_lp::Config {
         chain,
         lp_tokens: config.lp_tokens,
         allowed_buy_tokens: config.allowed_buy_tokens,
+        token_allowlist: config.token_allowlist,
         curve_api_url: config.curve_api_url,
         curve_price_api_url: config.curve_price_api_url,
         node_url: config.node_url,
@@ -192,5 +200,79 @@ mod tests {
     fn gnosis_deploy_config_is_valid() {
         let raw = include_str!("../../../../../deploy/curve-lp/curve-lp.gnosis.toml");
         parse_and_validate(raw).expect("gnosis deploy config should parse and validate");
+    }
+
+    /// A minimal TOML document with just the required fields, plus whatever
+    /// the caller appends. Used by the token-allowlist serde tests to avoid
+    /// coupling them to any of the real deploy TOMLs (whose `token-allowlist`
+    /// is commented out, which defeats the purpose of the assertion).
+    fn minimal_toml(extra: &str) -> String {
+        format!(
+            r#"
+chain-id = 1
+router-address = "0x45312ea0eFf7E09C83CBE249fa1d7598c4C8cd4e"
+wrapped-native-token = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+price-api-chain = "ethereum"
+node-url = "https://dummy.invalid/"
+curve-api-url = "https://dummy.invalid/"
+curve-price-api-url = "https://dummy.invalid/"
+settlement-contract = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"
+{extra}
+"#
+        )
+    }
+
+    #[test]
+    fn token_allowlist_populated_parses_and_preserves_addresses() {
+        let raw = minimal_toml(
+            r#"
+token-allowlist = [
+    "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+]
+"#,
+        );
+        let parsed: Config = toml::de::from_str(&raw).expect("should parse");
+        let list = parsed
+            .token_allowlist
+            .expect("token_allowlist should be present");
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            list[0],
+            "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+                .parse::<eth::Address>()
+                .unwrap()
+        );
+        assert_eq!(
+            list[1],
+            "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+                .parse::<eth::Address>()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn token_allowlist_omitted_defaults_to_none() {
+        // Proves `#[serde(default)]` is wired on the field — without it the
+        // deserializer would reject a document that omits the key.
+        let raw = minimal_toml("");
+        let parsed: Config = toml::de::from_str(&raw).expect("should parse");
+        assert!(parsed.token_allowlist.is_none());
+    }
+
+    #[test]
+    fn token_allowlist_wrong_key_spelling_is_rejected() {
+        // `deny_unknown_fields` is set on Config, so the snake_case variant
+        // (or any typo) fails parsing. This locks in the kebab-case key.
+        let raw = minimal_toml(
+            r#"
+token_allowlist = [ "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1" ]
+"#,
+        );
+        let result: Result<Config, _> = toml::de::from_str(&raw);
+        assert!(
+            result.is_err(),
+            "snake_case token_allowlist should be rejected by deny_unknown_fields"
+        );
     }
 }

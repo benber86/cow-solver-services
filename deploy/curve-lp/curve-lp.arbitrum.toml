@@ -16,12 +16,37 @@ node-url = "${NODE_URL}"
 curve-api-url = "https://www.curve.finance/api/router/v1/routes"
 curve-price-api-url = "https://prices.curve.finance/"
 
-# Token filtering: no lp-tokens yet — smoke-test routing on real Arbitrum
-# pools first, then restrict. Running without lp-tokens attempts every sell
-# order, which can cause deadline timeouts; accept that trade-off for the
-# first live run.
+# Token filtering — three independent knobs, applied together:
+#
+# - lp-tokens:        either-side — at least one side of the trade must be
+#                     one of these LP tokens. Use when you're the LP
+#                     specialist and the other side can be anything.
+# - allowed-buy-tokens: either-side — at least one side must be in this
+#                     list. Historically "buy-side crvUSD-and-friends"
+#                     filtering; misleadingly named (symmetric in practice).
+# - token-allowlist:  BOTH-sides — reject if either sell.token or
+#                     buy.token is not in this list. Use when you want the
+#                     solver confined to a known universe (e.g. "shitcoin
+#                     → ETH" gets rejected instead of quoted).
+#
+# Leaving all three omitted attempts every sell order, which can cause
+# deadline timeouts.
+#
+# For Arbitrum, the plan is: populate token-allowlist with the target LP
+# tokens + the usual quote currencies (ETH, USDC, USDC.e, USDT, …) so we
+# only engage with the intended universe.
+#
+# token-allowlist = [
+#     # LP tokens:
+#     "0x7f90122BF0700F9E7e1F688fe926940E8839F353",  # 2CRV (USDC.e/USDT)
+#     # quote/underlying tokens:
+#     "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",  # WETH
+#     "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",  # USDC
+#     "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8",  # USDC.e
+#     "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",  # USDT
+# ]
 
-# Optional buy-token filtering (left disabled):
+# Optional buy-token either-side filter (left disabled):
 # allowed-buy-tokens = [
 # ]
 

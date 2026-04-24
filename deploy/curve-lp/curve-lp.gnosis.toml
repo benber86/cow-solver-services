@@ -19,12 +19,21 @@ node-url = "${NODE_URL}"
 curve-api-url = "https://www.curve.finance/api/router/v1/routes"
 curve-price-api-url = "https://prices.curve.finance/"
 
-# Token filtering: no lp-tokens yet — smoke-test routing on real Gnosis
-# pools first, then restrict. Running without lp-tokens attempts every sell
-# order, which can cause deadline timeouts; accept that trade-off for the
-# first live run.
+# Token filtering — see curve-lp.arbitrum.toml for the full explanation of
+# lp-tokens / allowed-buy-tokens / token-allowlist semantics. The cheapest
+# way to avoid timeouts on Gnosis is to set token-allowlist with the target
+# LP tokens + the usual quote currencies (WXDAI, USDC, USDT, EURe, …).
+#
+# token-allowlist = [
+#     # LP tokens:
+#     "0x1337BedC9D22ecbe766dF105c9623922A27963EC",  # x3CRV (WXDAI/USDC/USDT)
+#     # quote/underlying tokens:
+#     "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d",  # WXDAI
+#     "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83",  # USDC
+#     "0x4ECaBa5870353805a9F068101A40E0f32ed605C6",  # USDT
+# ]
 
-# Optional buy-token filtering (left disabled):
+# Optional buy-token either-side filter (left disabled):
 # allowed-buy-tokens = [
 # ]
 
