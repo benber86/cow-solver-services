@@ -17,9 +17,14 @@ price-api-chain = "arbitrum"
 # RPC for on-chain verification (injected from environment)
 node-url = "${NODE_URL}"
 
-# Curve APIs (public, no auth needed)
+# Curve APIs (public, no auth needed). curve-api-url stays for sidechain
+# telemetry (parallel comparison logging on real solves).
 curve-api-url = "https://www.curve.finance/api/router/v1/routes"
 curve-price-api-url = "https://prices.curve.finance/"
+
+# Use the new curve_new_router service for execution quotes.
+route-provider = "new-router"
+new-router-url = "https://arbitrum.router.curve.finance/quote"
 
 # Token filtering — see README for how lp-tokens / allowed-buy-tokens /
 # token-allowlist interact. We use token-allowlist here (both-sides): any

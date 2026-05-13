@@ -21,8 +21,13 @@ price-api-chain = "arbitrum"
 #     "0xBeb177D05ac67330224291B259c401366C0974B4",  # alETH/WETH
 # ]
 
-# Curve Router API URL (chain selected via chainId query param)
+# Curve Router API URL (chain selected via chainId query param). Used for
+# sidechain telemetry comparison even when route-provider = "new-router".
 curve-api-url = "https://www.curve.finance/api/router/optimal-route"
+
+# Use the new curve_new_router service for execution quotes.
+route-provider = "new-router"
+new-router-url = "https://arbitrum.router.curve.finance/quote"
 
 # Curve Price API (for LP token pricing)
 curve-price-api-url = "https://prices.curve.finance/"

@@ -84,6 +84,7 @@ impl LegacyProvider {
         let calldata = router::encode_exchange(route, sell_amount, min_out, receiver);
         ExecutableQuote {
             expected_output: anchor_output,
+            min_out,
             router_address,
             calldata,
             gas_estimate: None,

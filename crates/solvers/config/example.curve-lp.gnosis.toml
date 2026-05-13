@@ -23,8 +23,13 @@ price-api-chain = "xdai"
 #     "0x0b9036F639f4E7498aFA34751a2710159373fC7B",  # USDC.e/EURe
 # ]
 
-# Curve Router API URL (chain selected via chainId query param)
+# Curve Router API URL (chain selected via chainId query param). Used for
+# sidechain telemetry comparison even when route-provider = "new-router".
 curve-api-url = "https://www.curve.finance/api/router/optimal-route"
+
+# Use the new curve_new_router service for execution quotes.
+route-provider = "new-router"
+new-router-url = "https://gnosis.router.curve.finance/quote"
 
 # Curve Price API (for LP token pricing)
 curve-price-api-url = "https://prices.curve.finance/"

@@ -3,7 +3,7 @@
 use {
     crate::domain::{
         eth,
-        solver::curve_lp::{self, ChainConfig, CurvePriceApiChain},
+        solver::curve_lp::{self, ChainConfig, CurvePriceApiChain, RouteProviderKind},
     },
     reqwest::Url,
     serde::Deserialize,
@@ -11,6 +11,19 @@ use {
     std::path::Path,
     tokio::fs,
 };
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum RouteProviderTag {
+    Legacy,
+    NewRouter,
+}
+
+impl Default for RouteProviderTag {
+    fn default() -> Self {
+        Self::Legacy
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
@@ -72,6 +85,16 @@ struct Config {
     /// deployment; the solver trusts the config so forks / test deployments
     /// can override.
     settlement_contract: eth::Address,
+
+    /// Which provider to use for execution quotes. Legacy = curve.finance v1
+    /// API; new-router = *.router.curve.finance/quote.
+    #[serde(default)]
+    route_provider: RouteProviderTag,
+
+    /// POST endpoint for the new router service. Required when
+    /// `route-provider = "new-router"`.
+    #[serde(default)]
+    new_router_url: Option<Url>,
 }
 
 fn default_slippage_bps() -> u32 {
@@ -117,6 +140,15 @@ pub async fn load(path: &Path) -> curve_lp::Config {
     .validated()
     .unwrap_or_else(|e| panic!("invalid chain config in {path:?}: {e}"));
 
+    let route_provider = match config.route_provider {
+        RouteProviderTag::Legacy => RouteProviderKind::Legacy,
+        RouteProviderTag::NewRouter => RouteProviderKind::NewRouter {
+            url: config.new_router_url.unwrap_or_else(|| {
+                panic!("route-provider = \"new-router\" requires new-router-url in {path:?}")
+            }),
+        },
+    };
+
     curve_lp::Config {
         chain,
         lp_tokens: config.lp_tokens,
@@ -128,6 +160,7 @@ pub async fn load(path: &Path) -> curve_lp::Config {
         slippage_bps: config.slippage_bps,
         max_quote_deviation_bps: config.max_quote_deviation_bps,
         solution_gas_offset: config.solution_gas_offset.into(),
+        route_provider,
     }
 }
 
@@ -288,5 +321,26 @@ token_allowlist = [ "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1" ]
             result.is_err(),
             "snake_case token_allowlist should be rejected by deny_unknown_fields"
         );
+    }
+
+    #[test]
+    fn route_provider_defaults_to_legacy() {
+        let raw = minimal_toml("");
+        let parsed: Config = toml::de::from_str(&raw).expect("should parse");
+        assert_eq!(parsed.route_provider, RouteProviderTag::Legacy);
+        assert!(parsed.new_router_url.is_none());
+    }
+
+    #[test]
+    fn route_provider_new_router_parses_with_url() {
+        let raw = minimal_toml(
+            r#"
+route-provider = "new-router"
+new-router-url = "https://arbitrum.router.curve.finance/quote"
+"#,
+        );
+        let parsed: Config = toml::de::from_str(&raw).expect("should parse");
+        assert_eq!(parsed.route_provider, RouteProviderTag::NewRouter);
+        assert!(parsed.new_router_url.is_some());
     }
 }

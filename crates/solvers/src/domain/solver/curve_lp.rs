@@ -4,17 +4,17 @@
 //! by routing through the Curve Router API and contract.
 
 use {
-    crate::{
-        boundary::curve::{interactions, router},
-        domain::{
-            auction::{self, Auction},
-            curve::{api, price_api},
-            eth,
-            order::{self, Order},
-            solution::{self, Solution},
+    crate::domain::{
+        auction::{self, Auction},
+        curve::{
+            api, legacy_provider::LegacyProvider, new_router::NewRouterClient, price_api,
+            route_provider::{self, QuoteRequest, RouteProvider},
         },
+        eth,
+        order::{self, Order},
+        solution::{self, Solution},
     },
-    alloy::{primitives::U256, providers::Provider, rpc::types::TransactionRequest},
+    alloy::primitives::U256,
     futures::stream::StreamExt,
     reqwest::Url,
     serde::Deserialize,
@@ -33,6 +33,9 @@ const ROUTE_REQUEST_TIMEOUT: Duration = Duration::from_millis(2500);
 const ONCHAIN_VERIFY_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Maximum time spent waiting for token price fallback per order.
 const PRICE_FETCH_TIMEOUT: Duration = Duration::from_millis(1200);
+/// Sidechain-only: legacy comparison probe budget. Tighter than the route
+/// timeout so a slow/down legacy never delays the real solve.
+const LEGACY_TELEMETRY_TIMEOUT: Duration = Duration::from_millis(1500);
 
 // CoW native-price probe detection constants
 /// The sentinel sell_amount CoW uses for native price probes (2^144).
@@ -59,6 +62,13 @@ impl CurvePriceApiChain {
             Self::Xdai => "xdai",
         }
     }
+}
+
+/// Backend selection per chain.
+#[derive(Debug, Clone)]
+pub enum RouteProviderKind {
+    Legacy,
+    NewRouter { url: Url },
 }
 
 /// Chain-scoped configuration. All values here are specific to the chain the
@@ -169,6 +179,8 @@ pub struct Config {
     pub max_quote_deviation_bps: u32,
     /// Gas offset for solution gas estimation.
     pub solution_gas_offset: eth::SignedGas,
+    /// Which backend provides execution quotes.
+    pub route_provider: RouteProviderKind,
 }
 
 struct Inner {
@@ -176,11 +188,13 @@ struct Inner {
     lp_tokens: Option<HashSet<eth::Address>>,
     allowed_buy_tokens: Option<HashSet<eth::Address>>,
     token_allowlist: Option<HashSet<eth::Address>>,
-    api_client: api::Client,
+    provider: Arc<dyn RouteProvider>,
+    /// Best-effort legacy probe alongside new-router real solves on
+    /// sidechains. `None` on mainnet (legacy is the primary path so the
+    /// comparison would be tautological).
+    legacy_telemetry: Option<Arc<LegacyProvider>>,
     price_client: price_api::Client,
-    provider: ethrpc::AlloyProvider,
     slippage_bps: u32,
-    max_quote_deviation_bps: u32,
     solution_gas_offset: eth::SignedGas,
 }
 
@@ -204,7 +218,6 @@ impl Solver {
             );
         }
 
-        let api_client = api::Client::new(config.curve_api_url);
         let price_client = price_api::Client::new(config.curve_price_api_url);
         let web3 = ethrpc::web3(
             Default::default(),
@@ -213,17 +226,45 @@ impl Solver {
             "curve-lp",
         );
 
+        let legacy = LegacyProvider::new(
+            api::Client::new(config.curve_api_url.clone()),
+            web3.alloy.clone(),
+            config.chain.chain_id,
+            config.chain.router_address,
+            config.slippage_bps,
+            config.max_quote_deviation_bps,
+            ONCHAIN_VERIFY_TIMEOUT,
+        );
+
+        let (provider, legacy_telemetry): (Arc<dyn RouteProvider>, _) = match config.route_provider {
+            RouteProviderKind::Legacy => (Arc::new(legacy), None),
+            RouteProviderKind::NewRouter { url } => {
+                let new_router = NewRouterClient::new(url, config.chain.router_address);
+                // Sidechain telemetry: a second legacy client (same chain) that
+                // we only ever invoke for log comparison on real solves.
+                let tele = LegacyProvider::new(
+                    api::Client::new(config.curve_api_url.clone()),
+                    web3.alloy.clone(),
+                    config.chain.chain_id,
+                    config.chain.router_address,
+                    config.slippage_bps,
+                    config.max_quote_deviation_bps,
+                    ONCHAIN_VERIFY_TIMEOUT,
+                );
+                (Arc::new(new_router), Some(Arc::new(tele)))
+            }
+        };
+
         Self {
             inner: Arc::new(Inner {
                 chain: config.chain,
                 lp_tokens: config.lp_tokens.map(|v| v.into_iter().collect()),
                 allowed_buy_tokens: config.allowed_buy_tokens.map(|v| v.into_iter().collect()),
                 token_allowlist: config.token_allowlist.map(|v| v.into_iter().collect()),
-                api_client,
+                provider,
+                legacy_telemetry,
                 price_client,
-                provider: web3.alloy,
                 slippage_bps: config.slippage_bps,
-                max_quote_deviation_bps: config.max_quote_deviation_bps,
                 solution_gas_offset: config.solution_gas_offset,
             }),
         }
@@ -476,12 +517,6 @@ impl Inner {
         }
     }
 
-    /// Solves a single LP order (sell or buy).
-    ///
-    /// When `is_quote` is true, skip the expensive on-chain `get_dy`
-    /// verification and use the Curve API output directly. Quotes are
-    /// not executed on-chain, so the extra safety check is unnecessary
-    /// and the ~750ms RPC call causes deadline timeouts.
     async fn solve_order(
         &self,
         order: &Order,
@@ -489,151 +524,28 @@ impl Inner {
         gas_price: &auction::GasPrice,
         is_quote: bool,
     ) -> Result<(Solution, eth::U256, u64, u64), SolveError> {
-        // Get token decimals (default to 18 for LP tokens, 6 for stables)
-        let sell_token_decimals = tokens
-            .get(&order.sell.token)
-            .and_then(|t| t.decimals)
-            .unwrap_or(18);
-        let buy_token_decimals = tokens
-            .get(&order.buy.token)
-            .and_then(|t| t.decimals)
-            .unwrap_or(18);
-
-        // Native-price probe: reverse-then-forward routing.
         if is_native_price_probe(order, is_quote, self.chain.wrapped_native_token) {
-            let route_start = std::time::Instant::now();
-
-            // Step 1: Reverse route (buy_token → sell_token) to estimate sell cost
-            let reverse_route = tokio::time::timeout(
-                ROUTE_REQUEST_TIMEOUT,
-                self.api_client.get_route(
-                    self.chain.chain_id,
-                    order.buy.token.0,
-                    order.sell.token.0,
-                    order.buy.amount,
-                    buy_token_decimals,
-                    sell_token_decimals,
-                ),
-            )
-            .await
-            .map_err(|_| {
-                SolveError::Api(api::Error::Network(format!(
-                    "reverse route timed out after {}ms",
-                    ROUTE_REQUEST_TIMEOUT.as_millis()
-                )))
-            })?
-            .map_err(SolveError::Api)?;
-
-            let reverse_output = reverse_route.expected_output;
-
-            // Step 2: Forward route with estimated sell amount + padding.
-            // Try 5% padding first, retry with 15% if forward output misses target.
-            let padding_bps_attempts = [500u32, 1500u32];
-            let mut forward_route = None;
-
-            for (attempt, &padding_bps) in padding_bps_attempts.iter().enumerate() {
-                let estimated_sell = reverse_output
-                    .saturating_mul(U256::from(10_000 + padding_bps))
-                    / U256::from(10_000u32);
-
-                let result = tokio::time::timeout(
-                    ROUTE_REQUEST_TIMEOUT,
-                    self.api_client.get_route(
-                        self.chain.chain_id,
-                        order.sell.token.0,
-                        order.buy.token.0,
-                        estimated_sell,
-                        sell_token_decimals,
-                        buy_token_decimals,
-                    ),
-                )
-                .await
-                .map_err(|_| {
-                    SolveError::Api(api::Error::Network(format!(
-                        "forward route timed out after {}ms",
-                        ROUTE_REQUEST_TIMEOUT.as_millis()
-                    )))
-                })?
-                .map_err(SolveError::Api)?;
-
-                tracing::debug!(
-                    reverse_output = %reverse_output,
-                    estimated_sell = %estimated_sell,
-                    forward_output = %result.expected_output,
-                    attempt,
-                    padding_bps,
-                    "native price probe routing"
-                );
-
-                if result.expected_output >= order.buy.amount {
-                    forward_route = Some((result, estimated_sell));
-                    break;
-                }
-            }
-
-            let (fwd_route, estimated_sell) =
-                forward_route.ok_or(SolveError::InsufficientOutput {
-                    min_output: U256::ZERO,
-                    required: order.buy.amount,
-                })?;
-
-            let route_ms = route_start.elapsed().as_millis() as u64;
-
-            // Build interaction from the FORWARD route (correct direction).
-            let interaction = interactions::build_exchange_interaction(
-                &fwd_route,
-                order.sell.token,
-                estimated_sell,
-                order.buy.token,
-                order.buy.amount,
-                self.chain.settlement_contract,
-                self.chain.router_address,
-            );
-
-            let single = solution::Single {
-                order: order.clone(),
-                input: eth::Asset {
-                    token: order.sell.token,
-                    amount: estimated_sell,
-                },
-                output: eth::Asset {
-                    token: order.buy.token,
-                    amount: order.buy.amount,
-                },
-                interactions: vec![solution::Interaction::Custom(interaction)],
-                gas: eth::Gas(U256::from(350_000)) + self.solution_gas_offset,
-                wrappers: order.wrappers.clone(),
-            };
-
-            // Zero fee: native-price probe, not a real settlement.
-            let solution = single
-                .into_solution(eth::SellTokenAmount(U256::ZERO))
-                .ok_or(SolveError::SolutionConstruction)?;
-
-            return Ok((solution, order.buy.amount, route_ms, 0));
+            return self.solve_native_price_probe(order).await;
         }
 
-        // 1. Get route from Curve API (fail fast if upstream is slow).
         let route_start = std::time::Instant::now();
+        let request = QuoteRequest {
+            sell_token: order.sell.token.0,
+            buy_token: order.buy.token.0,
+            sell_amount: order.sell.amount,
+            is_quote,
+            receiver: self.chain.settlement_contract,
+            min_out: Some(order.buy.amount),
+            gas_price_gwei: gas_price_to_gwei(gas_price),
+        };
+
         let route_fut = async {
-            let result = tokio::time::timeout(
-                ROUTE_REQUEST_TIMEOUT,
-                self.api_client.get_route(
-                    self.chain.chain_id,
-                    order.sell.token.0,
-                    order.buy.token.0,
-                    order.sell.amount,
-                    sell_token_decimals,
-                    buy_token_decimals,
-                ),
-            )
-            .await;
+            let result =
+                tokio::time::timeout(ROUTE_REQUEST_TIMEOUT, self.provider.quote(&request)).await;
             let route_ms = route_start.elapsed().as_millis() as u64;
             (result, route_ms)
         };
 
-        // Start price fetch concurrently with route — it doesn't depend on the
-        // route result and can take 200-800ms on its own.
         let needs_price = tokens.reference_price(&order.sell.token).is_none();
         let price_start = std::time::Instant::now();
         let price_fetch = async {
@@ -656,118 +568,65 @@ impl Inner {
             }
         };
 
-        let (route, min_output, fetched_price, route_ms, price_fetch_ms) = if is_quote {
-            // For quotes: run route + price fetch in parallel, skip on-chain
-            // verification. Apply slippage to the API estimate directly.
-            let ((route_result, route_ms), (fetched_price, price_fetch_ms)) =
-                tokio::join!(route_fut, price_fetch);
-            let route = route_result
-                .map_err(|_| {
-                    SolveError::Api(api::Error::Network(format!(
-                        "route request timed out after {}ms",
-                        ROUTE_REQUEST_TIMEOUT.as_millis()
-                    )))
-                })?
-                .map_err(SolveError::Api)?;
+        let ((quote_result, route_ms), (fetched_price, price_fetch_ms)) =
+            tokio::join!(route_fut, price_fetch);
+        let quote = quote_result
+            .map_err(|_| {
+                SolveError::Provider(route_provider::Error::Api(api::Error::Network(format!(
+                    "route request timed out after {}ms",
+                    ROUTE_REQUEST_TIMEOUT.as_millis()
+                ))))
+            })?
+            .map_err(SolveError::Provider)?;
 
-            tracing::debug!(
-                expected_output = %route.expected_output,
-                route_ms,
-                price_fetch_ms,
-                "got route from Curve API (quote)"
-            );
+        tracing::debug!(
+            expected_output = %quote.expected_output,
+            min_out = %quote.min_out,
+            route_ms,
+            price_fetch_ms,
+            is_quote,
+            quality = ?quote.quality,
+            "provider quote"
+        );
 
-            let min_output = self.apply_slippage(route.expected_output);
-            (route, min_output, fetched_price, route_ms, price_fetch_ms)
-        } else {
-            // For real auctions: get route first (need it for on-chain verify),
-            // then run verify + price fetch in parallel.
-            let (route_result, route_ms) = route_fut.await;
-            let route = route_result
-                .map_err(|_| {
-                    SolveError::Api(api::Error::Network(format!(
-                        "route request timed out after {}ms",
-                        ROUTE_REQUEST_TIMEOUT.as_millis()
-                    )))
-                })?
-                .map_err(SolveError::Api)?;
-
-            tracing::debug!(
-                expected_output = %route.expected_output,
-                route_ms,
-                "got route from Curve API"
-            );
-
-            // Fast-fail: if even the best-case API quote (allowing max deviation
-            // upward) can't fill the order after slippage, skip the expensive
-            // on-chain get_dy call.
-            let optimistic_output = route.expected_output.saturating_add(
-                route
-                    .expected_output
-                    .saturating_mul(U256::from(self.max_quote_deviation_bps))
-                    / U256::from(10_000u32),
-            );
-            if self.apply_slippage(optimistic_output) < order.buy.amount {
-                return Err(SolveError::InsufficientOutput {
-                    min_output: self.apply_slippage(optimistic_output),
-                    required: order.buy.amount,
-                });
-            }
-
-            let verify = tokio::time::timeout(
-                ONCHAIN_VERIFY_TIMEOUT,
-                self.verify_quote_onchain(&route, order.sell.amount),
-            );
-
-            let (onchain_result, (fetched_price, price_fetch_ms)) =
-                tokio::join!(verify, price_fetch);
-            let onchain_output = onchain_result
-                .map_err(|_| {
-                    SolveError::OnchainVerification(format!(
-                        "verification timed out after {}ms",
-                        ONCHAIN_VERIFY_TIMEOUT.as_millis()
-                    ))
-                })??;
-
-            // Check deviation between API and on-chain quote
-            let deviation_bps =
-                self.calculate_deviation_bps(route.expected_output, onchain_output);
-            if deviation_bps > self.max_quote_deviation_bps {
-                return Err(SolveError::QuoteDeviation {
-                    api_output: route.expected_output,
-                    onchain_output,
-                    deviation_bps,
-                });
-            }
-
-            (
-                route,
-                self.apply_slippage(onchain_output),
-                fetched_price,
-                route_ms,
-                price_fetch_ms,
-            )
-        };
-
-        if min_output < order.buy.amount {
+        if quote.min_out < order.buy.amount {
             return Err(SolveError::InsufficientOutput {
-                min_output,
+                min_output: quote.min_out,
                 required: order.buy.amount,
             });
         }
 
-        // 4. Build solution with custom interaction
-        let interaction = interactions::build_exchange_interaction(
-            &route,
-            order.sell.token,
-            order.sell.amount,
-            order.buy.token,
-            min_output,
-            self.chain.settlement_contract,
-            self.chain.router_address,
-        );
+        // Sidechain real-solve only: fire a best-effort legacy probe in
+        // parallel with the rest of solution construction. Wait for it just
+        // before logging so we can attach the comparison to "solved order".
+        let legacy_telemetry = if !is_quote {
+            self.spawn_legacy_telemetry(order, gas_price)
+        } else {
+            None
+        };
 
-        // 5. Calculate gas estimate
+        let interaction = solution::CustomInteraction {
+            target: quote.router_address,
+            value: eth::Ether(eth::U256::ZERO),
+            calldata: quote.calldata.clone(),
+            internalize: false,
+            inputs: vec![eth::Asset {
+                token: order.sell.token,
+                amount: order.sell.amount,
+            }],
+            outputs: vec![eth::Asset {
+                token: order.buy.token,
+                amount: quote.min_out,
+            }],
+            allowances: vec![solution::Allowance {
+                spender: quote.router_address,
+                asset: eth::Asset {
+                    token: order.sell.token,
+                    amount: order.sell.amount,
+                },
+            }],
+        };
+
         let estimated_gas = eth::Gas(U256::from(350_000)) + self.solution_gas_offset;
 
         // 6. Calculate fee based on gas
@@ -789,7 +648,7 @@ impl Inner {
         // sell_amount minus fee, because into_solution() adds the surplus fee back
         // to the sell side (input + fee must not exceed order.sell.amount).
         let (input_amount, output_amount) = match order.side {
-            order::Side::Sell => (order.sell.amount, min_output),
+            order::Side::Sell => (order.sell.amount, quote.min_out),
             order::Side::Buy => (
                 order
                     .sell
@@ -818,59 +677,189 @@ impl Inner {
         let solution = single
             .into_solution(eth::SellTokenAmount(fee_in_sell_token))
             .ok_or(SolveError::SolutionConstruction)?;
+
+        // Attach legacy comparison if we kicked one off.
+        if let Some(handle) = legacy_telemetry {
+            let _ = handle.await; // best-effort; result is logged inside.
+        }
+
         Ok((solution, output_amount, route_ms, price_fetch_ms))
     }
 
-    /// Verifies the quote on-chain by calling Router.get_dy().
-    async fn verify_quote_onchain(
+    async fn solve_native_price_probe(
         &self,
-        route: &api::Route,
-        amount: eth::U256,
-    ) -> Result<eth::U256, SolveError> {
-        let calldata = router::encode_get_dy(route, amount);
+        order: &Order,
+    ) -> Result<(Solution, eth::U256, u64, u64), SolveError> {
+        let route_start = std::time::Instant::now();
 
-        let tx = TransactionRequest::default()
-            .to(self.chain.router_address)
-            .input(calldata.into());
-
-        let result = self
-            .provider
-            .call(tx)
+        let reverse_req = QuoteRequest {
+            sell_token: order.buy.token.0,
+            buy_token: order.sell.token.0,
+            sell_amount: order.buy.amount,
+            is_quote: true,
+            receiver: self.chain.settlement_contract,
+            min_out: None,
+            gas_price_gwei: None,
+        };
+        let reverse = tokio::time::timeout(ROUTE_REQUEST_TIMEOUT, self.provider.quote(&reverse_req))
             .await
-            .map_err(|e| SolveError::OnchainVerification(e.to_string()))?;
+            .map_err(|_| {
+                SolveError::Provider(route_provider::Error::Api(api::Error::Network(format!(
+                    "reverse route timed out after {}ms",
+                    ROUTE_REQUEST_TIMEOUT.as_millis()
+                ))))
+            })?
+            .map_err(SolveError::Provider)?;
 
-        router::decode_get_dy_result(&result)
-            .map_err(|e| SolveError::OnchainVerification(e.to_string()))
-    }
+        let reverse_output = reverse.expected_output;
+        let padding_bps_attempts = [500u32, 1500u32];
+        let mut forward = None;
 
-    /// Calculates the deviation between two values in basis points.
-    fn calculate_deviation_bps(&self, a: eth::U256, b: eth::U256) -> u32 {
-        if a.is_zero() || b.is_zero() {
-            return u32::MAX;
+        for (attempt, &padding_bps) in padding_bps_attempts.iter().enumerate() {
+            let estimated_sell = reverse_output
+                .saturating_mul(U256::from(10_000 + padding_bps))
+                / U256::from(10_000u32);
+
+            let req = QuoteRequest {
+                sell_token: order.sell.token.0,
+                buy_token: order.buy.token.0,
+                sell_amount: estimated_sell,
+                is_quote: true,
+                receiver: self.chain.settlement_contract,
+                min_out: None,
+                gas_price_gwei: None,
+            };
+            let q = tokio::time::timeout(ROUTE_REQUEST_TIMEOUT, self.provider.quote(&req))
+                .await
+                .map_err(|_| {
+                    SolveError::Provider(route_provider::Error::Api(api::Error::Network(format!(
+                        "forward route timed out after {}ms",
+                        ROUTE_REQUEST_TIMEOUT.as_millis()
+                    ))))
+                })?
+                .map_err(SolveError::Provider)?;
+
+            tracing::debug!(
+                reverse_output = %reverse_output,
+                estimated_sell = %estimated_sell,
+                forward_output = %q.expected_output,
+                attempt,
+                padding_bps,
+                "native price probe routing"
+            );
+
+            if q.expected_output >= order.buy.amount {
+                forward = Some((q, estimated_sell));
+                break;
+            }
         }
-        let (larger, smaller) = if a > b { (a, b) } else { (b, a) };
-        let diff = larger.saturating_sub(smaller);
-        let bps = diff.saturating_mul(U256::from(10_000)) / smaller;
-        bps.try_into().unwrap_or(u32::MAX)
+
+        let (fwd, estimated_sell) = forward.ok_or(SolveError::InsufficientOutput {
+            min_output: U256::ZERO,
+            required: order.buy.amount,
+        })?;
+
+        let route_ms = route_start.elapsed().as_millis() as u64;
+
+        // Probes never settle; calldata may be empty (new-router quote mode).
+        let interaction = solution::CustomInteraction {
+            target: fwd.router_address,
+            value: eth::Ether(eth::U256::ZERO),
+            calldata: fwd.calldata,
+            internalize: false,
+            inputs: vec![eth::Asset {
+                token: order.sell.token,
+                amount: estimated_sell,
+            }],
+            outputs: vec![eth::Asset {
+                token: order.buy.token,
+                amount: order.buy.amount,
+            }],
+            allowances: vec![solution::Allowance {
+                spender: fwd.router_address,
+                asset: eth::Asset {
+                    token: order.sell.token,
+                    amount: estimated_sell,
+                },
+            }],
+        };
+
+        let single = solution::Single {
+            order: order.clone(),
+            input: eth::Asset {
+                token: order.sell.token,
+                amount: estimated_sell,
+            },
+            output: eth::Asset {
+                token: order.buy.token,
+                amount: order.buy.amount,
+            },
+            interactions: vec![solution::Interaction::Custom(interaction)],
+            gas: eth::Gas(U256::from(350_000)) + self.solution_gas_offset,
+            wrappers: order.wrappers.clone(),
+        };
+
+        let solution = single
+            .into_solution(eth::SellTokenAmount(U256::ZERO))
+            .ok_or(SolveError::SolutionConstruction)?;
+
+        Ok((solution, order.buy.amount, route_ms, 0))
     }
 
-    /// Applies slippage buffer to the output amount.
-    fn apply_slippage(&self, amount: eth::U256) -> eth::U256 {
-        // min_output = amount * (10000 - slippage_bps) / 10000
-        let multiplier = U256::from(10_000 - self.slippage_bps);
-        amount.saturating_mul(multiplier) / U256::from(10_000)
+    /// Fires the legacy provider in the background for telemetry purposes.
+    /// Returns a join handle the caller awaits before logging.
+    fn spawn_legacy_telemetry(
+        &self,
+        order: &Order,
+        gas_price: &auction::GasPrice,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let tele = self.legacy_telemetry.clone()?;
+        let req = QuoteRequest {
+            sell_token: order.sell.token.0,
+            buy_token: order.buy.token.0,
+            sell_amount: order.sell.amount,
+            is_quote: true, // skip on-chain verify for the probe
+            receiver: self.chain.settlement_contract,
+            min_out: None,
+            gas_price_gwei: gas_price_to_gwei(gas_price),
+        };
+        let order_uid = order.uid;
+        Some(tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let result =
+                tokio::time::timeout(LEGACY_TELEMETRY_TIMEOUT, tele.quote(&req)).await;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            match result {
+                Ok(Ok(q)) => tracing::info!(
+                    order_uid = %order_uid,
+                    legacy_output = %q.expected_output,
+                    legacy_ms = elapsed_ms,
+                    "legacy telemetry"
+                ),
+                Ok(Err(e)) => tracing::info!(
+                    order_uid = %order_uid,
+                    legacy_error = %e,
+                    legacy_ms = elapsed_ms,
+                    "legacy telemetry failed"
+                ),
+                Err(_) => tracing::info!(
+                    order_uid = %order_uid,
+                    legacy_ms = elapsed_ms,
+                    "legacy telemetry timed out"
+                ),
+            }
+        }))
     }
+}
+
+fn gas_price_to_gwei(gas_price: &auction::GasPrice) -> Option<f64> {
+    let wei: u128 = gas_price.0.0.try_into().ok()?;
+    Some((wei as f64) / 1e9)
 }
 
 #[derive(Debug)]
 pub enum SolveError {
-    Api(api::Error),
-    OnchainVerification(String),
-    QuoteDeviation {
-        api_output: eth::U256,
-        onchain_output: eth::U256,
-        deviation_bps: u32,
-    },
+    Provider(route_provider::Error),
     InsufficientOutput {
         min_output: eth::U256,
         required: eth::U256,
@@ -883,19 +872,7 @@ pub enum SolveError {
 impl fmt::Display for SolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SolveError::Api(e) => write!(f, "Curve API error: {}", e),
-            SolveError::OnchainVerification(msg) => {
-                write!(f, "on-chain verification failed: {}", msg)
-            }
-            SolveError::QuoteDeviation {
-                api_output,
-                onchain_output,
-                deviation_bps,
-            } => write!(
-                f,
-                "quote deviation too high: API={}, on-chain={}, deviation={}bps",
-                api_output, onchain_output, deviation_bps
-            ),
+            SolveError::Provider(e) => write!(f, "route provider: {}", e),
             SolveError::InsufficientOutput {
                 min_output,
                 required,
@@ -913,50 +890,11 @@ impl fmt::Display for SolveError {
 
 impl std::error::Error for SolveError {}
 
-impl From<api::Error> for SolveError {
-    fn from(e: api::Error) -> Self {
-        SolveError::Api(e)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn slippage_100bps() {
-        let inner = test_inner(100, 500);
-        let amount = U256::from(10_000u64);
-        // 1% slippage: 10000 * 9900 / 10000 = 9900
-        assert_eq!(inner.apply_slippage(amount), U256::from(9_900u64));
-    }
-
-    #[tokio::test]
-    async fn deviation_bps_symmetric() {
-        let inner = test_inner(100, 500);
-        // 5% deviation regardless of direction
-        assert_eq!(
-            inner.calculate_deviation_bps(U256::from(1050u64), U256::from(1000u64)),
-            500
-        );
-        assert_eq!(
-            inner.calculate_deviation_bps(U256::from(1000u64), U256::from(1050u64)),
-            500
-        );
-    }
-
-    #[tokio::test]
-    async fn deviation_bps_zero_inputs() {
-        let inner = test_inner(100, 500);
-        assert_eq!(
-            inner.calculate_deviation_bps(U256::ZERO, U256::from(1000u64)),
-            u32::MAX
-        );
-        assert_eq!(
-            inner.calculate_deviation_bps(U256::from(1000u64), U256::ZERO),
-            u32::MAX
-        );
-    }
+    // Slippage / deviation_bps moved into LegacyProvider; tests live there.
 
     #[tokio::test]
     async fn timeout_returns_partial_results() {
@@ -1129,25 +1067,28 @@ mod tests {
         }
     }
 
-    /// Helper to build a minimal Inner for testing pure methods.
-    /// Uses dummy URLs that will never be called.
-    fn test_inner(slippage_bps: u32, max_quote_deviation_bps: u32) -> Inner {
+    struct NoopProvider;
+
+    #[async_trait::async_trait]
+    impl RouteProvider for NoopProvider {
+        async fn quote(
+            &self,
+            _req: &QuoteRequest,
+        ) -> Result<route_provider::ExecutableQuote, route_provider::Error> {
+            Err(route_provider::Error::CalldataUnavailable("noop".into()))
+        }
+    }
+
+    fn test_inner(slippage_bps: u32, _max_quote_deviation_bps: u32) -> Inner {
         Inner {
             chain: test_chain_config(),
             lp_tokens: None,
             allowed_buy_tokens: None,
             token_allowlist: None,
-            api_client: api::Client::new("http://localhost:1".parse().unwrap()),
+            provider: Arc::new(NoopProvider),
+            legacy_telemetry: None,
             price_client: price_api::Client::new("http://localhost:1".parse().unwrap()),
-            provider: ethrpc::web3(
-                Default::default(),
-                Default::default(),
-                &"http://localhost:1".parse().unwrap(),
-                "test",
-            )
-            .alloy,
             slippage_bps,
-            max_quote_deviation_bps,
             solution_gas_offset: eth::SignedGas::default(),
         }
     }

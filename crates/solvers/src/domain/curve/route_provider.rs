@@ -8,7 +8,14 @@ use {
 
 #[derive(Debug, Clone)]
 pub struct ExecutableQuote {
+    /// Pre-slippage output anchor (verified on-chain for legacy, simulator-
+    /// validated for new-router). Used by the solver to compare against the
+    /// order's `buy.amount`.
     pub expected_output: eth::U256,
+    /// Post-slippage floor encoded into `calldata`. The on-chain router
+    /// reverts if it can't hit this. `solve_order` rejects the order when
+    /// this falls below the order's `buy.amount`.
+    pub min_out: eth::U256,
     pub router_address: eth::Address,
     pub calldata: Vec<u8>,
     pub gas_estimate: Option<u64>,

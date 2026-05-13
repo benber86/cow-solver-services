@@ -94,8 +94,14 @@ impl NewRouterClient {
             })?
         };
 
+        // The server already enforces `min_out` (sends 422 if unachievable) and
+        // bakes it into the returned calldata. We carry it back as the artifact
+        // floor; quote-only paths (no min_out) fall back to expected_output.
+        let min_out = req.min_out.unwrap_or(expected_output);
+
         Ok(ExecutableQuote {
             expected_output,
+            min_out,
             router_address: returned_router,
             calldata,
             gas_estimate: Some(body.gas_estimate),
