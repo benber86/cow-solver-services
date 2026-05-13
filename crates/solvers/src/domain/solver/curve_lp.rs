@@ -412,7 +412,26 @@ impl Inner {
                         );
 
                         match self.solve_order(&order, tokens, gas_price, is_quote).await {
-                            Ok((solution, output_amount, route_ms, price_fetch_ms)) => {
+                            Ok(solved) => {
+                                let legacy_output = solved
+                                    .legacy
+                                    .as_ref()
+                                    .and_then(|l| l.output)
+                                    .map(|v| v.to_string());
+                                let legacy_error = solved
+                                    .legacy
+                                    .as_ref()
+                                    .and_then(|l| l.error.clone());
+                                let legacy_ms =
+                                    solved.legacy.as_ref().map(|l| l.elapsed_ms);
+                                let delta_bps = solved
+                                    .legacy
+                                    .as_ref()
+                                    .and_then(|l| l.output)
+                                    .and_then(|v| legacy_delta_bps(solved.output_amount, v));
+                                let quality_slug = solved
+                                    .quote_quality
+                                    .map(|q| q.as_slug());
                                 tracing::info!(
                                     order_uid = %order.uid,
                                     sell_token = ?order.sell.token,
@@ -420,13 +439,19 @@ impl Inner {
                                     side = ?order.side,
                                     sell_amount = %order.sell.amount,
                                     order_buy_min = %order.buy.amount,
-                                    solution_output = %output_amount,
-                                    route_ms,
-                                    price_fetch_ms,
+                                    solution_output = %solved.output_amount,
+                                    route_ms = solved.route_ms,
+                                    price_fetch_ms = solved.price_fetch_ms,
                                     is_quote,
+                                    new_router_quality = quality_slug,
+                                    new_router_gas = solved.gas_estimate,
+                                    legacy_output,
+                                    legacy_ms,
+                                    legacy_error,
+                                    delta_bps,
                                     "solved order"
                                 );
-                                Some((solution.with_id(solution::Id(i as u64)), order))
+                                Some((solved.solution.with_id(solution::Id(i as u64)), order))
                             }
                             Err(err) => {
                                 tracing::warn!(order_uid = %order.uid, ?err, "failed to solve order");
@@ -523,7 +548,7 @@ impl Inner {
         tokens: &auction::Tokens,
         gas_price: &auction::GasPrice,
         is_quote: bool,
-    ) -> Result<(Solution, eth::U256, u64, u64), SolveError> {
+    ) -> Result<SolvedOrder, SolveError> {
         if is_native_price_probe(order, is_quote, self.chain.wrapped_native_token) {
             return self.solve_native_price_probe(order).await;
         }
@@ -678,18 +703,26 @@ impl Inner {
             .into_solution(eth::SellTokenAmount(fee_in_sell_token))
             .ok_or(SolveError::SolutionConstruction)?;
 
-        // Attach legacy comparison if we kicked one off.
-        if let Some(handle) = legacy_telemetry {
-            let _ = handle.await; // best-effort; result is logged inside.
-        }
+        let legacy = match legacy_telemetry {
+            Some(h) => h.await.ok(),
+            None => None,
+        };
 
-        Ok((solution, output_amount, route_ms, price_fetch_ms))
+        Ok(SolvedOrder {
+            solution,
+            output_amount,
+            route_ms,
+            price_fetch_ms,
+            quote_quality: quote.quality,
+            gas_estimate: quote.gas_estimate,
+            legacy,
+        })
     }
 
     async fn solve_native_price_probe(
         &self,
         order: &Order,
-    ) -> Result<(Solution, eth::U256, u64, u64), SolveError> {
+    ) -> Result<SolvedOrder, SolveError> {
         let route_start = std::time::Instant::now();
 
         let reverse_req = QuoteRequest {
@@ -803,16 +836,26 @@ impl Inner {
             .into_solution(eth::SellTokenAmount(U256::ZERO))
             .ok_or(SolveError::SolutionConstruction)?;
 
-        Ok((solution, order.buy.amount, route_ms, 0))
+        Ok(SolvedOrder {
+            solution,
+            output_amount: order.buy.amount,
+            route_ms,
+            price_fetch_ms: 0,
+            quote_quality: fwd.quality,
+            gas_estimate: fwd.gas_estimate,
+            legacy: None,
+        })
     }
 
     /// Fires the legacy provider in the background for telemetry purposes.
-    /// Returns a join handle the caller awaits before logging.
+    /// The returned handle yields the legacy output (None on failure/timeout)
+    /// and the elapsed milliseconds — caller awaits both before emitting the
+    /// "solved order" log.
     fn spawn_legacy_telemetry(
         &self,
         order: &Order,
         gas_price: &auction::GasPrice,
-    ) -> Option<tokio::task::JoinHandle<()>> {
+    ) -> Option<tokio::task::JoinHandle<LegacyTelemetry>> {
         let tele = self.legacy_telemetry.clone()?;
         let req = QuoteRequest {
             sell_token: order.sell.token.0,
@@ -823,33 +866,56 @@ impl Inner {
             min_out: None,
             gas_price_gwei: gas_price_to_gwei(gas_price),
         };
-        let order_uid = order.uid;
         Some(tokio::spawn(async move {
             let started = std::time::Instant::now();
             let result =
                 tokio::time::timeout(LEGACY_TELEMETRY_TIMEOUT, tele.quote(&req)).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
-            match result {
-                Ok(Ok(q)) => tracing::info!(
-                    order_uid = %order_uid,
-                    legacy_output = %q.expected_output,
-                    legacy_ms = elapsed_ms,
-                    "legacy telemetry"
-                ),
-                Ok(Err(e)) => tracing::info!(
-                    order_uid = %order_uid,
-                    legacy_error = %e,
-                    legacy_ms = elapsed_ms,
-                    "legacy telemetry failed"
-                ),
-                Err(_) => tracing::info!(
-                    order_uid = %order_uid,
-                    legacy_ms = elapsed_ms,
-                    "legacy telemetry timed out"
-                ),
+            let (output, error) = match result {
+                Ok(Ok(q)) => (Some(q.expected_output), None),
+                Ok(Err(e)) => (None, Some(e.to_string())),
+                Err(_) => (None, Some("timeout".to_string())),
+            };
+            LegacyTelemetry {
+                output,
+                elapsed_ms,
+                error,
             }
         }))
     }
+}
+
+#[derive(Debug, Default)]
+struct LegacyTelemetry {
+    output: Option<eth::U256>,
+    elapsed_ms: u64,
+    error: Option<String>,
+}
+
+struct SolvedOrder {
+    solution: Solution,
+    output_amount: eth::U256,
+    route_ms: u64,
+    price_fetch_ms: u64,
+    quote_quality: Option<route_provider::QuoteQuality>,
+    gas_estimate: Option<u64>,
+    legacy: Option<LegacyTelemetry>,
+}
+
+/// Basis-point delta between new-router and legacy outputs. Positive = new
+/// router won, negative = legacy won. Returns None if either is zero.
+fn legacy_delta_bps(new_router: eth::U256, legacy: eth::U256) -> Option<i32> {
+    if legacy.is_zero() || new_router.is_zero() {
+        return None;
+    }
+    let (diff, sign) = if new_router >= legacy {
+        (new_router - legacy, 1i32)
+    } else {
+        (legacy - new_router, -1i32)
+    };
+    let bps_u256 = diff.saturating_mul(U256::from(10_000u32)) / legacy;
+    let bps_i32: i32 = bps_u256.try_into().ok()?;
+    Some(sign * bps_i32)
 }
 
 fn gas_price_to_gwei(gas_price: &auction::GasPrice) -> Option<f64> {
@@ -895,6 +961,26 @@ mod tests {
     use super::*;
 
     // Slippage / deviation_bps moved into LegacyProvider; tests live there.
+
+    #[test]
+    fn legacy_delta_bps_positive_when_new_router_wins() {
+        let new_router = U256::from(1_010_000u64);
+        let legacy = U256::from(1_000_000u64);
+        assert_eq!(legacy_delta_bps(new_router, legacy), Some(100));
+    }
+
+    #[test]
+    fn legacy_delta_bps_negative_when_legacy_wins() {
+        let new_router = U256::from(990_000u64);
+        let legacy = U256::from(1_000_000u64);
+        assert_eq!(legacy_delta_bps(new_router, legacy), Some(-100));
+    }
+
+    #[test]
+    fn legacy_delta_bps_returns_none_on_zero_either_side() {
+        assert!(legacy_delta_bps(U256::ZERO, U256::from(1u64)).is_none());
+        assert!(legacy_delta_bps(U256::from(1u64), U256::ZERO).is_none());
+    }
 
     #[tokio::test]
     async fn timeout_returns_partial_results() {

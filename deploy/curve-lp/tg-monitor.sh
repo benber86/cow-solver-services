@@ -167,6 +167,10 @@ ${top_errors}
         sell_amt=$(echo "$log_line" | grep -oP '"sell_amount":"\K[0-9]+' || echo "???")
         buy_amt=$(echo "$log_line" | grep -oP '"solution_output":"\K[0-9]+' || echo "???")
         side=$(echo "$log_line" | grep -oP '"side":"\K[^"]+' || echo "???")
+        # New-router / legacy telemetry (sidechain only). Empty if absent.
+        quality=$(echo "$log_line" | grep -oP '"new_router_quality":"\K[^"]+' || true)
+        legacy_out=$(echo "$log_line" | grep -oP '"legacy_output":"\K[0-9]+' || true)
+        delta_bps=$(echo "$log_line" | grep -oP '"delta_bps":\K-?[0-9]+' || true)
 
         # Shorten addresses for readability
         sell_short="${sell_tok:0:6}...${sell_tok: -4}"
@@ -175,7 +179,19 @@ ${top_errors}
         msg="🔧 *Solution Candidate*
 Chain: ${chain} | Env: ${env_name}
 \`${sell_short}\` → \`${buy_short}\`
-Side: ${side} | Sell: ${sell_amt} | Output: ${buy_amt}
+Side: ${side} | Sell: ${sell_amt} | Output: ${buy_amt}"
+        if [ -n "$quality" ]; then
+            msg+="
+Quality: ${quality}"
+        fi
+        if [ -n "$legacy_out" ]; then
+            msg+="
+Legacy ref: ${legacy_out}"
+            if [ -n "$delta_bps" ]; then
+                msg+=" (Δ ${delta_bps}bps)"
+            fi
+        fi
+        msg+="
 [Order](https://explorer.cow.fi/orders/${uid})"
         send_tg "$thread_id" "$msg"
     done < <(echo "$logs" | grep '"solved order"' | grep '"is_quote":false' || true)
