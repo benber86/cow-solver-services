@@ -13,10 +13,11 @@ pub struct NewRouterClient {
     http: reqwest::Client,
     quote_url: Url,
     router_address: eth::Address,
+    slippage_bps: u32,
 }
 
 impl NewRouterClient {
-    pub fn new(quote_url: Url, router_address: eth::Address) -> Self {
+    pub fn new(quote_url: Url, router_address: eth::Address, slippage_bps: u32) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -25,6 +26,7 @@ impl NewRouterClient {
             http,
             quote_url,
             router_address,
+            slippage_bps,
         }
     }
 
@@ -44,6 +46,7 @@ impl NewRouterClient {
         body: ResponseBody,
         req: &QuoteRequest,
         expected_router: eth::Address,
+        slippage_bps: u32,
     ) -> Result<ExecutableQuote, Error> {
         if let Some(err) = body.error {
             return Err(Error::CalldataUnavailable(err));
@@ -94,10 +97,14 @@ impl NewRouterClient {
             })?
         };
 
-        // The server already enforces `min_out` (sends 422 if unachievable) and
-        // bakes it into the returned calldata. We carry it back as the artifact
-        // floor; quote-only paths (no min_out) fall back to expected_output.
-        let min_out = req.min_out.unwrap_or(expected_output);
+        // Two distinct concerns:
+        // - Request `min_out` is the on-chain hard floor encoded into the
+        //   returned calldata (server rejects with 422 if its route can't
+        //   hit it).
+        // - Artifact `min_out` is what we bid as solution_output for sell
+        //   orders. It's slippage-adjusted from `expected_output` so we
+        //   stay competitive, matching what LegacyProvider does.
+        let min_out = QuoteRequest::min_out_with_slippage(expected_output, slippage_bps);
 
         Ok(ExecutableQuote {
             expected_output,
@@ -141,7 +148,7 @@ impl RouteProvider for NewRouterClient {
             ))
         })?;
 
-        Self::parse_response(parsed, req, self.router_address)
+        Self::parse_response(parsed, req, self.router_address, self.slippage_bps)
     }
 }
 
@@ -239,9 +246,11 @@ mod tests {
     #[test]
     fn parse_response_returns_executable_quote_on_real_solve() {
         let req = dummy_req(false);
-        let q = NewRouterClient::parse_response(ok_body(), &req, Address::repeat_byte(0xCA))
+        let q = NewRouterClient::parse_response(ok_body(), &req, Address::repeat_byte(0xCA), 100)
             .expect("ok");
         assert_eq!(q.expected_output, eth::U256::from(1_000_000u64));
+        // 1% slippage applied to expected_output, not the request min_out.
+        assert_eq!(q.min_out, eth::U256::from(990_000u64));
         assert_eq!(q.router_address, Address::repeat_byte(0xCA));
         assert_eq!(q.calldata, vec![0xde, 0xad, 0xbe, 0xef]);
         assert_eq!(q.gas_estimate, Some(350_000));
@@ -249,9 +258,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_response_min_out_independent_of_request_min_out() {
+        // Regression: artifact min_out used to echo the request min_out
+        // verbatim, which made sell-order bids match the order floor instead
+        // of slippage-adjusted expected_output.
+        let mut req = dummy_req(false);
+        req.min_out = Some(eth::U256::from(500u64)); // far below expected
+        let q = NewRouterClient::parse_response(ok_body(), &req, Address::repeat_byte(0xCA), 100)
+            .expect("ok");
+        assert_eq!(q.min_out, eth::U256::from(990_000u64));
+    }
+
+    #[test]
     fn parse_response_rejects_router_address_mismatch() {
         let req = dummy_req(false);
-        let err = NewRouterClient::parse_response(ok_body(), &req, Address::repeat_byte(0xBB))
+        let err = NewRouterClient::parse_response(ok_body(), &req, Address::repeat_byte(0xBB), 100)
             .expect_err("must fail");
         assert!(matches!(err, Error::RouterAddressMismatch { .. }));
     }
@@ -261,7 +282,7 @@ mod tests {
         let req = dummy_req(false);
         let mut body = ok_body();
         body.final_token = format!("{:#x}", Address::repeat_byte(0xFF));
-        let err = NewRouterClient::parse_response(body, &req, Address::repeat_byte(0xCA))
+        let err = NewRouterClient::parse_response(body, &req, Address::repeat_byte(0xCA), 100)
             .expect_err("must fail");
         assert!(matches!(err, Error::FinalTokenMismatch { .. }));
     }
@@ -271,7 +292,7 @@ mod tests {
         let req = dummy_req(false);
         let mut body = ok_body();
         body.calldata = None;
-        let err = NewRouterClient::parse_response(body, &req, Address::repeat_byte(0xCA))
+        let err = NewRouterClient::parse_response(body, &req, Address::repeat_byte(0xCA), 100)
             .expect_err("must fail");
         assert!(matches!(err, Error::CalldataUnavailable(_)));
     }
@@ -281,7 +302,7 @@ mod tests {
         let req = dummy_req(true);
         let mut body = ok_body();
         body.calldata = None;
-        let q = NewRouterClient::parse_response(body, &req, Address::repeat_byte(0xCA))
+        let q = NewRouterClient::parse_response(body, &req, Address::repeat_byte(0xCA), 100)
             .expect("ok");
         assert!(q.calldata.is_empty());
         assert_eq!(q.expected_output, eth::U256::from(1_000_000u64));
@@ -292,7 +313,7 @@ mod tests {
         let req = dummy_req(false);
         let mut body = ok_body();
         body.error = Some("min_out_exceeds_route_output".into());
-        let err = NewRouterClient::parse_response(body, &req, Address::repeat_byte(0xCA))
+        let err = NewRouterClient::parse_response(body, &req, Address::repeat_byte(0xCA), 100)
             .expect_err("must fail");
         assert!(matches!(err, Error::CalldataUnavailable(_)));
     }

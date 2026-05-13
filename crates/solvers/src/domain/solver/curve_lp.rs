@@ -239,7 +239,11 @@ impl Solver {
         let (provider, legacy_telemetry): (Arc<dyn RouteProvider>, _) = match config.route_provider {
             RouteProviderKind::Legacy => (Arc::new(legacy), None),
             RouteProviderKind::NewRouter { url } => {
-                let new_router = NewRouterClient::new(url, config.chain.router_address);
+                let new_router = NewRouterClient::new(
+                    url,
+                    config.chain.router_address,
+                    config.slippage_bps,
+                );
                 // Sidechain telemetry: a second legacy client (same chain) that
                 // we only ever invoke for log comparison on real solves.
                 let tele = LegacyProvider::new(
@@ -553,6 +557,16 @@ impl Inner {
             return self.solve_native_price_probe(order).await;
         }
 
+        // Sidechain real-solve only: fire the legacy comparison NOW, in
+        // parallel with everything else. The handle is polled non-blockingly
+        // just before logging — if legacy hasn't finished by then, we drop it
+        // rather than delaying the solve.
+        let legacy_telemetry = if !is_quote {
+            self.spawn_legacy_telemetry(order, gas_price)
+        } else {
+            None
+        };
+
         let route_start = std::time::Instant::now();
         let request = QuoteRequest {
             sell_token: order.sell.token.0,
@@ -621,15 +635,6 @@ impl Inner {
             });
         }
 
-        // Sidechain real-solve only: fire a best-effort legacy probe in
-        // parallel with the rest of solution construction. Wait for it just
-        // before logging so we can attach the comparison to "solved order".
-        let legacy_telemetry = if !is_quote {
-            self.spawn_legacy_telemetry(order, gas_price)
-        } else {
-            None
-        };
-
         let interaction = solution::CustomInteraction {
             target: quote.router_address,
             value: eth::Ether(eth::U256::ZERO),
@@ -652,7 +657,13 @@ impl Inner {
             }],
         };
 
-        let estimated_gas = eth::Gas(U256::from(350_000)) + self.solution_gas_offset;
+        // Prefer the provider's gas estimate when present (new-router).
+        // Legacy returns None — fall back to the historical constant.
+        let raw_gas = quote
+            .gas_estimate
+            .map(U256::from)
+            .unwrap_or_else(|| U256::from(350_000u64));
+        let estimated_gas = eth::Gas(raw_gas) + self.solution_gas_offset;
 
         // 6. Calculate fee based on gas
         let sell_token_price = match tokens.reference_price(&order.sell.token) {
@@ -703,8 +714,19 @@ impl Inner {
             .into_solution(eth::SellTokenAmount(fee_in_sell_token))
             .ok_or(SolveError::SolutionConstruction)?;
 
+        // Non-blocking poll: attach only if the spawned probe is already
+        // ready. Anything still in-flight is abandoned rather than holding
+        // the critical path. The probe ran concurrently with the main quote
+        // (spawned at the top of this fn), so a fast legacy is usually done.
         let legacy = match legacy_telemetry {
-            Some(h) => h.await.ok(),
+            Some(mut h) => match tokio::time::timeout(Duration::ZERO, &mut h).await {
+                Ok(Ok(t)) => Some(t),
+                Ok(Err(_)) => None,
+                Err(_) => {
+                    h.abort();
+                    None
+                }
+            },
             None => None,
         };
 
@@ -828,7 +850,11 @@ impl Inner {
                 amount: order.buy.amount,
             },
             interactions: vec![solution::Interaction::Custom(interaction)],
-            gas: eth::Gas(U256::from(350_000)) + self.solution_gas_offset,
+            gas: eth::Gas(
+                fwd.gas_estimate
+                    .map(U256::from)
+                    .unwrap_or_else(|| U256::from(350_000u64)),
+            ) + self.solution_gas_offset,
             wrappers: order.wrappers.clone(),
         };
 
