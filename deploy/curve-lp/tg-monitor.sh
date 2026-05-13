@@ -21,13 +21,24 @@ fi
 
 : "${TG_BOT_TOKEN:?Set TG_BOT_TOKEN in .env}"
 : "${TG_CHAT_ID:?Set TG_CHAT_ID in .env}"
-TG_STATS_THREAD=${TG_STATS_THREAD:-}    # General topic (empty = default)
-TG_TRADES_THREAD=${TG_TRADES_THREAD:-3}  # Wins topic
+TG_STATS_THREAD=${TG_STATS_THREAD:-}                 # General topic (empty = default)
+TG_TRADES_THREAD=${TG_TRADES_THREAD:-3}             # Legacy/default trades topic
+TG_TRADES_THREAD_MAINNET=${TG_TRADES_THREAD_MAINNET:-$TG_TRADES_THREAD}
+TG_TRADES_THREAD_ARBITRUM=${TG_TRADES_THREAD_ARBITRUM:-$TG_TRADES_THREAD}
+TG_TRADES_THREAD_GNOSIS=${TG_TRADES_THREAD_GNOSIS:-$TG_TRADES_THREAD}
 
 COMPOSE_FILE="docker-compose.prod.yml"
 INTERVAL=300  # 5 minutes
 STATS_REPORT_CYCLES=12  # stats every 12 cycles (1 hour)
 IDLE_REPORT_CYCLES=6    # report idle every 30 min
+SOLVER_SERVICES=(
+    solver
+    solver-staging
+    arbitrum
+    arbitrum-staging
+    gnosis
+    gnosis-staging
+)
 
 idle_cycles=0
 stats_cycle=0
@@ -50,14 +61,50 @@ send_tg() {
         > /dev/null 2>&1 || true
 }
 
+service_chain() {
+    case "$1" in
+        solver|solver-staging) echo "mainnet" ;;
+        arbitrum|arbitrum-staging) echo "arbitrum" ;;
+        gnosis|gnosis-staging) echo "gnosis" ;;
+        *) echo "unknown" ;;
+    esac
+}
+
+service_env() {
+    case "$1" in
+        *-staging) echo "staging" ;;
+        *) echo "prod" ;;
+    esac
+}
+
+chain_thread() {
+    case "$1" in
+        mainnet) echo "$TG_TRADES_THREAD_MAINNET" ;;
+        arbitrum) echo "$TG_TRADES_THREAD_ARBITRUM" ;;
+        gnosis) echo "$TG_TRADES_THREAD_GNOSIS" ;;
+        *) echo "$TG_TRADES_THREAD" ;;
+    esac
+}
+
+normalize_service_name() {
+    local name="$1"
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    name="${name%-1}"
+    echo "$name"
+}
+
 # Startup message
-send_tg "$TG_STATS_THREAD" "🟢 Solver monitor started"
+send_tg "$TG_STATS_THREAD" "🟢 Solver monitor started
+
+Watching: mainnet, arbitrum, gnosis
+Trades threads: mainnet=${TG_TRADES_THREAD_MAINNET:-default}, arbitrum=${TG_TRADES_THREAD_ARBITRUM:-default}, gnosis=${TG_TRADES_THREAD_GNOSIS:-default}"
 
 while true; do
     sleep "$INTERVAL"
 
     # Grab last 5 min of logs
-    logs=$(docker compose -f "$COMPOSE_FILE" logs --since 5m solver 2>&1 || true)
+    logs=$(docker compose -f "$COMPOSE_FILE" logs --since 5m "${SOLVER_SERVICES[@]}" 2>&1 || true)
     nginx_logs=$(docker compose -f "$COMPOSE_FILE" logs --since 5m nginx 2>&1 || true)
 
     # Check nginx for 4xx/5xx errors
@@ -103,22 +150,34 @@ ${top_errors}
     # competing solvers; we have no visibility into that outcome here.
     while IFS= read -r line; do
         [ -z "$line" ] && continue
-        uid=$(echo "$line" | grep -oP '"order_uid":"\K[^"]+' || echo "???")
-        sell_tok=$(echo "$line" | grep -oP '"sell_token":"TokenAddress\(\K0x[a-fA-F0-9]+' || echo "???")
-        buy_tok=$(echo "$line" | grep -oP '"buy_token":"TokenAddress\(\K0x[a-fA-F0-9]+' || echo "???")
-        sell_amt=$(echo "$line" | grep -oP '"sell_amount":"\K[0-9]+' || echo "???")
-        buy_amt=$(echo "$line" | grep -oP '"solution_output":"\K[0-9]+' || echo "???")
-        side=$(echo "$line" | grep -oP '"side":"\K[^"]+' || echo "???")
+        service_prefix="${line%%|*}"
+        service_name="$(normalize_service_name "$service_prefix")"
+        log_line="$line"
+        if [[ "$line" == *"|"* ]]; then
+            log_line="${line#*| }"
+        fi
+
+        chain="$(service_chain "$service_name")"
+        env_name="$(service_env "$service_name")"
+        thread_id="$(chain_thread "$chain")"
+
+        uid=$(echo "$log_line" | grep -oP '"order_uid":"\K[^"]+' || echo "???")
+        sell_tok=$(echo "$log_line" | grep -oP '"sell_token":"TokenAddress\(\K0x[a-fA-F0-9]+' || echo "???")
+        buy_tok=$(echo "$log_line" | grep -oP '"buy_token":"TokenAddress\(\K0x[a-fA-F0-9]+' || echo "???")
+        sell_amt=$(echo "$log_line" | grep -oP '"sell_amount":"\K[0-9]+' || echo "???")
+        buy_amt=$(echo "$log_line" | grep -oP '"solution_output":"\K[0-9]+' || echo "???")
+        side=$(echo "$log_line" | grep -oP '"side":"\K[^"]+' || echo "???")
 
         # Shorten addresses for readability
         sell_short="${sell_tok:0:6}...${sell_tok: -4}"
         buy_short="${buy_tok:0:6}...${buy_tok: -4}"
 
         msg="🔧 *Solution Candidate*
+Chain: ${chain} | Env: ${env_name}
 \`${sell_short}\` → \`${buy_short}\`
 Side: ${side} | Sell: ${sell_amt} | Output: ${buy_amt}
 [Order](https://explorer.cow.fi/orders/${uid})"
-        send_tg "$TG_TRADES_THREAD" "$msg"
+        send_tg "$thread_id" "$msg"
     done < <(echo "$logs" | grep '"solved order"' | grep '"is_quote":false' || true)
 
     # Accumulate hourly stats

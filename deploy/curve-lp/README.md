@@ -21,10 +21,10 @@ container points at.
 |---------------------|----------|---------------|------------------------------------------------------|----------------|
 | `solver`            | Ethereum | prod `0x9008…`  | `/prod/mainnet/`                                     | **Yes**        |
 | `solver-staging`    | Ethereum | shadow `0xf553…`| `/staging/mainnet/`, `/shadow/mainnet/`              | Yes            |
-| `arbitrum`          | Arbitrum | prod `0x9008…`  | `/prod/arbitrum/`                                    | No (pending smoke test) |
-| `arbitrum-staging`  | Arbitrum | shadow `0xf553…`| `/staging/arbitrum/`, `/shadow/arbitrum/`            | No             |
-| `gnosis`            | Gnosis   | prod `0x9008…`  | `/prod/gnosis/`                                      | No (pending smoke test) |
-| `gnosis-staging`    | Gnosis   | shadow `0xf553…`| `/staging/gnosis/`, `/shadow/gnosis/`                | No             |
+| `arbitrum`          | Arbitrum | prod `0x9008…`  | `/prod/arbitrum/`                                    | Yes            |
+| `arbitrum-staging`  | Arbitrum | shadow `0xf553…`| `/staging/arbitrum/`, `/shadow/arbitrum/`            | Yes            |
+| `gnosis`            | Gnosis   | prod `0x9008…`  | `/prod/gnosis/`                                      | Yes            |
+| `gnosis-staging`    | Gnosis   | shadow `0xf553…`| `/staging/gnosis/`, `/shadow/gnosis/`                | Yes            |
 | `nginx`             | —        | —             | —                                                    | —              |
 | `certbot`           | —        | —             | —                                                    | —              |
 
@@ -35,16 +35,17 @@ to half-baked solver behavior.
 
 Public URL pattern follows CoW's convention: `https://$DOMAIN/{env}/{network}/...`.
 
-**Legacy `/healthz`** at the domain root still probes the mainnet `solver`
-(back-compat). Per-chain liveness is at `/prod/{chain}/healthz`.
+Per-chain liveness is at `/prod/{chain}/healthz`. Root `/healthz` still exists
+for back-compat, but the per-chain endpoints are the ones we actually care
+about operationally.
 
 ### Chains supported
 
-Chain support lives entirely in config (no Rust changes needed to add a 4th).
-To add a new chain you need: a Curve Router deployment, a Curve Price API slug
-(`ethereum`/`arbitrum`/`xdai` today), wrapped-native token, and a compose
-service + nginx location. See `crates/solvers/src/domain/solver/curve_lp.rs`
-for `ChainConfig`.
+Chain support is mostly config-driven once the solver knows the chain ID / price
+slug pair. To add a new chain you need: a Curve Router deployment, a Curve
+Price API slug (`ethereum`/`arbitrum`/`xdai` today), wrapped-native token, a
+compose service, an nginx location, and the corresponding `ChainConfig`
+validation entry in `crates/solvers/src/domain/solver/curve_lp.rs`.
 
 ---
 
@@ -134,7 +135,9 @@ Per-chain TOMLs in `deploy/curve-lp/`:
 - `curve-lp.prod.toml`    — ETH mainnet prod
 - `curve-lp.staging.toml` — ETH mainnet staging (different settlement contract)
 - `curve-lp.arbitrum.toml`
+- `curve-lp.arbitrum-staging.toml`
 - `curve-lp.gnosis.toml`
+- `curve-lp.gnosis-staging.toml`
 
 These are the source of truth. `deploy.sh` runs them through `envsubst` (only
 `${NODE_URL}` is substituted, scoped per-chain) into `./processed/` and mounts
@@ -168,8 +171,8 @@ not committed. `.env.example` is the template. Required vars:
 | var                  | when required                           |
 |----------------------|-----------------------------------------|
 | `NODE_URL`           | rebuilding `solver` or `solver-staging` |
-| `NODE_URL_ARBITRUM`  | rebuilding `arbitrum`                   |
-| `NODE_URL_GNOSIS`    | rebuilding `gnosis`                     |
+| `NODE_URL_ARBITRUM`  | rebuilding `arbitrum` or `arbitrum-staging` |
+| `NODE_URL_GNOSIS`    | rebuilding `gnosis` or `gnosis-staging` |
 | `DOMAIN`             | ingress (nginx/certbot)                 |
 | `SSL_EMAIL`          | ingress                                 |
 | `TG_BOT_TOKEN`, `TG_CHAT_ID`, `TG_*_THREAD` | telegram monitor (optional) |
@@ -206,14 +209,19 @@ nohup ./tg-monitor.sh > tg-monitor.log 2>&1 &
 What it reports (every 5 min tick):
 - Nginx 4xx/5xx over the last 5 min.
 - Solver-candidate trade notifications (per-order, with CoW explorer link).
-- Hourly summary: auctions, quotes, orders processed, solution candidates, errors.
+- Hourly summary across all solver containers: auctions, quotes, orders processed, solution candidates, errors.
 - Idle heartbeat every 30 min if no activity.
 
-**Caveat**: `tg-monitor.sh` and `monitor.sh` only watch the mainnet
-`solver` container. They do not currently watch `arbitrum`, `gnosis`, or
-`solver-staging`. To extend, the `docker compose logs` calls need to run
-per-container (or use `docker compose logs solver arbitrum gnosis` with
-per-line service prefixes).
+`tg-monitor.sh` watches all six solver containers. Solve notifications are
+routed by chain:
+- mainnet -> `TG_TRADES_THREAD_MAINNET` (fallback `TG_TRADES_THREAD`)
+- arbitrum -> `TG_TRADES_THREAD_ARBITRUM` (fallback `TG_TRADES_THREAD`)
+- gnosis -> `TG_TRADES_THREAD_GNOSIS` (fallback `TG_TRADES_THREAD`)
+
+Prod and staging notifications for the same chain land in the same Telegram
+topic; the message body includes `Chain:` and `Env:` so you can tell them apart.
+
+`monitor.sh` is still mainnet-only unless extended separately.
 
 `monitor.sh` is an interactive console tail with trade extraction to
 `trades.log`.
@@ -311,10 +319,14 @@ docker compose -f docker-compose.prod.yml logs certbot
 Force a refresh by recreating the ingress: `./deploy.sh --ingress-only`.
 
 ### CoW driver sends traffic that all 404s or times out
-Confirm CoW has the right URL(s) registered. For mainnet today that's
-`https://$DOMAIN/prod/mainnet/` and `/staging/mainnet/`. Arbitrum and
-Gnosis are **not yet registered** — smoke test first, then onboard via CoW
-discord.
+Confirm CoW has the right URL(s) registered for the chain/env pair in question.
+Typical examples:
+- `https://$DOMAIN/prod/mainnet/`
+- `https://$DOMAIN/staging/mainnet/`
+- `https://$DOMAIN/prod/arbitrum/`
+- `https://$DOMAIN/staging/arbitrum/`
+- `https://$DOMAIN/prod/gnosis/`
+- `https://$DOMAIN/staging/gnosis/`
 
 ### Swap / memory pressure on a t3.medium
 Three parallel Rust rebuilds can OOM on 4 GB. Up the swap file or deploy
