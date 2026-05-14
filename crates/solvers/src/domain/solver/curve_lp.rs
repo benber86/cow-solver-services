@@ -5,7 +5,7 @@
 
 use {
     crate::domain::{
-        auction::{self, Auction},
+        auction::{self, Auction, Tokens},
         curve::{
             api,
             legacy_provider::LegacyProvider,
@@ -21,7 +21,12 @@ use {
     futures::stream::StreamExt,
     reqwest::Url,
     serde::Deserialize,
-    std::{collections::HashSet, fmt, sync::Arc, time::Duration},
+    std::{
+        collections::{HashMap, HashSet},
+        fmt,
+        sync::Arc,
+        time::Duration,
+    },
     tracing::Instrument,
 };
 
@@ -183,6 +188,12 @@ pub struct Config {
     pub solution_gas_offset: eth::SignedGas,
     /// Which backend provides execution quotes.
     pub route_provider: RouteProviderKind,
+    /// Maximum non-LP orders to attempt after all LP-priority orders.
+    /// `None` means uncapped.
+    pub max_general_orders_per_auction: Option<usize>,
+    /// Maximum non-LP orders to attempt per (sell token, buy token, side).
+    /// `None` means uncapped.
+    pub max_general_orders_per_pair: Option<usize>,
 }
 
 struct Inner {
@@ -198,6 +209,8 @@ struct Inner {
     price_client: price_api::Client,
     slippage_bps: u32,
     solution_gas_offset: eth::SignedGas,
+    max_general_orders_per_auction: Option<usize>,
+    max_general_orders_per_pair: Option<usize>,
 }
 
 impl Solver {
@@ -270,6 +283,8 @@ impl Solver {
                 price_client,
                 slippage_bps: config.slippage_bps,
                 solution_gas_offset: config.solution_gas_offset,
+                max_general_orders_per_auction: config.max_general_orders_per_auction,
+                max_general_orders_per_pair: config.max_general_orders_per_pair,
             }),
         }
     }
@@ -389,7 +404,7 @@ impl Inner {
         let is_quote = matches!(auction.id, auction::Id::Quote);
         let mut sent_count: usize = 0;
         let mut receiver_dropped = false;
-        let mut supported: Vec<_> = auction
+        let supported: Vec<_> = auction
             .orders
             .into_iter()
             .enumerate()
@@ -408,9 +423,9 @@ impl Inner {
                 Some(_) => false,
             })
             .collect();
-        supported.sort_by_key(|(i, order)| (!self.is_priority_order(order), *i));
+        let selected = self.select_orders(supported, &auction.tokens);
 
-        let mut stream = futures::stream::iter(supported.into_iter().map(|(i, order)| {
+        let mut stream = futures::stream::iter(selected.into_iter().map(|(i, order)| {
             let tokens = &auction.tokens;
             let gas_price = &auction.gas_price;
             async move {
@@ -559,6 +574,59 @@ impl Inner {
         self.lp_tokens.as_ref().is_some_and(|lp_tokens| {
             lp_tokens.contains(&order.sell.token.0) || lp_tokens.contains(&order.buy.token.0)
         })
+    }
+
+    fn select_orders(
+        &self,
+        supported: Vec<(usize, Order)>,
+        tokens: &Tokens,
+    ) -> Vec<(usize, Order)> {
+        let mut priority = Vec::new();
+        let mut general = Vec::new();
+
+        for item in supported {
+            if self.is_priority_order(&item.1) {
+                priority.push(item);
+            } else {
+                general.push(item);
+            }
+        }
+
+        priority.sort_by_key(|(i, order)| (std::cmp::Reverse(order_notional(order, tokens)), *i));
+        general.sort_by_key(|(i, order)| (std::cmp::Reverse(order_notional(order, tokens)), *i));
+
+        if let Some(per_pair) = self.max_general_orders_per_pair {
+            let mut counts = HashMap::<(eth::Address, eth::Address, u8), usize>::new();
+            general.retain(|(_, order)| {
+                let key = (
+                    order.sell.token.0,
+                    order.buy.token.0,
+                    order_side_key(order.side),
+                );
+                let count = counts.entry(key).or_default();
+                if *count >= per_pair {
+                    false
+                } else {
+                    *count += 1;
+                    true
+                }
+            });
+        }
+
+        if let Some(limit) = self.max_general_orders_per_auction {
+            general.truncate(limit);
+        }
+
+        tracing::debug!(
+            priority_orders = priority.len(),
+            selected_general_orders = general.len(),
+            max_general_orders_per_auction = self.max_general_orders_per_auction,
+            max_general_orders_per_pair = self.max_general_orders_per_pair,
+            "selected Curve LP solver orders"
+        );
+
+        priority.extend(general);
+        priority
     }
 
     async fn solve_order(
@@ -955,6 +1023,26 @@ fn legacy_delta_bps(new_router: eth::U256, legacy: eth::U256) -> Option<i32> {
     Some(sign * bps_i32)
 }
 
+fn order_notional(order: &Order, tokens: &Tokens) -> eth::U256 {
+    const BASE: u128 = 1_000_000_000_000_000_000;
+    let (token, amount) = match order.side {
+        order::Side::Sell => (&order.sell.token, order.sell.amount),
+        order::Side::Buy => (&order.buy.token, order.buy.amount),
+    };
+    let price = match tokens.reference_price(token) {
+        Some(price) => price.0.0,
+        None => return eth::U256::ZERO,
+    };
+    amount.saturating_mul(price) / eth::U256::from(BASE)
+}
+
+fn order_side_key(side: order::Side) -> u8 {
+    match side {
+        order::Side::Buy => 0,
+        order::Side::Sell => 1,
+    }
+}
+
 fn gas_price_to_gwei(gas_price: &auction::GasPrice) -> Option<f64> {
     let wei: u128 = gas_price.0.0.try_into().ok()?;
     Some((wei as f64) / 1e9)
@@ -1214,6 +1302,8 @@ mod tests {
             price_client: price_api::Client::new("http://localhost:1".parse().unwrap()),
             slippage_bps,
             solution_gas_offset: eth::SignedGas::default(),
+            max_general_orders_per_auction: None,
+            max_general_orders_per_pair: None,
         }
     }
 
@@ -1357,6 +1447,39 @@ mod tests {
         }
     }
 
+    fn sell_order_with_amount(sell: eth::Address, buy: eth::Address, amount: u128) -> Order {
+        Order {
+            sell: eth::Asset {
+                token: eth::TokenAddress(sell),
+                amount: U256::from(amount),
+            },
+            ..sell_order(sell, buy)
+        }
+    }
+
+    fn tokens_with_unit_prices(tokens: &[eth::Address]) -> auction::Tokens {
+        auction::Tokens(
+            tokens
+                .iter()
+                .copied()
+                .map(|token| {
+                    (
+                        eth::TokenAddress(token),
+                        auction::Token {
+                            decimals: Some(18),
+                            symbol: None,
+                            reference_price: Some(auction::Price(eth::Ether(U256::from(
+                                1_000_000_000_000_000_000u128,
+                            )))),
+                            available_balance: U256::ZERO,
+                            trusted: true,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
     #[tokio::test]
     async fn token_allowlist_accepts_when_both_sides_in_list() {
         let a = eth::Address::repeat_byte(0xaa);
@@ -1461,5 +1584,37 @@ mod tests {
             inner.rejection_reason(&sell_order(a, b)),
             Some("no_lp_token_match")
         );
+    }
+
+    #[test]
+    fn select_orders_processes_all_lp_orders_before_capped_general_orders() {
+        let lp = eth::Address::repeat_byte(0x01);
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+        let usdt = eth::Address::repeat_byte(0x04);
+
+        let mut inner = test_inner(100, 50);
+        inner.lp_tokens = Some([lp].into_iter().collect());
+        inner.token_allowlist = Some([usdc, weth, usdt].into_iter().collect());
+        inner.max_general_orders_per_auction = Some(2);
+        inner.max_general_orders_per_pair = Some(1);
+
+        let orders = vec![
+            (0, sell_order_with_amount(usdc, weth, 100)),
+            (1, sell_order_with_amount(lp, usdc, 1)),
+            (2, sell_order_with_amount(usdc, weth, 200)),
+            (3, sell_order_with_amount(usdt, usdc, 50)),
+            (4, sell_order_with_amount(weth, usdt, 25)),
+            (5, sell_order_with_amount(lp, weth, 2)),
+        ];
+        let tokens = tokens_with_unit_prices(&[lp, usdc, weth, usdt]);
+
+        let selected = inner.select_orders(orders, &tokens);
+        let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
+
+        // Both LP orders are retained and come first, even though their
+        // notional is smaller than the general orders. General orders are
+        // capped globally and per pair after notional ranking.
+        assert_eq!(selected_indices, vec![5, 1, 2, 3]);
     }
 }

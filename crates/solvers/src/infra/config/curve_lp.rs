@@ -95,6 +95,14 @@ struct Config {
     /// `route-provider = "new-router"`.
     #[serde(default)]
     new_router_url: Option<Url>,
+
+    /// Maximum non-LP orders to attempt after all LP-priority orders.
+    #[serde(default)]
+    max_general_orders_per_auction: Option<usize>,
+
+    /// Maximum non-LP orders to attempt per (sell token, buy token, side).
+    #[serde(default)]
+    max_general_orders_per_pair: Option<usize>,
 }
 
 fn default_slippage_bps() -> u32 {
@@ -161,6 +169,8 @@ pub async fn load(path: &Path) -> curve_lp::Config {
         max_quote_deviation_bps: config.max_quote_deviation_bps,
         solution_gas_offset: config.solution_gas_offset.into(),
         route_provider,
+        max_general_orders_per_auction: config.max_general_orders_per_auction,
+        max_general_orders_per_pair: config.max_general_orders_per_pair,
     }
 }
 
