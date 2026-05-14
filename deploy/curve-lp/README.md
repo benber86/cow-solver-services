@@ -150,18 +150,20 @@ a chain.
 
 ### Token filters
 
-Three independent filters can narrow what the solver engages with. All are
-optional; any combination can be set. Applied together (AND).
+Three filter knobs control what the solver engages with and which orders it
+tries first. All are optional.
 
 | filter                 | semantics                                                            | use when                                          |
 |------------------------|----------------------------------------------------------------------|---------------------------------------------------|
-| `lp-tokens`            | either-side — at least one side must be in this list                 | "I'm the LP specialist; other side unconstrained" |
+| `lp-tokens`            | either-side LP set. Alone, it is a hard filter; with `token-allowlist`, it becomes priority ordering | "LP orders first, general Curve pairs if time remains" |
 | `allowed-buy-tokens`   | either-side — at least one side must be in this list (misleadingly named; symmetric) | historical crvUSD-style filter                    |
-| `token-allowlist`      | **both-sides** — reject if either `sell.token` or `buy.token` is absent | "confine the solver to a known universe"          |
+| `token-allowlist`      | **both-sides** — reject if either `sell.token` or `buy.token` is outside `token-allowlist ∪ lp-tokens` | "confine the solver to a known universe"          |
 
-Leaving all three omitted attempts every order and can cause deadline
-timeouts. Mainnet uses `lp-tokens`; Arbitrum/Gnosis are set up to use
-`token-allowlist` instead.
+Mainnet uses `lp-tokens` as a hard LP-specialist filter. Arbitrum/Gnosis use
+`token-allowlist` as a broad safety universe and `lp-tokens` as priority:
+LP-involved orders are attempted first, then non-LP allowlisted pairs consume
+whatever deadline remains. Leaving all three omitted attempts every order and
+can cause deadline timeouts.
 
 ### Secrets
 

@@ -1,8 +1,7 @@
 use {
     alloy::primitives::{Address, U256, aliases::U24},
     contracts::alloy::UniswapV3QuoterV2::IQuoterV2::{
-        QuoteExactInputSingleParams,
-        QuoteExactOutputSingleParams,
+        QuoteExactInputSingleParams, QuoteExactOutputSingleParams,
     },
     model::TokenPair,
     shared::baseline_solver::BaselineSolvable,

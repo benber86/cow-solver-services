@@ -94,7 +94,11 @@ impl Client {
             .map_err(|e| Error::Network(e.to_string()))?;
         let http_ms = http_start.elapsed().as_millis() as u64;
 
-        tracing::debug!(http_ms, status = response.status().as_u16(), "curve API response");
+        tracing::debug!(
+            http_ms,
+            status = response.status().as_u16(),
+            "curve API response"
+        );
 
         if !response.status().is_success() {
             let status = response.status();
@@ -192,11 +196,9 @@ impl Client {
             }
 
             // Pool/swap address
-            let swap_addr: eth::Address = step
-                .args
-                .swap_address
-                .parse()
-                .map_err(|_| Error::Parse(format!("invalid swap_address: {}", step.args.swap_address)))?;
+            let swap_addr: eth::Address = step.args.swap_address.parse().map_err(|_| {
+                Error::Parse(format!("invalid swap_address: {}", step.args.swap_address))
+            })?;
             route[i * 2 + 1] = swap_addr;
 
             // Token out for this step
@@ -218,11 +220,9 @@ impl Client {
             if !step.args.pool_address.is_empty()
                 && step.args.pool_address != "0x0000000000000000000000000000000000000000"
             {
-                pools[i] = step
-                    .args
-                    .pool_address
-                    .parse()
-                    .map_err(|_| Error::Parse(format!("invalid pool_address: {}", step.args.pool_address)))?;
+                pools[i] = step.args.pool_address.parse().map_err(|_| {
+                    Error::Parse(format!("invalid pool_address: {}", step.args.pool_address))
+                })?;
             }
         }
 
@@ -282,19 +282,27 @@ mod tests {
             }],
         }];
 
-        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4".parse().unwrap();
-        let token_out: eth::Address = "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().unwrap();
+        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4"
+            .parse()
+            .unwrap();
+        let token_out: eth::Address = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+            .parse()
+            .unwrap();
         let route = Client::parse_route(response, token_in, token_out).unwrap();
         assert_eq!(route.expected_output, eth::U256::from(1_769_022_968u64));
     }
 
     #[test]
     fn test_validate_route_rejects_wrong_token_in() {
-        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4".parse().unwrap();
-        let token_out: eth::Address =
-            "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().unwrap();
-        let wrong_token: eth::Address =
-            "0x0000000000000000000000000000000000000001".parse().unwrap();
+        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4"
+            .parse()
+            .unwrap();
+        let token_out: eth::Address = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+            .parse()
+            .unwrap();
+        let wrong_token: eth::Address = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
 
         let mut route = [eth::Address::ZERO; 11];
         route[0] = wrong_token; // wrong first token
@@ -314,11 +322,15 @@ mod tests {
 
     #[test]
     fn test_validate_route_rejects_wrong_token_out() {
-        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4".parse().unwrap();
-        let token_out: eth::Address =
-            "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().unwrap();
-        let wrong_token: eth::Address =
-            "0x0000000000000000000000000000000000000001".parse().unwrap();
+        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4"
+            .parse()
+            .unwrap();
+        let token_out: eth::Address = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+            .parse()
+            .unwrap();
+        let wrong_token: eth::Address = "0x0000000000000000000000000000000000000001"
+            .parse()
+            .unwrap();
 
         let mut route = [eth::Address::ZERO; 11];
         route[0] = token_in;
@@ -338,9 +350,12 @@ mod tests {
 
     #[test]
     fn test_validate_route_rejects_no_hops() {
-        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4".parse().unwrap();
-        let token_out: eth::Address =
-            "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().unwrap();
+        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4"
+            .parse()
+            .unwrap();
+        let token_out: eth::Address = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+            .parse()
+            .unwrap();
 
         let mut route = [eth::Address::ZERO; 11];
         route[0] = token_in;
@@ -357,9 +372,12 @@ mod tests {
 
     #[test]
     fn test_validate_route_accepts_valid_route() {
-        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4".parse().unwrap();
-        let token_out: eth::Address =
-            "0xdAC17F958D2ee523a2206206994597C13D831ec7".parse().unwrap();
+        let token_in: eth::Address = "0xf5f5B97624542D72A9E06f04804Bf81baA15e2B4"
+            .parse()
+            .unwrap();
+        let token_out: eth::Address = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+            .parse()
+            .unwrap();
 
         let mut route = [eth::Address::ZERO; 11];
         route[0] = token_in;

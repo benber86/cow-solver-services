@@ -7,7 +7,10 @@ use {
     crate::domain::{
         auction::{self, Auction},
         curve::{
-            api, legacy_provider::LegacyProvider, new_router::NewRouterClient, price_api,
+            api,
+            legacy_provider::LegacyProvider,
+            new_router::NewRouterClient,
+            price_api,
             route_provider::{self, QuoteRequest, RouteProvider},
         },
         eth,
@@ -86,10 +89,7 @@ pub struct ChainConfig {
 #[derive(Debug)]
 pub enum ChainConfigError {
     UnsupportedChain(u64),
-    PriceApiChainMismatch {
-        chain_id: u64,
-        slug: &'static str,
-    },
+    PriceApiChainMismatch { chain_id: u64, slug: &'static str },
     ZeroRouterAddress,
 }
 
@@ -97,16 +97,18 @@ impl fmt::Display for ChainConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnsupportedChain(id) => {
-                write!(f, "unsupported chain_id {id}; expected one of 1, 100, 42161")
+                write!(
+                    f,
+                    "unsupported chain_id {id}; expected one of 1, 100, 42161"
+                )
             }
             Self::PriceApiChainMismatch { chain_id, slug } => write!(
                 f,
                 "price_api_chain {slug} does not match chain_id {chain_id}"
             ),
-            Self::ZeroRouterAddress => write!(
-                f,
-                "router_address must be a non-zero 20-byte address"
-            ),
+            Self::ZeroRouterAddress => {
+                write!(f, "router_address must be a non-zero 20-byte address")
+            }
         }
     }
 }
@@ -236,14 +238,12 @@ impl Solver {
             ONCHAIN_VERIFY_TIMEOUT,
         );
 
-        let (provider, legacy_telemetry): (Arc<dyn RouteProvider>, _) = match config.route_provider {
+        let (provider, legacy_telemetry): (Arc<dyn RouteProvider>, _) = match config.route_provider
+        {
             RouteProviderKind::Legacy => (Arc::new(legacy), None),
             RouteProviderKind::NewRouter { url } => {
-                let new_router = NewRouterClient::new(
-                    url,
-                    config.chain.router_address,
-                    config.slippage_bps,
-                );
+                let new_router =
+                    NewRouterClient::new(url, config.chain.router_address, config.slippage_bps);
                 // Sidechain telemetry: a second legacy client (same chain) that
                 // we only ever invoke for log comparison on real solves.
                 let tele = LegacyProvider::new(
@@ -289,6 +289,13 @@ impl Solver {
             .iter()
             .filter(|order| self.inner.rejection_reason(order).is_none())
             .count();
+        let priority_orders = auction
+            .orders
+            .iter()
+            .filter(|order| {
+                self.inner.rejection_reason(order).is_none() && self.inner.is_priority_order(order)
+            })
+            .count();
         let auction_id = auction.id;
         let is_quote = matches!(auction.id, auction::Id::Quote);
 
@@ -306,6 +313,7 @@ impl Solver {
         tracing::info!(
             total_orders,
             supported_orders,
+            priority_orders,
             remaining_ms = remaining.as_millis(),
             "starting Curve LP solver"
         );
@@ -330,6 +338,7 @@ impl Solver {
                 tracing::debug!(
                     total_orders,
                     supported_orders,
+                    priority_orders,
                     remaining_ms = remaining.as_millis(),
                     "reached timeout while solving Curve LP orders"
                 );
@@ -349,6 +358,7 @@ impl Solver {
             is_quote,
             total_orders,
             supported_orders,
+            priority_orders,
             num_solutions = solutions.len(),
             elapsed_ms = elapsed.as_millis() as u64,
             budget_ms = remaining.as_millis() as u64,
@@ -375,96 +385,85 @@ fn is_native_price_probe(order: &Order, is_quote: bool, wrapped_native: eth::Add
 }
 
 impl Inner {
-    async fn solve(
-        &self,
-        auction: Auction,
-        sender: tokio::sync::mpsc::UnboundedSender<Solution>,
-    ) {
+    async fn solve(&self, auction: Auction, sender: tokio::sync::mpsc::UnboundedSender<Solution>) {
         let is_quote = matches!(auction.id, auction::Id::Quote);
         let mut sent_count: usize = 0;
         let mut receiver_dropped = false;
-        let mut stream = futures::stream::iter(
-            auction
-                .orders
-                .into_iter()
-                .enumerate()
-                .filter(|(_, order)| {
-                    match self.rejection_reason(order) {
-                        None => true,
-                        Some(reason) if is_quote => {
-                            tracing::debug!(
-                                order_uid = %order.uid,
-                                sell_token = ?order.sell.token,
-                                buy_token = ?order.buy.token,
-                                reason,
-                                "order not supported"
-                            );
-                            false
-                        }
-                        Some(_) => false,
-                    }
-                })
-                .map(|(i, order)| {
-                    let tokens = &auction.tokens;
-                    let gas_price = &auction.gas_price;
-                    async move {
-                        tracing::debug!(
+        let mut supported: Vec<_> = auction
+            .orders
+            .into_iter()
+            .enumerate()
+            .filter(|(_, order)| match self.rejection_reason(order) {
+                None => true,
+                Some(reason) if is_quote => {
+                    tracing::debug!(
+                        order_uid = %order.uid,
+                        sell_token = ?order.sell.token,
+                        buy_token = ?order.buy.token,
+                        reason,
+                        "order not supported"
+                    );
+                    false
+                }
+                Some(_) => false,
+            })
+            .collect();
+        supported.sort_by_key(|(i, order)| (!self.is_priority_order(order), *i));
+
+        let mut stream = futures::stream::iter(supported.into_iter().map(|(i, order)| {
+            let tokens = &auction.tokens;
+            let gas_price = &auction.gas_price;
+            async move {
+                tracing::debug!(
+                    order_uid = %order.uid,
+                    sell_token = ?order.sell.token,
+                    buy_token = ?order.buy.token,
+                    "processing Curve LP order"
+                );
+
+                match self.solve_order(&order, tokens, gas_price, is_quote).await {
+                    Ok(solved) => {
+                        let legacy_output = solved
+                            .legacy
+                            .as_ref()
+                            .and_then(|l| l.output)
+                            .map(|v| v.to_string());
+                        let legacy_error = solved.legacy.as_ref().and_then(|l| l.error.clone());
+                        let legacy_ms = solved.legacy.as_ref().map(|l| l.elapsed_ms);
+                        let delta_bps = solved
+                            .legacy
+                            .as_ref()
+                            .and_then(|l| l.output)
+                            .and_then(|v| legacy_delta_bps(solved.output_amount, v));
+                        let quality_slug = solved.quote_quality.map(|q| q.as_slug());
+                        tracing::info!(
                             order_uid = %order.uid,
                             sell_token = ?order.sell.token,
                             buy_token = ?order.buy.token,
-                            "processing Curve LP order"
+                            side = ?order.side,
+                            sell_amount = %order.sell.amount,
+                            order_buy_min = %order.buy.amount,
+                            solution_output = %solved.output_amount,
+                            route_ms = solved.route_ms,
+                            price_fetch_ms = solved.price_fetch_ms,
+                            is_quote,
+                            new_router_quality = quality_slug,
+                            new_router_gas = solved.gas_estimate,
+                            legacy_output,
+                            legacy_ms,
+                            legacy_error,
+                            delta_bps,
+                            "solved order"
                         );
-
-                        match self.solve_order(&order, tokens, gas_price, is_quote).await {
-                            Ok(solved) => {
-                                let legacy_output = solved
-                                    .legacy
-                                    .as_ref()
-                                    .and_then(|l| l.output)
-                                    .map(|v| v.to_string());
-                                let legacy_error = solved
-                                    .legacy
-                                    .as_ref()
-                                    .and_then(|l| l.error.clone());
-                                let legacy_ms =
-                                    solved.legacy.as_ref().map(|l| l.elapsed_ms);
-                                let delta_bps = solved
-                                    .legacy
-                                    .as_ref()
-                                    .and_then(|l| l.output)
-                                    .and_then(|v| legacy_delta_bps(solved.output_amount, v));
-                                let quality_slug = solved
-                                    .quote_quality
-                                    .map(|q| q.as_slug());
-                                tracing::info!(
-                                    order_uid = %order.uid,
-                                    sell_token = ?order.sell.token,
-                                    buy_token = ?order.buy.token,
-                                    side = ?order.side,
-                                    sell_amount = %order.sell.amount,
-                                    order_buy_min = %order.buy.amount,
-                                    solution_output = %solved.output_amount,
-                                    route_ms = solved.route_ms,
-                                    price_fetch_ms = solved.price_fetch_ms,
-                                    is_quote,
-                                    new_router_quality = quality_slug,
-                                    new_router_gas = solved.gas_estimate,
-                                    legacy_output,
-                                    legacy_ms,
-                                    legacy_error,
-                                    delta_bps,
-                                    "solved order"
-                                );
-                                Some((solved.solution.with_id(solution::Id(i as u64)), order))
-                            }
-                            Err(err) => {
-                                tracing::warn!(order_uid = %order.uid, ?err, "failed to solve order");
-                                None
-                            }
-                        }
+                        Some((solved.solution.with_id(solution::Id(i as u64)), order))
                     }
-                }),
-        )
+                    Err(err) => {
+                        tracing::warn!(order_uid = %order.uid, ?err, "failed to solve order");
+                        None
+                    }
+                }
+            }
+        }))
         .buffer_unordered(MAX_CONCURRENT_ORDERS);
 
         while let Some(result) = stream.next().await {
@@ -497,20 +496,28 @@ impl Inner {
     /// Returns `None` if the order is supported, or a static reason string if
     /// it should be rejected.
     fn rejection_reason(&self, order: &Order) -> Option<&'static str> {
-        // Strict both-sides allowlist: reject if either token is absent.
-        // Independent of and stricter than the either-side filters below;
-        // use this when you want to confine the solver to a fixed universe
-        // of tokens.
-        if let Some(ref allowlist) = self.token_allowlist
-            && (!allowlist.contains(&order.sell.token.0)
-                || !allowlist.contains(&order.buy.token.0))
-        {
-            return Some("token_not_allowlisted");
+        // Strict both-sides allowlist: reject if either token is outside the
+        // configured universe. LP tokens are part of that universe even when
+        // they are only listed in `lp-tokens`, so sidechain configs don't need
+        // to duplicate every LP address in both lists.
+        if let Some(ref allowlist) = self.token_allowlist {
+            let token_allowed = |token| {
+                allowlist.contains(&token)
+                    || self
+                        .lp_tokens
+                        .as_ref()
+                        .is_some_and(|lp_tokens| lp_tokens.contains(&token))
+            };
+            if !token_allowed(order.sell.token.0) || !token_allowed(order.buy.token.0) {
+                return Some("token_not_allowlisted");
+            }
         }
 
         match order.side {
             order::Side::Sell => {
-                if let Some(ref lp_tokens) = self.lp_tokens {
+                if let Some(ref lp_tokens) = self.lp_tokens
+                    && self.token_allowlist.is_none()
+                {
                     let sell_is_lp = lp_tokens.contains(&order.sell.token.0);
                     let buy_is_lp = lp_tokens.contains(&order.buy.token.0);
                     if !sell_is_lp && !buy_is_lp {
@@ -527,7 +534,9 @@ impl Inner {
                 None
             }
             order::Side::Buy => {
-                if let Some(ref lp_tokens) = self.lp_tokens {
+                if let Some(ref lp_tokens) = self.lp_tokens
+                    && self.token_allowlist.is_none()
+                {
                     let sell_is_lp = lp_tokens.contains(&order.sell.token.0);
                     let buy_is_lp = lp_tokens.contains(&order.buy.token.0);
                     if !sell_is_lp && !buy_is_lp {
@@ -544,6 +553,12 @@ impl Inner {
                 None
             }
         }
+    }
+
+    fn is_priority_order(&self, order: &Order) -> bool {
+        self.lp_tokens.as_ref().is_some_and(|lp_tokens| {
+            lp_tokens.contains(&order.sell.token.0) || lp_tokens.contains(&order.buy.token.0)
+        })
     }
 
     async fn solve_order(
@@ -741,10 +756,7 @@ impl Inner {
         })
     }
 
-    async fn solve_native_price_probe(
-        &self,
-        order: &Order,
-    ) -> Result<SolvedOrder, SolveError> {
+    async fn solve_native_price_probe(&self, order: &Order) -> Result<SolvedOrder, SolveError> {
         let route_start = std::time::Instant::now();
 
         let reverse_req = QuoteRequest {
@@ -756,23 +768,23 @@ impl Inner {
             min_out: None,
             gas_price_gwei: None,
         };
-        let reverse = tokio::time::timeout(ROUTE_REQUEST_TIMEOUT, self.provider.quote(&reverse_req))
-            .await
-            .map_err(|_| {
-                SolveError::Provider(route_provider::Error::Api(api::Error::Network(format!(
-                    "reverse route timed out after {}ms",
-                    ROUTE_REQUEST_TIMEOUT.as_millis()
-                ))))
-            })?
-            .map_err(SolveError::Provider)?;
+        let reverse =
+            tokio::time::timeout(ROUTE_REQUEST_TIMEOUT, self.provider.quote(&reverse_req))
+                .await
+                .map_err(|_| {
+                    SolveError::Provider(route_provider::Error::Api(api::Error::Network(format!(
+                        "reverse route timed out after {}ms",
+                        ROUTE_REQUEST_TIMEOUT.as_millis()
+                    ))))
+                })?
+                .map_err(SolveError::Provider)?;
 
         let reverse_output = reverse.expected_output;
         let padding_bps_attempts = [500u32, 1500u32];
         let mut forward = None;
 
         for (attempt, &padding_bps) in padding_bps_attempts.iter().enumerate() {
-            let estimated_sell = reverse_output
-                .saturating_mul(U256::from(10_000 + padding_bps))
+            let estimated_sell = reverse_output.saturating_mul(U256::from(10_000 + padding_bps))
                 / U256::from(10_000u32);
 
             let req = QuoteRequest {
@@ -894,8 +906,7 @@ impl Inner {
         };
         Some(tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let result =
-                tokio::time::timeout(LEGACY_TELEMETRY_TIMEOUT, tele.quote(&req)).await;
+            let result = tokio::time::timeout(LEGACY_TELEMETRY_TIMEOUT, tele.quote(&req)).await;
             let elapsed_ms = started.elapsed().as_millis() as u64;
             let (output, error) = match result {
                 Ok(Ok(q)) => (Some(q.expected_output), None),
@@ -1098,7 +1109,10 @@ mod tests {
 
         let sent = handle.await.unwrap();
         // Task should have stopped early because receiver was dropped
-        assert!(sent < 100, "task should stop when receiver is dropped, sent {sent}");
+        assert!(
+            sent < 100,
+            "task should stop when receiver is dropped, sent {sent}"
+        );
     }
 
     const WETH_MAINNET: eth::Address =
@@ -1168,9 +1182,7 @@ mod tests {
     fn test_chain_config() -> ChainConfig {
         ChainConfig {
             chain_id: 1,
-            router_address: alloy::primitives::address!(
-                "45312ea0eFf7E09C83CBE249fa1d7598c4C8cd4e"
-            ),
+            router_address: alloy::primitives::address!("45312ea0eFf7E09C83CBE249fa1d7598c4C8cd4e"),
             wrapped_native_token: WETH_MAINNET,
             price_api_chain: CurvePriceApiChain::Ethereum,
             settlement_contract: alloy::primitives::address!(
@@ -1214,9 +1226,7 @@ mod tests {
     fn chain_config_validates_arbitrum() {
         ChainConfig {
             chain_id: 42161,
-            router_address: alloy::primitives::address!(
-                "2191718CD32d02B8E60BAdFFeA33E4B5DD9A0A0D"
-            ),
+            router_address: alloy::primitives::address!("2191718CD32d02B8E60BAdFFeA33E4B5DD9A0A0D"),
             wrapped_native_token: alloy::primitives::address!(
                 "82aF49447D8a07e3bd95BD0d56f35241523fBab1"
             ),
@@ -1233,9 +1243,7 @@ mod tests {
     fn chain_config_validates_gnosis() {
         ChainConfig {
             chain_id: 100,
-            router_address: alloy::primitives::address!(
-                "0DCDED3545D565bA3B19E683431381007245d983"
-            ),
+            router_address: alloy::primitives::address!("0DCDED3545D565bA3B19E683431381007245d983"),
             wrapped_native_token: WXDAI_GNOSIS,
             price_api_chain: CurvePriceApiChain::Xdai,
             settlement_contract: alloy::primitives::address!(
@@ -1281,7 +1289,8 @@ mod tests {
             settlement_contract: eth::Address::repeat_byte(0xbb),
             ..test_chain_config()
         };
-        fork.validated().expect("fork-style override should validate");
+        fork.validated()
+            .expect("fork-style override should validate");
     }
 
     #[test]
@@ -1413,36 +1422,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn token_allowlist_combines_with_lp_tokens_filter() {
-        // With both filters set, both must pass. `lp-tokens` requires one
-        // side to be an LP; `token_allowlist` requires both sides to be in
-        // the list. An order passing only the LP filter still gets rejected
-        // if its other side isn't allowlisted.
+    async fn token_allowlist_combines_with_lp_tokens_as_priority() {
+        // With a broad allowlist present, lp-tokens no longer rejects non-LP
+        // pairs. It extends the safety universe and marks LP-involved orders
+        // as higher priority.
         let lp = eth::Address::repeat_byte(0x01);
         let allowlisted = eth::Address::repeat_byte(0x02);
         let elsewhere = eth::Address::repeat_byte(0x03);
+        let a2 = eth::Address::repeat_byte(0x04);
 
         let mut inner = test_inner(100, 50);
         inner.lp_tokens = Some([lp].into_iter().collect());
-        inner.token_allowlist = Some([lp, allowlisted].into_iter().collect());
+        inner.token_allowlist = Some([allowlisted, a2].into_iter().collect());
 
-        // LP on sell, allowlisted on buy -> passes both.
         assert_eq!(inner.rejection_reason(&sell_order(lp, allowlisted)), None);
+        assert!(inner.is_priority_order(&sell_order(lp, allowlisted)));
 
-        // LP on sell, non-allowlisted on buy -> fails allowlist.
         assert_eq!(
             inner.rejection_reason(&sell_order(lp, elsewhere)),
             Some("token_not_allowlisted")
         );
 
-        // Allowlisted but not LP on both sides -> fails lp_tokens.
-        // Allowlist check runs first, so the allowlist must pass for the
-        // lp-tokens reason to surface. Use two allowlisted tokens neither
-        // of which is an LP:
-        let a2 = eth::Address::repeat_byte(0x04);
-        inner.token_allowlist = Some([lp, allowlisted, a2].into_iter().collect());
+        assert_eq!(inner.rejection_reason(&sell_order(allowlisted, a2)), None);
+        assert!(!inner.is_priority_order(&sell_order(allowlisted, a2)));
+    }
+
+    #[tokio::test]
+    async fn lp_tokens_without_token_allowlist_remains_hard_filter() {
+        let lp = eth::Address::repeat_byte(0x01);
+        let a = eth::Address::repeat_byte(0x02);
+        let b = eth::Address::repeat_byte(0x03);
+
+        let mut inner = test_inner(100, 50);
+        inner.lp_tokens = Some([lp].into_iter().collect());
+
+        assert_eq!(inner.rejection_reason(&sell_order(lp, a)), None);
         assert_eq!(
-            inner.rejection_reason(&sell_order(allowlisted, a2)),
+            inner.rejection_reason(&sell_order(a, b)),
             Some("no_lp_token_match")
         );
     }

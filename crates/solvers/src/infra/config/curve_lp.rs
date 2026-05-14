@@ -174,8 +174,8 @@ mod tests {
     /// needing a filesystem or env setup.
     fn parse_and_validate(raw_toml: &str) -> Result<ChainConfig, String> {
         let substituted = raw_toml.replace("${NODE_URL}", "https://dummy.invalid/");
-        let parsed: Config = toml::de::from_str(&substituted)
-            .map_err(|e| format!("parse error: {e:#?}"))?;
+        let parsed: Config =
+            toml::de::from_str(&substituted).map_err(|e| format!("parse error: {e:#?}"))?;
         ChainConfig {
             chain_id: parsed.chain_id,
             router_address: parsed.router_address,
@@ -238,15 +238,13 @@ mod tests {
     #[test]
     fn arbitrum_staging_deploy_config_is_valid() {
         let raw = include_str!("../../../../../deploy/curve-lp/curve-lp.arbitrum-staging.toml");
-        parse_and_validate(raw)
-            .expect("arbitrum staging deploy config should parse and validate");
+        parse_and_validate(raw).expect("arbitrum staging deploy config should parse and validate");
     }
 
     #[test]
     fn gnosis_staging_deploy_config_is_valid() {
         let raw = include_str!("../../../../../deploy/curve-lp/curve-lp.gnosis-staging.toml");
-        parse_and_validate(raw)
-            .expect("gnosis staging deploy config should parse and validate");
+        parse_and_validate(raw).expect("gnosis staging deploy config should parse and validate");
     }
 
     /// A minimal TOML document with just the required fields, plus whatever

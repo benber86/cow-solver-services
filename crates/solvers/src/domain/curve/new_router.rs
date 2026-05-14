@@ -59,12 +59,9 @@ impl NewRouterClient {
             return Err(Error::CalldataUnavailable(err));
         }
 
-        let returned_router: eth::Address = body
-            .router_address
-            .parse()
-            .map_err(|_| Error::CalldataUnavailable(format!(
-                "invalid router_address: {}", body.router_address
-            )))?;
+        let returned_router: eth::Address = body.router_address.parse().map_err(|_| {
+            Error::CalldataUnavailable(format!("invalid router_address: {}", body.router_address))
+        })?;
         if returned_router != expected_router {
             return Err(Error::RouterAddressMismatch {
                 expected: expected_router,
@@ -72,12 +69,9 @@ impl NewRouterClient {
             });
         }
 
-        let final_token: eth::Address = body
-            .final_token
-            .parse()
-            .map_err(|_| Error::CalldataUnavailable(format!(
-                "invalid final_token: {}", body.final_token
-            )))?;
+        let final_token: eth::Address = body.final_token.parse().map_err(|_| {
+            Error::CalldataUnavailable(format!("invalid final_token: {}", body.final_token))
+        })?;
         if final_token != req.buy_token {
             return Err(Error::FinalTokenMismatch {
                 expected: req.buy_token,
@@ -85,23 +79,19 @@ impl NewRouterClient {
             });
         }
 
-        let expected_output: eth::U256 = body
-            .expected_out
-            .parse()
-            .map_err(|_| Error::CalldataUnavailable(format!(
-                "invalid expected_out: {}", body.expected_out
-            )))?;
+        let expected_output: eth::U256 = body.expected_out.parse().map_err(|_| {
+            Error::CalldataUnavailable(format!("invalid expected_out: {}", body.expected_out))
+        })?;
 
         let calldata = if req.is_quote {
             Vec::new()
         } else {
-            let hex = body
-                .calldata
-                .ok_or_else(|| Error::CalldataUnavailable("missing calldata on real solve".into()))?;
+            let hex = body.calldata.ok_or_else(|| {
+                Error::CalldataUnavailable("missing calldata on real solve".into())
+            })?;
             let stripped = hex.strip_prefix("0x").unwrap_or(&hex);
-            alloy::hex::decode(stripped).map_err(|e| {
-                Error::CalldataUnavailable(format!("invalid hex calldata: {e}"))
-            })?
+            alloy::hex::decode(stripped)
+                .map_err(|e| Error::CalldataUnavailable(format!("invalid hex calldata: {e}")))?
         };
 
         // The calldata-encoded floor:
@@ -131,15 +121,14 @@ impl NewRouterClient {
             .map_err(|e| Error::CalldataUnavailable(format!("network: {e}")))?;
 
         let status = resp.status();
-        let raw = resp.bytes().await.map_err(|e| {
-            Error::CalldataUnavailable(format!("read body: {e}"))
-        })?;
+        let raw = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::CalldataUnavailable(format!("read body: {e}")))?;
 
         if !status.is_success() {
             let txt = String::from_utf8_lossy(&raw).to_string();
-            return Err(Error::CalldataUnavailable(format!(
-                "HTTP {status}: {txt}"
-            )));
+            return Err(Error::CalldataUnavailable(format!("HTTP {status}: {txt}")));
         }
 
         let parsed: ResponseBody = serde_json::from_slice(&raw).map_err(|e| {
@@ -362,8 +351,8 @@ mod tests {
         let req = dummy_req(true);
         let mut body = ok_body();
         body.calldata = None;
-        let q = NewRouterClient::parse_response(body, &req, Address::repeat_byte(0xCA))
-            .expect("ok");
+        let q =
+            NewRouterClient::parse_response(body, &req, Address::repeat_byte(0xCA)).expect("ok");
         assert!(q.calldata.is_empty());
         assert_eq!(q.expected_output, eth::U256::from(1_000_000u64));
     }

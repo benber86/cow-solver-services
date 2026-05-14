@@ -146,9 +146,7 @@ impl RouteProvider for LegacyProvider {
             if dev > self.max_quote_deviation_bps {
                 return Err(Error::Api(api::Error::InvalidRoute(format!(
                     "API/on-chain quote deviation {dev}bps exceeds max {}bps (api={}, chain={})",
-                    self.max_quote_deviation_bps,
-                    route.expected_output,
-                    onchain,
+                    self.max_quote_deviation_bps, route.expected_output, onchain,
                 ))));
             }
             onchain
