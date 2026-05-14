@@ -165,6 +165,14 @@ LP-involved orders are attempted first, then non-LP allowlisted pairs consume
 whatever deadline remains. Leaving all three omitted attempts every order and
 can cause deadline timeouts.
 
+Sidechain general-order caps keep broad routing opportunistic instead of
+letting common pairs consume the whole auction:
+- `max-general-orders-per-auction = 48`
+- `max-general-orders-per-pair = 3`
+
+These caps apply only to non-LP orders. LP-priority orders are always attempted
+first and are not capped by these settings.
+
 ### Secrets
 
 All secrets live in `deploy/curve-lp/.env` on the VPS. Not a secrets manager,

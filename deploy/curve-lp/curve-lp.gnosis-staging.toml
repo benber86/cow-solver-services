@@ -87,6 +87,8 @@ token-allowlist = [
 # Safety settings
 slippage-bps = 100              # 1% slippage buffer
 max-quote-deviation-bps = 300   # 3% max deviation between API and on-chain quote
+max-general-orders-per-auction = 48
+max-general-orders-per-pair = 3
 
 # CoW Protocol Staging / Shadow settlement contract (same on all chains)
 settlement-contract = "0xf553d092b50bdcbdded1a99af2ca29fbe5e2cb13"
