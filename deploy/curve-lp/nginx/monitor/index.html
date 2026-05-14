@@ -150,7 +150,7 @@
 /*
  * curve-lp monitor UI
  *
- * Model: chain × env matrix. Chain = mainnet | arbitrum | gnosis.
+ * Model: chain × env matrix. Chain = mainnet | arbitrum-one | xdai.
  * Env   = prod | staging. Every combination has a backend container and
  * a public route today. If we ever add more chains or envs, update CHAINS
  * and the path helper below.
@@ -166,10 +166,12 @@
  * that's entirely inside the container, not in the request). A schema
  * change from CoW will break them visibly; update the blobs by hand.
  */
-const CHAINS = ["mainnet", "arbitrum", "gnosis"];
+// Keys match CoW's network slugs verbatim — they're path segments in the
+// upstream URL. UI labels are decoupled via CHAIN_LABEL below.
+const CHAINS = ["mainnet", "arbitrum-one", "xdai"];
 const ENVS = ["prod", "staging"];
 
-const CHAIN_LABEL = { mainnet: "Ethereum", arbitrum: "Arbitrum", gnosis: "Gnosis" };
+const CHAIN_LABEL = { mainnet: "Ethereum", "arbitrum-one": "Arbitrum", xdai: "Gnosis" };
 const ENV_LABEL   = { prod: "prod", staging: "staging" };
 
 function pathFor(chain, env) {
@@ -214,7 +216,7 @@ const PRESETS = {
   mainnet: [
     { label: "(no presets — CoW-registered; edit test_quote.json and curl)", payload: null },
   ],
-  arbitrum: [
+  "arbitrum-one": [
     {
       label: "1e18 2CRV → USDC (allowed)",
       payload: basePayload(
@@ -234,7 +236,7 @@ const PRESETS = {
         "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", 6, "USDC"),
     },
   ],
-  gnosis: [
+  xdai: [
     {
       label: "1e18 x3CRV → WXDAI (allowed)",
       payload: basePayload(
@@ -257,7 +259,7 @@ const PRESETS = {
 };
 
 /* ---- state ---- */
-let currentChain = "arbitrum";
+let currentChain = "arbitrum-one";
 let currentEnv   = "prod";
 let healthTimer  = null;
 

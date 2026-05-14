@@ -21,10 +21,10 @@ container points at.
 |---------------------|----------|---------------|------------------------------------------------------|----------------|
 | `solver`            | Ethereum | prod `0x9008…`  | `/prod/mainnet/`                                     | **Yes**        |
 | `solver-staging`    | Ethereum | shadow `0xf553…`| `/staging/mainnet/`, `/shadow/mainnet/`              | Yes            |
-| `arbitrum`          | Arbitrum | prod `0x9008…`  | `/prod/arbitrum/`                                    | Yes            |
-| `arbitrum-staging`  | Arbitrum | shadow `0xf553…`| `/staging/arbitrum/`, `/shadow/arbitrum/`            | Yes            |
-| `gnosis`            | Gnosis   | prod `0x9008…`  | `/prod/gnosis/`                                      | Yes            |
-| `gnosis-staging`    | Gnosis   | shadow `0xf553…`| `/staging/gnosis/`, `/shadow/gnosis/`                | Yes            |
+| `arbitrum`          | Arbitrum | prod `0x9008…`  | `/prod/arbitrum-one/`                                | Yes            |
+| `arbitrum-staging`  | Arbitrum | shadow `0xf553…`| `/staging/arbitrum-one/`, `/shadow/arbitrum-one/`    | Yes            |
+| `gnosis`            | Gnosis   | prod `0x9008…`  | `/prod/xdai/`                                        | Yes            |
+| `gnosis-staging`    | Gnosis   | shadow `0xf553…`| `/staging/xdai/`, `/shadow/xdai/`                    | Yes            |
 | `nginx`             | —        | —             | —                                                    | —              |
 | `certbot`           | —        | —             | —                                                    | —              |
 
@@ -323,10 +323,10 @@ Confirm CoW has the right URL(s) registered for the chain/env pair in question.
 Typical examples:
 - `https://$DOMAIN/prod/mainnet/`
 - `https://$DOMAIN/staging/mainnet/`
-- `https://$DOMAIN/prod/arbitrum/`
-- `https://$DOMAIN/staging/arbitrum/`
-- `https://$DOMAIN/prod/gnosis/`
-- `https://$DOMAIN/staging/gnosis/`
+- `https://$DOMAIN/prod/arbitrum-one/`
+- `https://$DOMAIN/staging/arbitrum-one/`
+- `https://$DOMAIN/prod/xdai/`
+- `https://$DOMAIN/staging/xdai/`
 
 ### Swap / memory pressure on a t3.medium
 Three parallel Rust rebuilds can OOM on 4 GB. Up the swap file or deploy

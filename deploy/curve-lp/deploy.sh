@@ -372,9 +372,9 @@ extract_token_allowlist() {
 }
 
 # emit_monitor_json <chain> <env> <source-toml> <output-json>
-# `chain` is mainnet|arbitrum|gnosis, `env` is prod|staging. Both are
-# emitted into the JSON so the UI can render the chain × env matrix
-# without having to infer either from the filename.
+# `chain` matches CoW's network slug (mainnet|arbitrum-one|xdai), `env` is
+# prod|staging. Both are emitted into the JSON so the UI can render the
+# chain × env matrix without having to infer either from the filename.
 emit_monitor_json() {
     local chain="$1"
     local env="$2"
@@ -444,13 +444,13 @@ if [ "$MONITOR_JSON_REFRESH" = "1" ]; then
     # being rebuilt right now.
     REFRESHED=()
     if [ ${#INGRESS_SERVICES[@]} -gt 0 ]; then
-        emit_monitor_json mainnet  prod    curve-lp.prod.toml             ./processed/monitor/mainnet-prod.json
-        emit_monitor_json mainnet  staging curve-lp.staging.toml          ./processed/monitor/mainnet-staging.json
-        emit_monitor_json arbitrum prod    curve-lp.arbitrum.toml         ./processed/monitor/arbitrum-prod.json
-        emit_monitor_json arbitrum staging curve-lp.arbitrum-staging.toml ./processed/monitor/arbitrum-staging.json
-        emit_monitor_json gnosis   prod    curve-lp.gnosis.toml           ./processed/monitor/gnosis-prod.json
-        emit_monitor_json gnosis   staging curve-lp.gnosis-staging.toml   ./processed/monitor/gnosis-staging.json
-        REFRESHED=(mainnet-prod mainnet-staging arbitrum-prod arbitrum-staging gnosis-prod gnosis-staging)
+        emit_monitor_json mainnet      prod    curve-lp.prod.toml             ./processed/monitor/mainnet-prod.json
+        emit_monitor_json mainnet      staging curve-lp.staging.toml          ./processed/monitor/mainnet-staging.json
+        emit_monitor_json arbitrum-one prod    curve-lp.arbitrum.toml         ./processed/monitor/arbitrum-one-prod.json
+        emit_monitor_json arbitrum-one staging curve-lp.arbitrum-staging.toml ./processed/monitor/arbitrum-one-staging.json
+        emit_monitor_json xdai         prod    curve-lp.gnosis.toml           ./processed/monitor/xdai-prod.json
+        emit_monitor_json xdai         staging curve-lp.gnosis-staging.toml   ./processed/monitor/xdai-staging.json
+        REFRESHED=(mainnet-prod mainnet-staging arbitrum-one-prod arbitrum-one-staging xdai-prod xdai-staging)
     else
         if [ "$REBUILD_PROD" = "1" ]; then
             emit_monitor_json mainnet prod curve-lp.prod.toml ./processed/monitor/mainnet-prod.json
@@ -461,20 +461,20 @@ if [ "$MONITOR_JSON_REFRESH" = "1" ]; then
             REFRESHED+=(mainnet-staging)
         fi
         if [ "$REBUILD_ARBITRUM" = "1" ]; then
-            emit_monitor_json arbitrum prod curve-lp.arbitrum.toml ./processed/monitor/arbitrum-prod.json
-            REFRESHED+=(arbitrum-prod)
+            emit_monitor_json arbitrum-one prod curve-lp.arbitrum.toml ./processed/monitor/arbitrum-one-prod.json
+            REFRESHED+=(arbitrum-one-prod)
         fi
         if [ "$REBUILD_ARBITRUM_STAGING" = "1" ]; then
-            emit_monitor_json arbitrum staging curve-lp.arbitrum-staging.toml ./processed/monitor/arbitrum-staging.json
-            REFRESHED+=(arbitrum-staging)
+            emit_monitor_json arbitrum-one staging curve-lp.arbitrum-staging.toml ./processed/monitor/arbitrum-one-staging.json
+            REFRESHED+=(arbitrum-one-staging)
         fi
         if [ "$REBUILD_GNOSIS" = "1" ]; then
-            emit_monitor_json gnosis prod curve-lp.gnosis.toml ./processed/monitor/gnosis-prod.json
-            REFRESHED+=(gnosis-prod)
+            emit_monitor_json xdai prod curve-lp.gnosis.toml ./processed/monitor/xdai-prod.json
+            REFRESHED+=(xdai-prod)
         fi
         if [ "$REBUILD_GNOSIS_STAGING" = "1" ]; then
-            emit_monitor_json gnosis staging curve-lp.gnosis-staging.toml ./processed/monitor/gnosis-staging.json
-            REFRESHED+=(gnosis-staging)
+            emit_monitor_json xdai staging curve-lp.gnosis-staging.toml ./processed/monitor/xdai-staging.json
+            REFRESHED+=(xdai-staging)
         fi
     fi
 
@@ -534,10 +534,10 @@ if [ ${#INGRESS_SERVICES[@]} -gt 0 ] && [ -n "${DOMAIN:-}" ]; then
         echo "  curl https://$DOMAIN/prod/mainnet/healthz"
     fi
     if [ "$REBUILD_ARBITRUM" = "1" ] || [ "$INGRESS_ONLY" = "1" ]; then
-        echo "  curl https://$DOMAIN/prod/arbitrum/healthz"
+        echo "  curl https://$DOMAIN/prod/arbitrum-one/healthz"
     fi
     if [ "$REBUILD_GNOSIS" = "1" ] || [ "$INGRESS_ONLY" = "1" ]; then
-        echo "  curl https://$DOMAIN/prod/gnosis/healthz"
+        echo "  curl https://$DOMAIN/prod/xdai/healthz"
     fi
     echo "  curl https://$DOMAIN/healthz   # back-compat: probes mainnet prod"
 fi
