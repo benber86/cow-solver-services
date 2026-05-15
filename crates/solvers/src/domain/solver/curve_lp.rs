@@ -182,6 +182,9 @@ pub struct Config {
     pub node_url: Url,
     /// Slippage buffer in basis points (e.g., 100 = 1%).
     pub slippage_bps: u32,
+    /// Competitive bid haircut in basis points. This controls the amount we
+    /// promise to CoW; `slippage_bps` still controls calldata revert safety.
+    pub bid_slippage_bps: u32,
     /// Maximum deviation between API quote and on-chain get_dy (basis points).
     pub max_quote_deviation_bps: u32,
     /// Gas offset for solution gas estimation.
@@ -208,6 +211,7 @@ struct Inner {
     legacy_telemetry: Option<Arc<LegacyProvider>>,
     price_client: price_api::Client,
     slippage_bps: u32,
+    bid_slippage_bps: u32,
     solution_gas_offset: eth::SignedGas,
     max_general_orders_per_auction: Option<usize>,
     max_general_orders_per_pair: Option<usize>,
@@ -289,6 +293,7 @@ impl Solver {
                 legacy_telemetry,
                 price_client,
                 slippage_bps: config.slippage_bps,
+                bid_slippage_bps: config.bid_slippage_bps,
                 solution_gas_offset: config.solution_gas_offset,
                 max_general_orders_per_auction: config.max_general_orders_per_auction,
                 max_general_orders_per_pair: config.max_general_orders_per_pair,
@@ -475,6 +480,8 @@ impl Inner {
                             side = ?order.side,
                             sell_amount = %order.sell.amount,
                             order_buy_min = %order.buy.amount,
+                            expected_output = %solved.expected_output,
+                            calldata_min_out = %solved.calldata_min_out,
                             solution_output = %solved.output_amount,
                             route_ms = solved.route_ms,
                             price_fetch_ms = solved.price_fetch_ms,
@@ -826,12 +833,21 @@ impl Inner {
             .ok_or(SolveError::FeeCalculation)?;
 
         // 8. Build the solution
-        // For sell orders: input is the full sell amount, output is slippage-adjusted.
+        // For sell orders: input is the full sell amount, output is the
+        // competitive bid. Calldata remains protected by quote.min_out.
         // For buy orders: output is the exact desired buy amount. Input must be
         // sell_amount minus fee, because into_solution() adds the surplus fee back
         // to the sell side (input + fee must not exceed order.sell.amount).
         let (input_amount, output_amount) = match order.side {
-            order::Side::Sell => (order.sell.amount, quote.min_out),
+            order::Side::Sell => (
+                order.sell.amount,
+                sell_order_bid_output(
+                    quote.expected_output,
+                    quote.min_out,
+                    order.buy.amount,
+                    self.bid_slippage_bps,
+                ),
+            ),
             order::Side::Buy => (
                 order
                     .sell
@@ -879,6 +895,8 @@ impl Inner {
 
         Ok(SolvedOrder {
             solution,
+            expected_output: quote.expected_output,
+            calldata_min_out: quote.min_out,
             output_amount,
             route_ms,
             price_fetch_ms,
@@ -1008,6 +1026,8 @@ impl Inner {
 
         Ok(SolvedOrder {
             solution,
+            expected_output: order.buy.amount,
+            calldata_min_out: U256::ZERO,
             output_amount: order.buy.amount,
             route_ms,
             price_fetch_ms: 0,
@@ -1063,6 +1083,8 @@ struct LegacyTelemetry {
 
 struct SolvedOrder {
     solution: Solution,
+    expected_output: eth::U256,
+    calldata_min_out: eth::U256,
     output_amount: eth::U256,
     route_ms: u64,
     price_fetch_ms: u64,
@@ -1105,6 +1127,17 @@ fn order_side_key(side: order::Side) -> u8 {
         order::Side::Buy => 0,
         order::Side::Sell => 1,
     }
+}
+
+fn sell_order_bid_output(
+    expected_output: eth::U256,
+    calldata_min_out: eth::U256,
+    order_floor: eth::U256,
+    bid_slippage_bps: u32,
+) -> eth::U256 {
+    QuoteRequest::min_out_with_slippage(expected_output, bid_slippage_bps)
+        .max(calldata_min_out)
+        .max(order_floor)
 }
 
 fn gas_price_to_gwei(gas_price: &auction::GasPrice) -> Option<f64> {
@@ -1365,6 +1398,7 @@ mod tests {
             legacy_telemetry: None,
             price_client: price_api::Client::new("http://localhost:1".parse().unwrap()),
             slippage_bps,
+            bid_slippage_bps: slippage_bps,
             solution_gas_offset: eth::SignedGas::default(),
             max_general_orders_per_auction: None,
             max_general_orders_per_pair: None,
@@ -1488,6 +1522,30 @@ mod tests {
         assert!(parse("arbitrum-one").is_err());
         assert!(parse("mainnet").is_err());
         assert!(parse("gnosis").is_err());
+    }
+
+    #[test]
+    fn sell_order_bid_output_uses_tighter_bid_floor_without_lowering_calldata_floor() {
+        let expected = U256::from(1_000_000u64);
+        let calldata_floor = U256::from(990_000u64);
+        let order_floor = U256::from(950_000u64);
+
+        assert_eq!(
+            sell_order_bid_output(expected, calldata_floor, order_floor, 20),
+            U256::from(998_000u64)
+        );
+    }
+
+    #[test]
+    fn sell_order_bid_output_never_goes_below_calldata_or_order_floor() {
+        let expected = U256::from(1_000_000u64);
+        let calldata_floor = U256::from(990_000u64);
+        let order_floor = U256::from(995_000u64);
+
+        assert_eq!(
+            sell_order_bid_output(expected, calldata_floor, order_floor, 200),
+            order_floor
+        );
     }
 
     // --- token_allowlist filter tests ---

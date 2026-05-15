@@ -73,6 +73,11 @@ struct Config {
     #[serde(default = "default_slippage_bps")]
     slippage_bps: u32,
 
+    /// Competitive bid haircut in basis points. Defaults to `slippage-bps`
+    /// when omitted so existing configs keep their previous behavior.
+    #[serde(default)]
+    bid_slippage_bps: Option<u32>,
+
     /// Maximum deviation between API quote and on-chain get_dy (basis points).
     #[serde(default = "default_max_quote_deviation_bps")]
     max_quote_deviation_bps: u32,
@@ -166,6 +171,7 @@ pub async fn load(path: &Path) -> curve_lp::Config {
         curve_price_api_url: config.curve_price_api_url,
         node_url: config.node_url,
         slippage_bps: config.slippage_bps,
+        bid_slippage_bps: config.bid_slippage_bps.unwrap_or(config.slippage_bps),
         max_quote_deviation_bps: config.max_quote_deviation_bps,
         solution_gas_offset: config.solution_gas_offset.into(),
         route_provider,
