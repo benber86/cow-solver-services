@@ -6,14 +6,15 @@
 # through CoW shadow competitions, not real settlement).
 #
 # SECRETS: This file contains NO secrets.
-# NODE_URL is injected via environment variable — same NODE_URL_GNOSIS as
-# the prod gnosis container; RPC quota is shared between the two.
+# NODE_URL and ROUTER_ADDRESS are injected by deploy.sh from
+# NODE_URL_GNOSIS and ROUTER_ADDRESS_GNOSIS in .env; RPC quota is shared
+# between prod and staging.
 #
 # Note: Gnosis native token is xDAI, wrapped native is WXDAI (not WETH).
 # CoW's native-price probe on Gnosis uses WXDAI as the reference token.
 
 chain-id = 100
-router-address = "0x0DCDED3545D565bA3B19E683431381007245d983"
+router-address = "${ROUTER_ADDRESS}"
 wrapped-native-token = "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"
 price-api-chain = "xdai"
 

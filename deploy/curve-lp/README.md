@@ -183,6 +183,8 @@ not committed. `.env.example` is the template. Required vars:
 | `NODE_URL`           | rebuilding `solver` or `solver-staging` |
 | `NODE_URL_ARBITRUM`  | rebuilding `arbitrum` or `arbitrum-staging` |
 | `NODE_URL_GNOSIS`    | rebuilding `gnosis` or `gnosis-staging` |
+| `ROUTER_ADDRESS_ARBITRUM` | rebuilding `arbitrum` / `arbitrum-staging`, or refreshing ingress monitor config |
+| `ROUTER_ADDRESS_GNOSIS` | rebuilding `gnosis` / `gnosis-staging`, or refreshing ingress monitor config |
 | `DOMAIN`             | ingress (nginx/certbot)                 |
 | `SSL_EMAIL`          | ingress                                 |
 | `TG_BOT_TOKEN`, `TG_CHAT_ID`, `TG_*_THREAD` | telegram monitor (optional) |

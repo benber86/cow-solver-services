@@ -201,16 +201,16 @@ REQUIRED_VARS=()
 if [ "$REBUILD_PROD" = "1" ] || [ "$REBUILD_STAGING" = "1" ]; then
     REQUIRED_VARS+=("NODE_URL")
 fi
-if [ "$REBUILD_ARBITRUM" = "1" ]; then
-    REQUIRED_VARS+=("NODE_URL_ARBITRUM")
+if [ "$REBUILD_ARBITRUM" = "1" ] || [ "$REBUILD_ARBITRUM_STAGING" = "1" ]; then
+    REQUIRED_VARS+=("NODE_URL_ARBITRUM" "ROUTER_ADDRESS_ARBITRUM")
 fi
-if [ "$REBUILD_GNOSIS" = "1" ]; then
-    REQUIRED_VARS+=("NODE_URL_GNOSIS")
+if [ "$REBUILD_GNOSIS" = "1" ] || [ "$REBUILD_GNOSIS_STAGING" = "1" ]; then
+    REQUIRED_VARS+=("NODE_URL_GNOSIS" "ROUTER_ADDRESS_GNOSIS")
 fi
 # Ingress needs DOMAIN and SSL_EMAIL; also needed for the DOMAIN placeholder
 # in nginx.template that certbot-init and nginx substitute at startup.
 if [ ${#INGRESS_SERVICES[@]} -gt 0 ]; then
-    REQUIRED_VARS+=("DOMAIN" "SSL_EMAIL")
+    REQUIRED_VARS+=("DOMAIN" "SSL_EMAIL" "ROUTER_ADDRESS_ARBITRUM" "ROUTER_ADDRESS_GNOSIS")
 fi
 
 MISSING_VARS=()
@@ -232,6 +232,13 @@ for url_var in NODE_URL NODE_URL_ARBITRUM NODE_URL_GNOSIS; do
     val="${!url_var:-}"
     if [ -n "$val" ] && [[ ! "$val" =~ ^https?:// ]]; then
         echo -e "${RED}ERROR: $url_var must be a valid HTTP(S) URL${NC}"
+        exit 1
+    fi
+done
+
+for address_var in ROUTER_ADDRESS_ARBITRUM ROUTER_ADDRESS_GNOSIS; do
+    if [ -n "${!address_var:-}" ] && ! [[ "${!address_var}" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
+        echo -e "${RED}ERROR: $address_var must be a 20-byte 0x-prefixed address${NC}" >&2
         exit 1
     fi
 done
@@ -272,19 +279,23 @@ if [ ${#SOLVER_SERVICES[@]} -gt 0 ]; then
             < curve-lp.staging.toml > ./processed/curve-lp-staging.toml
     fi
     if [ "$REBUILD_ARBITRUM" = "1" ]; then
-        NODE_URL="$NODE_URL_ARBITRUM" envsubst '${NODE_URL}' \
+        NODE_URL="$NODE_URL_ARBITRUM" ROUTER_ADDRESS="$ROUTER_ADDRESS_ARBITRUM" \
+            envsubst '${NODE_URL} ${ROUTER_ADDRESS}' \
             < curve-lp.arbitrum.toml > ./processed/curve-lp-arbitrum.toml
     fi
     if [ "$REBUILD_ARBITRUM_STAGING" = "1" ]; then
-        NODE_URL="$NODE_URL_ARBITRUM" envsubst '${NODE_URL}' \
+        NODE_URL="$NODE_URL_ARBITRUM" ROUTER_ADDRESS="$ROUTER_ADDRESS_ARBITRUM" \
+            envsubst '${NODE_URL} ${ROUTER_ADDRESS}' \
             < curve-lp.arbitrum-staging.toml > ./processed/curve-lp-arbitrum-staging.toml
     fi
     if [ "$REBUILD_GNOSIS" = "1" ]; then
-        NODE_URL="$NODE_URL_GNOSIS" envsubst '${NODE_URL}' \
+        NODE_URL="$NODE_URL_GNOSIS" ROUTER_ADDRESS="$ROUTER_ADDRESS_GNOSIS" \
+            envsubst '${NODE_URL} ${ROUTER_ADDRESS}' \
             < curve-lp.gnosis.toml > ./processed/curve-lp-gnosis.toml
     fi
     if [ "$REBUILD_GNOSIS_STAGING" = "1" ]; then
-        NODE_URL="$NODE_URL_GNOSIS" envsubst '${NODE_URL}' \
+        NODE_URL="$NODE_URL_GNOSIS" ROUTER_ADDRESS="$ROUTER_ADDRESS_GNOSIS" \
+            envsubst '${NODE_URL} ${ROUTER_ADDRESS}' \
             < curve-lp.gnosis-staging.toml > ./processed/curve-lp-gnosis-staging.toml
     fi
 
@@ -292,6 +303,10 @@ if [ ${#SOLVER_SERVICES[@]} -gt 0 ]; then
 
     if grep -l "YOUR_API_KEY" ./processed/*.toml 2>/dev/null; then
         echo -e "${RED}ERROR: Placeholder values found in processed config${NC}"
+        exit 1
+    fi
+    if grep -l '\${ROUTER_ADDRESS}' ./processed/*.toml 2>/dev/null; then
+        echo -e "${RED}ERROR: ROUTER_ADDRESS placeholder found in processed config${NC}"
         exit 1
     fi
     echo -e "${GREEN}✓ No placeholder values in configs${NC}"
@@ -387,6 +402,16 @@ emit_monitor_json() {
     local chain_id router wrapped settle slug allowlist_items
     chain_id="$(extract_scalar "$src" "chain-id")"
     router="$(extract_scalar "$src" "router-address")"
+    if [ "$router" = '"${ROUTER_ADDRESS}"' ]; then
+        case "$chain" in
+            arbitrum-one) router="\"$ROUTER_ADDRESS_ARBITRUM\"" ;;
+            xdai) router="\"$ROUTER_ADDRESS_GNOSIS\"" ;;
+            *)
+                echo -e "${RED}ERROR: router-address placeholder used for unsupported monitor chain '$chain'${NC}" >&2
+                exit 1
+                ;;
+        esac
+    fi
     wrapped="$(extract_scalar "$src" "wrapped-native-token")"
     settle="$(extract_scalar "$src" "settlement-contract")"
     slug="$(extract_scalar "$src" "price-api-chain")"

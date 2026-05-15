@@ -1,11 +1,11 @@
 # Curve LP Solver - Arbitrum One Production Configuration
 #
 # SECRETS: This file contains NO secrets.
-# NODE_URL is injected via environment variable (set by deploy.sh from
-# NODE_URL_ARBITRUM in .env).
+# NODE_URL and ROUTER_ADDRESS are injected by deploy.sh from
+# NODE_URL_ARBITRUM and ROUTER_ADDRESS_ARBITRUM in .env.
 
 chain-id = 42161
-router-address = "0x2191718CD32d02B8E60BAdFFeA33E4B5DD9A0A0D"
+router-address = "${ROUTER_ADDRESS}"
 wrapped-native-token = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
 price-api-chain = "arbitrum"
 

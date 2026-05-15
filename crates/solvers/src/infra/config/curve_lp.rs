@@ -178,12 +178,17 @@ pub async fn load(path: &Path) -> curve_lp::Config {
 mod tests {
     use super::*;
 
-    /// Parses a TOML string (substituting in a dummy value for any
-    /// `${NODE_URL}`) and runs it through the same validation pipeline as
+    /// Parses a TOML string (substituting in dummy values for deploy-time
+    /// placeholders) and runs it through the same validation pipeline as
     /// `load`. Catches shape / missing-field / validation errors without
     /// needing a filesystem or env setup.
     fn parse_and_validate(raw_toml: &str) -> Result<ChainConfig, String> {
-        let substituted = raw_toml.replace("${NODE_URL}", "https://dummy.invalid/");
+        let substituted = raw_toml
+            .replace("${NODE_URL}", "https://dummy.invalid/")
+            .replace(
+                "${ROUTER_ADDRESS}",
+                "0xa1c7a8360eb4049595a24d6919e74e105b409cb5",
+            );
         let parsed: Config =
             toml::de::from_str(&substituted).map_err(|e| format!("parse error: {e:#?}"))?;
         ChainConfig {
