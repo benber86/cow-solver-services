@@ -213,6 +213,13 @@ struct Inner {
     max_general_orders_per_pair: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct SelectedCounts {
+    total: usize,
+    priority: usize,
+    general: usize,
+}
+
 impl Solver {
     /// Creates a new Curve LP solver.
     pub async fn new(config: Config) -> Self {
@@ -311,6 +318,7 @@ impl Solver {
                 self.inner.rejection_reason(order).is_none() && self.inner.is_priority_order(order)
             })
             .count();
+        let selected_counts = self.inner.selected_counts(&auction.orders, &auction.tokens);
         let auction_id = auction.id;
         let is_quote = matches!(auction.id, auction::Id::Quote);
 
@@ -329,6 +337,9 @@ impl Solver {
             total_orders,
             supported_orders,
             priority_orders,
+            selected_orders = selected_counts.total,
+            selected_priority_orders = selected_counts.priority,
+            selected_general_orders = selected_counts.general,
             remaining_ms = remaining.as_millis(),
             "starting Curve LP solver"
         );
@@ -354,6 +365,9 @@ impl Solver {
                     total_orders,
                     supported_orders,
                     priority_orders,
+                    selected_orders = selected_counts.total,
+                    selected_priority_orders = selected_counts.priority,
+                    selected_general_orders = selected_counts.general,
                     remaining_ms = remaining.as_millis(),
                     "reached timeout while solving Curve LP orders"
                 );
@@ -374,6 +388,9 @@ impl Solver {
             total_orders,
             supported_orders,
             priority_orders,
+            selected_orders = selected_counts.total,
+            selected_priority_orders = selected_counts.priority,
+            selected_general_orders = selected_counts.general,
             num_solutions = solutions.len(),
             elapsed_ms = elapsed.as_millis() as u64,
             budget_ms = remaining.as_millis() as u64,
@@ -627,6 +644,53 @@ impl Inner {
 
         priority.extend(general);
         priority
+    }
+
+    fn selected_counts(&self, orders: &[Order], tokens: &Tokens) -> SelectedCounts {
+        let mut priority = 0usize;
+        let mut general = Vec::new();
+
+        for (i, order) in orders
+            .iter()
+            .enumerate()
+            .filter(|(_, order)| self.rejection_reason(order).is_none())
+        {
+            if self.is_priority_order(order) {
+                priority += 1;
+            } else {
+                general.push((i, order));
+            }
+        }
+
+        general.sort_by_key(|(i, order)| (std::cmp::Reverse(order_notional(order, tokens)), *i));
+
+        if let Some(per_pair) = self.max_general_orders_per_pair {
+            let mut counts = HashMap::<(eth::Address, eth::Address, u8), usize>::new();
+            general.retain(|(_, order)| {
+                let key = (
+                    order.sell.token.0,
+                    order.buy.token.0,
+                    order_side_key(order.side),
+                );
+                let count = counts.entry(key).or_default();
+                if *count >= per_pair {
+                    false
+                } else {
+                    *count += 1;
+                    true
+                }
+            });
+        }
+
+        if let Some(limit) = self.max_general_orders_per_auction {
+            general.truncate(limit);
+        }
+
+        SelectedCounts {
+            total: priority + general.len(),
+            priority,
+            general: general.len(),
+        }
     }
 
     async fn solve_order(

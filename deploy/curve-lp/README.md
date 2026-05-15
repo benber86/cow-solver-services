@@ -167,8 +167,8 @@ can cause deadline timeouts.
 
 Sidechain general-order caps keep broad routing opportunistic instead of
 letting common pairs consume the whole auction:
-- `max-general-orders-per-auction = 48`
-- `max-general-orders-per-pair = 3`
+- `max-general-orders-per-auction = 24` on Arbitrum, `48` on Gnosis
+- `max-general-orders-per-pair = 2` on Arbitrum, `3` on Gnosis
 
 These caps apply only to non-LP orders. LP-priority orders are always attempted
 first and are not capped by these settings.
