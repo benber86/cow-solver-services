@@ -4,7 +4,7 @@
 #
 # Usage:
 #   # Add TG_BOT_TOKEN, TG_CHAT_ID to .env first
-#   nohup ./tg-monitor.sh > tg-monitor.log 2>&1 &
+#   nohup ./tg-monitor.sh >/dev/null 2>&1 &
 
 set -euo pipefail
 

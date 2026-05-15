@@ -215,7 +215,7 @@ When in doubt, quote.
 `tg-monitor.sh` tails logs and posts to Telegram. Start it once:
 
 ```
-nohup ./tg-monitor.sh > tg-monitor.log 2>&1 &
+nohup ./tg-monitor.sh >/dev/null 2>&1 &
 ```
 
 What it reports (every 5 min tick):
