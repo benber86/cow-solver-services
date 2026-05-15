@@ -219,7 +219,6 @@ nohup ./tg-monitor.sh >/dev/null 2>&1 &
 ```
 
 What it reports (every 5 min tick):
-- Nginx 4xx/5xx over the last 5 min.
 - Solver-candidate trade notifications (per-order, with CoW explorer link).
 - Hourly summary across all solver containers: auctions, quotes, orders processed, solution candidates, errors.
 - Idle heartbeat every 30 min if no activity.
