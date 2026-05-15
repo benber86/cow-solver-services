@@ -51,7 +51,11 @@ hourly_errors=0
 send_tg() {
     local thread_id="$1"
     local text="$2"
-    local args=(-d chat_id="$TG_CHAT_ID" -d text="$text" -d parse_mode="Markdown")
+    local parse_mode="${3:-Markdown}"
+    local args=(-d chat_id="$TG_CHAT_ID" -d text="$text")
+    if [ -n "$parse_mode" ]; then
+        args+=(-d parse_mode="$parse_mode")
+    fi
     if [ -n "$thread_id" ]; then
         args+=(-d message_thread_id="$thread_id")
     fi
@@ -176,9 +180,9 @@ ${top_errors}
         sell_short="${sell_tok:0:6}...${sell_tok: -4}"
         buy_short="${buy_tok:0:6}...${buy_tok: -4}"
 
-        msg="🔧 *Solution Candidate*
+        msg="Solution Candidate
 Chain: ${chain} | Env: ${env_name}
-\`${sell_short}\` → \`${buy_short}\`
+${sell_short} -> ${buy_short}
 Side: ${side} | Sell: ${sell_amt} | Output: ${buy_amt}"
         if [ -n "$quality" ]; then
             msg+="
@@ -192,8 +196,8 @@ Legacy ref: ${legacy_out}"
             fi
         fi
         msg+="
-[Order](https://explorer.cow.fi/orders/${uid})"
-        send_tg "$thread_id" "$msg"
+Order: https://explorer.cow.fi/orders/${uid}"
+        send_tg "$thread_id" "$msg" ""
     done < <(echo "$logs" | grep '"solved order"' | grep '"is_quote":false' || true)
 
     # Accumulate hourly stats
