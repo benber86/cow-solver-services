@@ -472,6 +472,12 @@ impl Inner {
                             .as_ref()
                             .and_then(|l| l.output)
                             .and_then(|v| legacy_delta_bps(solved.output_amount, v));
+                        let bid_haircut_bps = match order.side {
+                            order::Side::Sell => {
+                                output_haircut_bps(solved.expected_output, solved.output_amount)
+                            }
+                            order::Side::Buy => None,
+                        };
                         let quality_slug = solved.quote_quality.map(|q| q.as_slug());
                         tracing::info!(
                             order_uid = %order.uid,
@@ -482,7 +488,9 @@ impl Inner {
                             order_buy_min = %order.buy.amount,
                             expected_output = %solved.expected_output,
                             calldata_min_out = %solved.calldata_min_out,
+                            solution_input = %solved.input_amount,
                             solution_output = %solved.output_amount,
+                            bid_haircut_bps,
                             route_ms = solved.route_ms,
                             price_fetch_ms = solved.price_fetch_ms,
                             is_quote,
@@ -897,6 +905,7 @@ impl Inner {
             solution,
             expected_output: quote.expected_output,
             calldata_min_out: quote.min_out,
+            input_amount,
             output_amount,
             route_ms,
             price_fetch_ms,
@@ -1028,6 +1037,7 @@ impl Inner {
             solution,
             expected_output: order.buy.amount,
             calldata_min_out: U256::ZERO,
+            input_amount: estimated_sell,
             output_amount: order.buy.amount,
             route_ms,
             price_fetch_ms: 0,
@@ -1085,6 +1095,7 @@ struct SolvedOrder {
     solution: Solution,
     expected_output: eth::U256,
     calldata_min_out: eth::U256,
+    input_amount: eth::U256,
     output_amount: eth::U256,
     route_ms: u64,
     price_fetch_ms: u64,
@@ -1105,6 +1116,23 @@ fn legacy_delta_bps(new_router: eth::U256, legacy: eth::U256) -> Option<i32> {
         (legacy - new_router, -1i32)
     };
     let bps_u256 = diff.saturating_mul(U256::from(10_000u32)) / legacy;
+    let bps_i32: i32 = bps_u256.try_into().ok()?;
+    Some(sign * bps_i32)
+}
+
+/// Basis-point haircut between the provider's expected output and the amount
+/// promised to CoW. Negative means the promised output exceeds expected output
+/// because the order floor or calldata floor dominated.
+fn output_haircut_bps(expected: eth::U256, output: eth::U256) -> Option<i32> {
+    if expected.is_zero() || output.is_zero() {
+        return None;
+    }
+    let (diff, sign) = if expected >= output {
+        (expected - output, 1i32)
+    } else {
+        (output - expected, -1i32)
+    };
+    let bps_u256 = diff.saturating_mul(U256::from(10_000u32)) / expected;
     let bps_i32: i32 = bps_u256.try_into().ok()?;
     Some(sign * bps_i32)
 }
@@ -1202,6 +1230,20 @@ mod tests {
     fn legacy_delta_bps_returns_none_on_zero_either_side() {
         assert!(legacy_delta_bps(U256::ZERO, U256::from(1u64)).is_none());
         assert!(legacy_delta_bps(U256::from(1u64), U256::ZERO).is_none());
+    }
+
+    #[test]
+    fn output_haircut_bps_positive_when_bid_below_expected() {
+        let expected = U256::from(1_000_000u64);
+        let output = U256::from(999_500u64);
+        assert_eq!(output_haircut_bps(expected, output), Some(5));
+    }
+
+    #[test]
+    fn output_haircut_bps_negative_when_floor_dominates() {
+        let expected = U256::from(1_000_000u64);
+        let output = U256::from(1_001_000u64);
+        assert_eq!(output_haircut_bps(expected, output), Some(-10));
     }
 
     #[tokio::test]

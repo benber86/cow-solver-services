@@ -98,6 +98,85 @@ normalize_service_name() {
     echo "$name"
 }
 
+token_meta() {
+    local chain="$1"
+    local token="${2,,}"
+
+    case "${chain}:${token}" in
+        arbitrum:0xaf88d065e77c8cc2239327c5edb3a432268e5831) echo "USDC|6" ;;
+        arbitrum:0xff970a61a04b1ca14834a43f5de4533ebddb5cc8) echo "USDC.e|6" ;;
+        arbitrum:0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9) echo "USDT|6" ;;
+        arbitrum:0x2f2a2543b76a4166549f7aab2e75bef0aefc5b0f) echo "WBTC|8" ;;
+        arbitrum:0x82af49447d8a07e3bd95bd0d56f35241523fbab1) echo "WETH|18" ;;
+        arbitrum:0x912ce59144191c1204e64559fe8253a0e49e6548) echo "ARB|18" ;;
+        arbitrum:0x11cdb42b0eb46d95f990bedd4695a6e3fa034978) echo "CRV|18" ;;
+        arbitrum:0x498bf2b1e120fed3ad3d42ea2165e9b73f99c1e5) echo "crvUSD|18" ;;
+        gnosis:0xddafbb505ad214d7b80b1f830fccc89b60fb7a83) echo "USDC|6" ;;
+        gnosis:0x4ecaba5870353805a9f068101a40e0f32ed605c6) echo "USDT|6" ;;
+        gnosis:0x6a023ccd1ff6f2045c3309768ead9e68f978f6e1) echo "WETH|18" ;;
+        gnosis:0x9c58bacc331c9aa871afd802db6379a98e80cedb) echo "GNO|18" ;;
+        gnosis:0x44fa8e6f47987339850636f88629646662444217) echo "WXDAI|18" ;;
+        gnosis:0xcb444e90d8198415266c6a2724b7900fb12fc56e) echo "EURe|18" ;;
+        gnosis:0x83f20f44975d03b1b09e64809b757c47f942beea) echo "sDAI|18" ;;
+        gnosis:0x2a22f9c3b484c3629090feed35f17ff8f88f76f0) echo "USDC.e|6" ;;
+        mainnet:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48) echo "USDC|6" ;;
+        mainnet:0xdac17f958d2ee523a2206206994597c13d831ec7) echo "USDT|6" ;;
+        mainnet:0x6b175474e89094c44da98b954eedeac495271d0f) echo "DAI|18" ;;
+        mainnet:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2) echo "WETH|18" ;;
+        mainnet:0xd533a949740bb3306d119cc777fa900ba034cd52) echo "CRV|18" ;;
+        *) echo "raw|18" ;;
+    esac
+}
+
+format_amount() {
+    local raw="$1"
+    local decimals="$2"
+
+    if [[ ! "$raw" =~ ^[0-9]+$ ]] || [[ ! "$decimals" =~ ^[0-9]+$ ]]; then
+        echo "$raw"
+        return
+    fi
+
+    awk -v raw="$raw" -v decimals="$decimals" '
+        BEGIN {
+            if (decimals == 0) {
+                print raw;
+                exit;
+            }
+            if (length(raw) <= decimals) {
+                int = "0";
+                frac = sprintf("%0*d", decimals, raw);
+            } else {
+                int = substr(raw, 1, length(raw) - decimals);
+                frac = substr(raw, length(raw) - decimals + 1);
+            }
+            sub(/0+$/, "", frac);
+            if (frac == "") {
+                print int;
+            } else {
+                print int "." frac;
+            }
+        }'
+}
+
+format_token_amount() {
+    local chain="$1"
+    local token="$2"
+    local raw="$3"
+    local meta symbol decimals normalized
+
+    meta="$(token_meta "$chain" "$token")"
+    symbol="${meta%%|*}"
+    decimals="${meta##*|}"
+    normalized="$(format_amount "$raw" "$decimals")"
+
+    if [ "$symbol" = "raw" ]; then
+        echo "${normalized} (raw ${raw}, assumed 18 decimals)"
+    else
+        echo "${normalized} ${symbol} (raw ${raw})"
+    fi
+}
+
 # Startup message
 send_tg "$TG_STATS_THREAD" "🟢 Solver monitor started
 
@@ -147,6 +226,10 @@ while true; do
         sell_tok=$(echo "$log_line" | grep -oP '"sell_token":"TokenAddress\(\K0x[a-fA-F0-9]+' || echo "???")
         buy_tok=$(echo "$log_line" | grep -oP '"buy_token":"TokenAddress\(\K0x[a-fA-F0-9]+' || echo "???")
         sell_amt=$(echo "$log_line" | grep -oP '"sell_amount":"\K[0-9]+' || echo "???")
+        input_amt=$(echo "$log_line" | grep -oP '"solution_input":"\K[0-9]+' || true)
+        if [ -z "$input_amt" ]; then
+            input_amt="$sell_amt"
+        fi
         buy_amt=$(echo "$log_line" | grep -oP '"solution_output":"\K[0-9]+' || echo "???")
         side=$(echo "$log_line" | grep -oP '"side":"\K[^"]+' || echo "???")
         # New-router / legacy telemetry (sidechain only). Empty if absent.
@@ -157,11 +240,15 @@ while true; do
         # Shorten addresses for readability
         sell_short="${sell_tok:0:6}...${sell_tok: -4}"
         buy_short="${buy_tok:0:6}...${buy_tok: -4}"
+        input_display="$(format_token_amount "$chain" "$sell_tok" "$input_amt")"
+        output_display="$(format_token_amount "$chain" "$buy_tok" "$buy_amt")"
 
         msg="Solution Candidate
 Chain: ${chain} | Env: ${env_name}
 ${sell_short} -> ${buy_short}
-Side: ${side} | Sell: ${sell_amt} | Output: ${buy_amt}"
+Side: ${side}
+Input: ${input_display}
+Output: ${output_display}"
         if [ -n "$quality" ]; then
             msg+="
 Quality: ${quality}"
