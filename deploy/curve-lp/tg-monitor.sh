@@ -51,7 +51,7 @@ hourly_errors=0
 send_tg() {
     local thread_id="$1"
     local text="$2"
-    local parse_mode="${3:-Markdown}"
+    local parse_mode="${3-Markdown}"
     local args=(-d chat_id="$TG_CHAT_ID" -d text="$text")
     if [ -n "$parse_mode" ]; then
         args+=(-d parse_mode="$parse_mode")
