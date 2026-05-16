@@ -26,6 +26,17 @@ TG_TRADES_THREAD=${TG_TRADES_THREAD:-3}             # Legacy/default trades topi
 TG_TRADES_THREAD_MAINNET=${TG_TRADES_THREAD_MAINNET:-$TG_TRADES_THREAD}
 TG_TRADES_THREAD_ARBITRUM=${TG_TRADES_THREAD_ARBITRUM:-$TG_TRADES_THREAD}
 TG_TRADES_THREAD_GNOSIS=${TG_TRADES_THREAD_GNOSIS:-$TG_TRADES_THREAD}
+TG_WINS_CHAT_ID=${TG_WINS_CHAT_ID-$TG_CHAT_ID}     # Optional separate wins channel
+TG_WINS_THREAD=${TG_WINS_THREAD-$TG_TRADES_THREAD}
+TG_WINS_THREAD_MAINNET=${TG_WINS_THREAD_MAINNET-$TG_WINS_THREAD}
+TG_WINS_THREAD_ARBITRUM=${TG_WINS_THREAD_ARBITRUM-$TG_WINS_THREAD}
+TG_WINS_THREAD_GNOSIS=${TG_WINS_THREAD_GNOSIS-$TG_WINS_THREAD}
+COW_SOLVER_NAME=${COW_SOLVER_NAME:-curve}
+TG_WIN_MAX_TRADES_PER_ORDER=${TG_WIN_MAX_TRADES_PER_ORDER:-20}
+TG_WIN_STATE_FILE=${TG_WIN_STATE_FILE-./processed/tg-wins-seen.txt}
+TG_WIN_LOOKBACK_BLOCKS_MAINNET=${TG_WIN_LOOKBACK_BLOCKS_MAINNET:-200}
+TG_WIN_LOOKBACK_BLOCKS_ARBITRUM=${TG_WIN_LOOKBACK_BLOCKS_ARBITRUM:-5000}
+TG_WIN_LOOKBACK_BLOCKS_GNOSIS=${TG_WIN_LOOKBACK_BLOCKS_GNOSIS:-240}
 
 COMPOSE_FILE="docker-compose.prod.yml"
 INTERVAL=300  # 5 minutes
@@ -48,11 +59,16 @@ hourly_orders=0
 hourly_solutions=0
 hourly_errors=0
 
-send_tg() {
-    local thread_id="$1"
-    local text="$2"
-    local parse_mode="${3-Markdown}"
-    local args=(-d chat_id="$TG_CHAT_ID" -d text="$text")
+mkdir -p "$(dirname "$TG_WIN_STATE_FILE")"
+touch "$TG_WIN_STATE_FILE" 2>/dev/null || true
+
+send_tg_to_chat() {
+    local chat_id="$1"
+    local thread_id="$2"
+    local text="$3"
+    local parse_mode="${4-Markdown}"
+    local args=(-d chat_id="$chat_id" -d text="$text")
+    [ -z "$chat_id" ] && return
     if [ -n "$parse_mode" ]; then
         args+=(-d parse_mode="$parse_mode")
     fi
@@ -63,6 +79,16 @@ send_tg() {
         "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
         "${args[@]}" \
         > /dev/null 2>&1 || true
+}
+
+send_tg() {
+    send_tg_to_chat "$TG_CHAT_ID" "$1" "$2" "${3-Markdown}"
+}
+
+send_win_tg() {
+    local chain="$1"
+    local text="$2"
+    send_tg_to_chat "$TG_WINS_CHAT_ID" "$(chain_wins_thread "$chain")" "$text" ""
 }
 
 service_chain() {
@@ -87,6 +113,62 @@ chain_thread() {
         arbitrum) echo "$TG_TRADES_THREAD_ARBITRUM" ;;
         gnosis) echo "$TG_TRADES_THREAD_GNOSIS" ;;
         *) echo "$TG_TRADES_THREAD" ;;
+    esac
+}
+
+chain_wins_thread() {
+    case "$1" in
+        mainnet) echo "$TG_WINS_THREAD_MAINNET" ;;
+        arbitrum) echo "$TG_WINS_THREAD_ARBITRUM" ;;
+        gnosis) echo "$TG_WINS_THREAD_GNOSIS" ;;
+        *) echo "$TG_WINS_THREAD" ;;
+    esac
+}
+
+cow_api_chain() {
+    case "$1" in
+        mainnet) echo "mainnet" ;;
+        arbitrum) echo "arbitrum_one" ;;
+        gnosis) echo "xdai" ;;
+        *) echo "" ;;
+    esac
+}
+
+chain_rpc_url() {
+    case "$1" in
+        mainnet) echo "${NODE_URL:-https://ethereum.publicnode.com}" ;;
+        arbitrum) echo "${NODE_URL_ARBITRUM:-https://arb1.arbitrum.io/rpc}" ;;
+        gnosis) echo "${NODE_URL_GNOSIS:-https://rpc.gnosischain.com}" ;;
+        *) echo "" ;;
+    esac
+}
+
+chain_win_lookback_blocks() {
+    case "$1" in
+        mainnet) echo "$TG_WIN_LOOKBACK_BLOCKS_MAINNET" ;;
+        arbitrum) echo "$TG_WIN_LOOKBACK_BLOCKS_ARBITRUM" ;;
+        gnosis) echo "$TG_WIN_LOOKBACK_BLOCKS_GNOSIS" ;;
+        *) echo "0" ;;
+    esac
+}
+
+explorer_order_url() {
+    local chain="$1"
+    local uid="$2"
+    case "$chain" in
+        arbitrum) echo "https://explorer.cow.fi/arb1/orders/${uid}" ;;
+        gnosis) echo "https://explorer.cow.fi/gc/orders/${uid}" ;;
+        *) echo "https://explorer.cow.fi/orders/${uid}" ;;
+    esac
+}
+
+explorer_tx_url() {
+    local chain="$1"
+    local tx="$2"
+    case "$chain" in
+        arbitrum) echo "https://arbiscan.io/tx/${tx}" ;;
+        gnosis) echo "https://gnosisscan.io/tx/${tx}" ;;
+        *) echo "https://etherscan.io/tx/${tx}" ;;
     esac
 }
 
@@ -181,11 +263,169 @@ format_token_amount() {
     fi
 }
 
+win_seen() {
+    local key="$1"
+    [ -f "$TG_WIN_STATE_FILE" ] && grep -qxF "$key" "$TG_WIN_STATE_FILE"
+}
+
+mark_win_seen() {
+    local key="$1"
+    if ! win_seen "$key"; then
+        echo "$key" >> "$TG_WIN_STATE_FILE" 2>/dev/null || true
+        tail -n 2000 "$TG_WIN_STATE_FILE" > "${TG_WIN_STATE_FILE}.tmp" 2>/dev/null \
+            && mv "${TG_WIN_STATE_FILE}.tmp" "$TG_WIN_STATE_FILE" 2>/dev/null || true
+    fi
+}
+
+fetch_winning_trades() {
+    local chain="$1"
+    local uid="$2"
+    local api_chain rpc_url lookback_blocks
+
+    command -v python3 >/dev/null 2>&1 || return
+    api_chain="$(cow_api_chain "$chain")"
+    rpc_url="$(chain_rpc_url "$chain")"
+    lookback_blocks="$(chain_win_lookback_blocks "$chain")"
+    [ -z "$api_chain" ] && return
+
+    python3 - "$api_chain" "$uid" "$COW_SOLVER_NAME" "$TG_WIN_MAX_TRADES_PER_ORDER" "$rpc_url" "$lookback_blocks" <<'PY' || true
+import json
+import sys
+import urllib.error
+import urllib.request
+
+api_chain, uid, solver_name, max_trades, rpc_url, lookback_blocks = sys.argv[1:]
+max_trades = int(max_trades)
+lookback_blocks = int(lookback_blocks)
+base = f"https://api.cow.fi/{api_chain}/api/v1"
+
+
+def get_json(url):
+    req = urllib.request.Request(url, headers={"user-agent": "curve-lp-tg-monitor"})
+    with urllib.request.urlopen(req, timeout=8) as response:
+        return json.load(response)
+
+
+def rpc(method, params):
+    if not rpc_url:
+        return None
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
+    req = urllib.request.Request(
+        rpc_url,
+        data=body,
+        headers={"content-type": "application/json", "user-agent": "curve-lp-tg-monitor"},
+    )
+    with urllib.request.urlopen(req, timeout=8) as response:
+        return json.load(response).get("result")
+
+
+min_block = 0
+if lookback_blocks > 0:
+    try:
+        current_block = int(rpc("eth_blockNumber", []), 16)
+        min_block = max(0, current_block - lookback_blocks)
+    except Exception:
+        min_block = 0
+
+try:
+    trades = get_json(f"{base}/trades?orderUid={uid}")
+except Exception:
+    sys.exit(0)
+
+seen_txs = set()
+checked = 0
+for trade in trades:
+    tx_hash = trade.get("txHash")
+    if not tx_hash or tx_hash in seen_txs:
+        continue
+    seen_txs.add(tx_hash)
+
+    block_number = int(trade.get("blockNumber") or 0)
+    if min_block and block_number < min_block:
+        continue
+
+    checked += 1
+    if checked > max_trades:
+        break
+
+    try:
+        competition = get_json(f"{base}/solver_competition/by_tx_hash/{tx_hash}")
+    except Exception:
+        continue
+
+    winning_solution = None
+    for solution in competition.get("solutions", []):
+        if solution.get("solver") != solver_name or solution.get("isWinner") is not True:
+            continue
+        if any(order.get("id", "").lower() == uid.lower() for order in solution.get("orders", [])):
+            winning_solution = solution
+            break
+
+    if not winning_solution:
+        continue
+
+    fields = [
+        tx_hash,
+        str(block_number),
+        trade.get("sellAmount", ""),
+        trade.get("buyAmount", ""),
+        trade.get("sellToken", ""),
+        trade.get("buyToken", ""),
+        str(winning_solution.get("score", "")),
+        str(winning_solution.get("ranking", "")),
+    ]
+    print("\t".join(fields))
+PY
+}
+
+send_win_notifications_for_candidate() {
+    local chain="$1"
+    local env_name="$2"
+    local uid="$3"
+
+    [ "$env_name" = "prod" ] || return
+    [ -n "$TG_WINS_CHAT_ID" ] || return
+    [ "$uid" != "???" ] || return
+
+    local tx_hash block_number sell_amount buy_amount sell_token buy_token score ranking key
+    while IFS=$'\t' read -r tx_hash block_number sell_amount buy_amount sell_token buy_token score ranking; do
+        [ -n "$tx_hash" ] || continue
+        key="${chain}:${tx_hash}:${uid}"
+        if win_seen "$key"; then
+            continue
+        fi
+        mark_win_seen "$key"
+
+        local sell_short buy_short sell_display buy_display msg
+        sell_short="${sell_token:0:6}...${sell_token: -4}"
+        buy_short="${buy_token:0:6}...${buy_token: -4}"
+        sell_display="$(format_token_amount "$chain" "$sell_token" "$sell_amount")"
+        buy_display="$(format_token_amount "$chain" "$buy_token" "$buy_amount")"
+
+        msg="Auction Won
+Chain: ${chain}
+${sell_short} -> ${buy_short}
+Sold: ${sell_display}
+Bought: ${buy_display}
+Score: ${score}
+Block: ${block_number}
+Order: $(explorer_order_url "$chain" "$uid")
+Tx: $(explorer_tx_url "$chain" "$tx_hash")"
+        if [ -n "$ranking" ]; then
+            msg+="
+Ranking: ${ranking}"
+        fi
+        send_win_tg "$chain" "$msg"
+    done < <(fetch_winning_trades "$chain" "$uid")
+}
+
 # Startup message
 send_tg "$TG_STATS_THREAD" "🟢 Solver monitor started
 
 Watching: mainnet, arbitrum, gnosis
-Trades threads: mainnet=${TG_TRADES_THREAD_MAINNET:-default}, arbitrum=${TG_TRADES_THREAD_ARBITRUM:-default}, gnosis=${TG_TRADES_THREAD_GNOSIS:-default}"
+Trades threads: mainnet=${TG_TRADES_THREAD_MAINNET:-default}, arbitrum=${TG_TRADES_THREAD_ARBITRUM:-default}, gnosis=${TG_TRADES_THREAD_GNOSIS:-default}
+Wins chat: ${TG_WINS_CHAT_ID:-disabled}
+Wins threads: mainnet=${TG_WINS_THREAD_MAINNET:-default}, arbitrum=${TG_WINS_THREAD_ARBITRUM:-default}, gnosis=${TG_WINS_THREAD_GNOSIS:-default}"
 
 while true; do
     sleep "$INTERVAL"
@@ -265,8 +505,9 @@ Legacy ref: ${legacy_out}"
             fi
         fi
         msg+="
-Order: https://explorer.cow.fi/orders/${uid}"
+Order: $(explorer_order_url "$chain" "$uid")"
         send_tg "$thread_id" "$msg" ""
+        send_win_notifications_for_candidate "$chain" "$env_name" "$uid"
     done < <(echo "$logs" | grep '"solved order"' | grep '"is_quote":false' || true)
 
     # Accumulate hourly stats

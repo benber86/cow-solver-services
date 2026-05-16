@@ -220,6 +220,9 @@ nohup ./tg-monitor.sh >/dev/null 2>&1 &
 
 What it reports (every 5 min tick):
 - Solver-candidate trade notifications (per-order, with CoW explorer link).
+- Confirmed win notifications for prod settlements. These are checked against
+  CoW's `solver_competition/by_tx_hash` API and only fire when `solver=curve`
+  is `isWinner=true`.
 - Hourly summary across all solver containers: auctions, quotes, orders processed, solution candidates, errors.
 - Idle heartbeat every 30 min if no activity.
 
@@ -231,6 +234,21 @@ routed by chain:
 
 Prod and staging notifications for the same chain land in the same Telegram
 topic; the message body includes `Chain:` and `Env:` so you can tell them apart.
+
+Confirmed win notifications can go to a separate chat or topic:
+
+```
+TG_WINS_CHAT_ID=-100...
+TG_WINS_THREAD=
+TG_WINS_THREAD_MAINNET=
+TG_WINS_THREAD_ARBITRUM=
+TG_WINS_THREAD_GNOSIS=
+```
+
+If `TG_WINS_CHAT_ID` is omitted, wins use `TG_CHAT_ID`. If a wins thread is
+omitted, it falls back to `TG_WINS_THREAD`; setting a thread variable to an
+empty value is valid for a non-forum channel. The monitor keeps a bounded
+`processed/tg-wins-seen.txt` state file to avoid duplicate win alerts.
 
 `monitor.sh` is still mainnet-only unless extended separately.
 
