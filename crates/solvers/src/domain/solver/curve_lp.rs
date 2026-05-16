@@ -48,6 +48,8 @@ const LEGACY_TELEMETRY_TIMEOUT: Duration = Duration::from_millis(1500);
 // CoW native-price probe detection constants
 /// The sentinel sell_amount CoW uses for native price probes (2^144).
 const NATIVE_PRICE_SELL_SENTINEL: U256 = U256::from_limbs([0, 0, 65536, 0]);
+const MARKETABILITY_BASE_BPS: u64 = 10_000;
+const TOKEN_PRICE_BASE: u128 = 1_000_000_000_000_000_000;
 
 /// Curve Price API chain slug used in the URL path.
 ///
@@ -197,6 +199,9 @@ pub struct Config {
     /// Maximum non-LP orders to attempt per (sell token, buy token, side).
     /// `None` means uncapped.
     pub max_general_orders_per_pair: Option<usize>,
+    /// Maximum accepted off-market deviation for non-LP general orders, in bps.
+    /// `None` disables the pre-router marketability filter.
+    pub max_general_order_market_deviation_bps: Option<u32>,
 }
 
 struct Inner {
@@ -215,6 +220,7 @@ struct Inner {
     solution_gas_offset: eth::SignedGas,
     max_general_orders_per_auction: Option<usize>,
     max_general_orders_per_pair: Option<usize>,
+    max_general_order_market_deviation_bps: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -222,6 +228,7 @@ struct SelectedCounts {
     total: usize,
     priority: usize,
     general: usize,
+    marketability_filtered_general: usize,
 }
 
 impl Solver {
@@ -297,6 +304,8 @@ impl Solver {
                 solution_gas_offset: config.solution_gas_offset,
                 max_general_orders_per_auction: config.max_general_orders_per_auction,
                 max_general_orders_per_pair: config.max_general_orders_per_pair,
+                max_general_order_market_deviation_bps: config
+                    .max_general_order_market_deviation_bps,
             }),
         }
     }
@@ -345,6 +354,7 @@ impl Solver {
             selected_orders = selected_counts.total,
             selected_priority_orders = selected_counts.priority,
             selected_general_orders = selected_counts.general,
+            marketability_filtered_general_orders = selected_counts.marketability_filtered_general,
             remaining_ms = remaining.as_millis(),
             "starting Curve LP solver"
         );
@@ -373,6 +383,8 @@ impl Solver {
                     selected_orders = selected_counts.total,
                     selected_priority_orders = selected_counts.priority,
                     selected_general_orders = selected_counts.general,
+                    marketability_filtered_general_orders =
+                        selected_counts.marketability_filtered_general,
                     remaining_ms = remaining.as_millis(),
                     "reached timeout while solving Curve LP orders"
                 );
@@ -396,6 +408,7 @@ impl Solver {
             selected_orders = selected_counts.total,
             selected_priority_orders = selected_counts.priority,
             selected_general_orders = selected_counts.general,
+            marketability_filtered_general_orders = selected_counts.marketability_filtered_general,
             num_solutions = solutions.len(),
             elapsed_ms = elapsed.as_millis() as u64,
             budget_ms = remaining.as_millis() as u64,
@@ -608,6 +621,37 @@ impl Inner {
         })
     }
 
+    fn general_marketability_rejection_reason(
+        &self,
+        order: &Order,
+        tokens: &Tokens,
+    ) -> Option<&'static str> {
+        let max_deviation_bps = self.max_general_order_market_deviation_bps?;
+        let sell_price = match tokens.reference_price(&order.sell.token) {
+            Some(price) => price,
+            None => return Some("missing_sell_reference_price"),
+        };
+        let buy_price = match tokens.reference_price(&order.buy.token) {
+            Some(price) => price,
+            None => return Some("missing_buy_reference_price"),
+        };
+
+        let sell_value = order_value(order.sell.amount, sell_price);
+        let buy_value = order_value(order.buy.amount, buy_price);
+        if sell_value.is_zero() || buy_value.is_zero() {
+            return Some("zero_reference_value");
+        }
+
+        let allowed_buy_value = sell_value.saturating_mul(eth::U256::from(
+            MARKETABILITY_BASE_BPS + u64::from(max_deviation_bps),
+        )) / eth::U256::from(MARKETABILITY_BASE_BPS);
+        if buy_value > allowed_buy_value {
+            Some("off_market_limit_price")
+        } else {
+            None
+        }
+    }
+
     fn select_orders(
         &self,
         supported: Vec<(usize, Order)>,
@@ -615,10 +659,21 @@ impl Inner {
     ) -> Vec<(usize, Order)> {
         let mut priority = Vec::new();
         let mut general = Vec::new();
+        let mut marketability_filtered_general = 0usize;
 
         for item in supported {
             if self.is_priority_order(&item.1) {
                 priority.push(item);
+            } else if let Some(reason) = self.general_marketability_rejection_reason(&item.1, tokens)
+            {
+                marketability_filtered_general += 1;
+                tracing::debug!(
+                    order_uid = %item.1.uid,
+                    sell_token = ?item.1.sell.token,
+                    buy_token = ?item.1.buy.token,
+                    reason,
+                    "general order skipped by marketability filter"
+                );
             } else {
                 general.push(item);
             }
@@ -652,8 +707,10 @@ impl Inner {
         tracing::debug!(
             priority_orders = priority.len(),
             selected_general_orders = general.len(),
+            marketability_filtered_general_orders = marketability_filtered_general,
             max_general_orders_per_auction = self.max_general_orders_per_auction,
             max_general_orders_per_pair = self.max_general_orders_per_pair,
+            max_general_order_market_deviation_bps = self.max_general_order_market_deviation_bps,
             "selected Curve LP solver orders"
         );
 
@@ -664,6 +721,7 @@ impl Inner {
     fn selected_counts(&self, orders: &[Order], tokens: &Tokens) -> SelectedCounts {
         let mut priority = 0usize;
         let mut general = Vec::new();
+        let mut marketability_filtered_general = 0usize;
 
         for (i, order) in orders
             .iter()
@@ -672,6 +730,11 @@ impl Inner {
         {
             if self.is_priority_order(order) {
                 priority += 1;
+            } else if self
+                .general_marketability_rejection_reason(order, tokens)
+                .is_some()
+            {
+                marketability_filtered_general += 1;
             } else {
                 general.push((i, order));
             }
@@ -705,6 +768,7 @@ impl Inner {
             total: priority + general.len(),
             priority,
             general: general.len(),
+            marketability_filtered_general,
         }
     }
 
@@ -1138,7 +1202,6 @@ fn output_haircut_bps(expected: eth::U256, output: eth::U256) -> Option<i32> {
 }
 
 fn order_notional(order: &Order, tokens: &Tokens) -> eth::U256 {
-    const BASE: u128 = 1_000_000_000_000_000_000;
     let (token, amount) = match order.side {
         order::Side::Sell => (&order.sell.token, order.sell.amount),
         order::Side::Buy => (&order.buy.token, order.buy.amount),
@@ -1147,7 +1210,11 @@ fn order_notional(order: &Order, tokens: &Tokens) -> eth::U256 {
         Some(price) => price.0.0,
         None => return eth::U256::ZERO,
     };
-    amount.saturating_mul(price) / eth::U256::from(BASE)
+    amount.saturating_mul(price) / eth::U256::from(TOKEN_PRICE_BASE)
+}
+
+fn order_value(amount: eth::U256, price: auction::Price) -> eth::U256 {
+    amount.saturating_mul(price.0.0) / eth::U256::from(TOKEN_PRICE_BASE)
 }
 
 fn order_side_key(side: order::Side) -> u8 {
@@ -1444,6 +1511,7 @@ mod tests {
             solution_gas_offset: eth::SignedGas::default(),
             max_general_orders_per_auction: None,
             max_general_orders_per_pair: None,
+            max_general_order_market_deviation_bps: None,
         }
     }
 
@@ -1621,6 +1689,25 @@ mod tests {
         }
     }
 
+    fn sell_order_with_amounts(
+        sell: eth::Address,
+        buy: eth::Address,
+        sell_amount: u128,
+        buy_amount: u128,
+    ) -> Order {
+        Order {
+            sell: eth::Asset {
+                token: eth::TokenAddress(sell),
+                amount: U256::from(sell_amount),
+            },
+            buy: eth::Asset {
+                token: eth::TokenAddress(buy),
+                amount: U256::from(buy_amount),
+            },
+            ..sell_order(sell, buy)
+        }
+    }
+
     fn tokens_with_unit_prices(tokens: &[eth::Address]) -> auction::Tokens {
         auction::Tokens(
             tokens
@@ -1780,5 +1867,52 @@ mod tests {
         // notional is smaller than the general orders. General orders are
         // capped globally and per pair after notional ranking.
         assert_eq!(selected_indices, vec![5, 1, 2, 3]);
+    }
+
+    #[test]
+    fn select_orders_filters_off_market_general_orders_only() {
+        let lp = eth::Address::repeat_byte(0x01);
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+
+        let mut inner = test_inner(100, 50);
+        inner.lp_tokens = Some([lp].into_iter().collect());
+        inner.token_allowlist = Some([lp, usdc, weth].into_iter().collect());
+        inner.max_general_order_market_deviation_bps = Some(200);
+
+        let orders = vec![
+            (0, sell_order_with_amounts(usdc, weth, 100, 103)),
+            (1, sell_order_with_amounts(usdc, weth, 100, 101)),
+            (2, sell_order_with_amounts(lp, usdc, 1, 1_000_000)),
+        ];
+        let tokens = tokens_with_unit_prices(&[lp, usdc, weth]);
+
+        let selected = inner.select_orders(orders, &tokens);
+        let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
+
+        // General order 0 is >2% off-market and skipped. The LP-priority order
+        // bypasses marketability even though its limit price is absurd.
+        assert_eq!(selected_indices, vec![2, 1]);
+    }
+
+    #[test]
+    fn selected_counts_include_marketability_filtered_general_orders() {
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+
+        let mut inner = test_inner(100, 50);
+        inner.max_general_order_market_deviation_bps = Some(200);
+
+        let orders = vec![
+            sell_order_with_amounts(usdc, weth, 100, 103),
+            sell_order_with_amounts(usdc, weth, 100, 101),
+        ];
+        let tokens = tokens_with_unit_prices(&[usdc, weth]);
+
+        let counts = inner.selected_counts(&orders, &tokens);
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.priority, 0);
+        assert_eq!(counts.general, 1);
+        assert_eq!(counts.marketability_filtered_general, 1);
     }
 }

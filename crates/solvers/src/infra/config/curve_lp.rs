@@ -108,6 +108,11 @@ struct Config {
     /// Maximum non-LP orders to attempt per (sell token, buy token, side).
     #[serde(default)]
     max_general_orders_per_pair: Option<usize>,
+
+    /// Maximum accepted off-market deviation for non-LP general orders, in bps.
+    /// If set, general orders with missing reference prices are skipped.
+    #[serde(default)]
+    max_general_order_market_deviation_bps: Option<u32>,
 }
 
 fn default_slippage_bps() -> u32 {
@@ -177,6 +182,7 @@ pub async fn load(path: &Path) -> curve_lp::Config {
         route_provider,
         max_general_orders_per_auction: config.max_general_orders_per_auction,
         max_general_orders_per_pair: config.max_general_orders_per_pair,
+        max_general_order_market_deviation_bps: config.max_general_order_market_deviation_bps,
     }
 }
 

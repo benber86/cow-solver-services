@@ -167,6 +167,7 @@ lp-tokens = [
 # Safety settings
 slippage-bps = 100              # 1% slippage buffer
 max-quote-deviation-bps = 300   # 3% max deviation between API and on-chain quote
+max-general-order-market-deviation-bps = 200  # 2% pre-router general-order filter
 
 # CoW Protocol Settlement contract (Ethereum mainnet)
 settlement-contract = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"

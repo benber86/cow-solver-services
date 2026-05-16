@@ -213,6 +213,7 @@ token-allowlist = [
 slippage-bps = 100              # 1% calldata slippage buffer
 bid-slippage-bps = 5            # 0.05% competitive bid haircut
 max-quote-deviation-bps = 300   # 3% max deviation between API and on-chain quote
+max-general-order-market-deviation-bps = 200  # 2% pre-router general-order filter
 max-general-orders-per-auction = 24
 max-general-orders-per-pair = 2
 
