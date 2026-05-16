@@ -513,6 +513,12 @@ impl Inner {
                             calldata_min_out = %solved.calldata_min_out,
                             solution_input = %solved.input_amount,
                             solution_output = %solved.output_amount,
+                            effective_sell_amount = %solved.effective_sell_amount,
+                            effective_buy_amount = %solved.effective_buy_amount,
+                            fee_in_sell_token = %solved.fee_in_sell_token,
+                            estimated_gas = %solved.estimated_gas.0,
+                            gas_price_wei = %solved.gas_price.0.0,
+                            sell_token_reference_price = %solved.sell_token_reference_price.0.0,
                             bid_haircut_bps,
                             route_ms = solved.route_ms,
                             price_fetch_ms = solved.price_fetch_ms,
@@ -961,14 +967,40 @@ impl Inner {
         let sell_token_price = match tokens.reference_price(&order.sell.token) {
             Some(price) => price,
             None => {
-                let eth_price = fetched_price.ok_or(SolveError::NoPriceForSellToken)?;
+                let eth_price = match fetched_price {
+                    Some(price) => price,
+                    None => {
+                        tracing::warn!(
+                            order_uid = %order.uid,
+                            sell_token = ?order.sell.token,
+                            buy_token = ?order.buy.token,
+                            price_fetch_ms,
+                            "missing sell token reference price"
+                        );
+                        return Err(SolveError::NoPriceForSellToken);
+                    }
+                };
                 auction::Price(eth::Ether(eth_price))
             }
         };
 
-        let fee_in_sell_token = sell_token_price
-            .ether_value(eth::Ether(estimated_gas.0.saturating_mul(gas_price.0.0)))
-            .ok_or(SolveError::FeeCalculation)?;
+        let gas_cost = eth::Ether(estimated_gas.0.saturating_mul(gas_price.0.0));
+        let fee_in_sell_token = match sell_token_price.ether_value(gas_cost) {
+            Some(fee) => fee,
+            None => {
+                tracing::warn!(
+                    order_uid = %order.uid,
+                    sell_token = ?order.sell.token,
+                    buy_token = ?order.buy.token,
+                    estimated_gas = %estimated_gas.0,
+                    gas_price_wei = %gas_price.0.0,
+                    gas_cost_wei = %gas_cost.0,
+                    sell_token_reference_price = %sell_token_price.0.0,
+                    "fee calculation failed while converting gas cost to sell token"
+                );
+                return Err(SolveError::FeeCalculation);
+            }
+        };
 
         // 8. Build the solution
         // For sell orders: input is the full sell amount, output is the
@@ -987,13 +1019,49 @@ impl Inner {
                 ),
             ),
             order::Side::Buy => (
-                order
-                    .sell
-                    .amount
-                    .checked_sub(fee_in_sell_token)
-                    .ok_or(SolveError::FeeCalculation)?,
+                match order.sell.amount.checked_sub(fee_in_sell_token) {
+                    Some(input) => input,
+                    None => {
+                        tracing::warn!(
+                            order_uid = %order.uid,
+                            sell_token = ?order.sell.token,
+                            buy_token = ?order.buy.token,
+                            sell_amount = %order.sell.amount,
+                            buy_amount = %order.buy.amount,
+                            fee_in_sell_token = %fee_in_sell_token,
+                            estimated_gas = %estimated_gas.0,
+                            gas_price_wei = %gas_price.0.0,
+                            gas_cost_wei = %gas_cost.0,
+                            sell_token_reference_price = %sell_token_price.0.0,
+                            "fee calculation failed because fee exceeds buy-order max sell"
+                        );
+                        return Err(SolveError::FeeCalculation);
+                    }
+                },
                 order.buy.amount,
             ),
+        };
+
+        let effective = match effective_trade_amounts(
+            order,
+            input_amount,
+            output_amount,
+            fee_in_sell_token,
+        ) {
+            Some(effective) => effective,
+            None => {
+                tracing::warn!(
+                    order_uid = %order.uid,
+                    sell_token = ?order.sell.token,
+                    buy_token = ?order.buy.token,
+                    side = ?order.side,
+                    input_amount = %input_amount,
+                    output_amount = %output_amount,
+                    fee_in_sell_token = %fee_in_sell_token,
+                    "solution construction failed while computing effective amounts"
+                );
+                return Err(SolveError::SolutionConstruction);
+            }
         };
 
         let single = solution::Single {
@@ -1011,9 +1079,32 @@ impl Inner {
             wrappers: order.wrappers.clone(),
         };
 
-        let solution = single
-            .into_solution(eth::SellTokenAmount(fee_in_sell_token))
-            .ok_or(SolveError::SolutionConstruction)?;
+        let solution = match single.into_solution(eth::SellTokenAmount(fee_in_sell_token)) {
+            Some(solution) => solution,
+            None => {
+                tracing::warn!(
+                    order_uid = %order.uid,
+                    sell_token = ?order.sell.token,
+                    buy_token = ?order.buy.token,
+                    side = ?order.side,
+                    sell_amount = %order.sell.amount,
+                    buy_amount = %order.buy.amount,
+                    input_amount = %input_amount,
+                    output_amount = %output_amount,
+                    effective_sell_amount = %effective.sell,
+                    effective_buy_amount = %effective.buy,
+                    effective_executed_amount = %effective.executed,
+                    fee_in_sell_token = %fee_in_sell_token,
+                    estimated_gas = %estimated_gas.0,
+                    gas_price_wei = %gas_price.0.0,
+                    gas_cost_wei = %gas_cost.0,
+                    sell_token_reference_price = %sell_token_price.0.0,
+                    limit_price_satisfied = effective.limit_price_satisfied,
+                    "solution construction failed after fee accounting"
+                );
+                return Err(SolveError::SolutionConstruction);
+            }
+        };
 
         // Non-blocking poll: attach only if the spawned probe is already
         // ready. Anything still in-flight is abandoned rather than holding
@@ -1037,6 +1128,12 @@ impl Inner {
             calldata_min_out: quote.min_out,
             input_amount,
             output_amount,
+            effective_sell_amount: effective.sell,
+            effective_buy_amount: effective.buy,
+            fee_in_sell_token,
+            estimated_gas,
+            gas_price: *gas_price,
+            sell_token_reference_price: sell_token_price,
             route_ms,
             price_fetch_ms,
             quote_quality: quote.quality,
@@ -1159,6 +1256,9 @@ impl Inner {
             wrappers: order.wrappers.clone(),
         };
 
+        let effective = effective_trade_amounts(order, estimated_sell, order.buy.amount, U256::ZERO)
+            .ok_or(SolveError::SolutionConstruction)?;
+
         let solution = single
             .into_solution(eth::SellTokenAmount(U256::ZERO))
             .ok_or(SolveError::SolutionConstruction)?;
@@ -1169,6 +1269,16 @@ impl Inner {
             calldata_min_out: U256::ZERO,
             input_amount: estimated_sell,
             output_amount: order.buy.amount,
+            effective_sell_amount: effective.sell,
+            effective_buy_amount: effective.buy,
+            fee_in_sell_token: U256::ZERO,
+            estimated_gas: eth::Gas(
+                fwd.gas_estimate
+                    .map(U256::from)
+                    .unwrap_or_else(|| U256::from(350_000u64)),
+            ) + self.solution_gas_offset,
+            gas_price: auction::GasPrice(eth::Ether(U256::ZERO)),
+            sell_token_reference_price: auction::Price(eth::Ether(U256::ZERO)),
             route_ms,
             price_fetch_ms: 0,
             quote_quality: fwd.quality,
@@ -1227,6 +1337,12 @@ struct SolvedOrder {
     calldata_min_out: eth::U256,
     input_amount: eth::U256,
     output_amount: eth::U256,
+    effective_sell_amount: eth::U256,
+    effective_buy_amount: eth::U256,
+    fee_in_sell_token: eth::U256,
+    estimated_gas: eth::Gas,
+    gas_price: auction::GasPrice,
+    sell_token_reference_price: auction::Price,
     route_ms: u64,
     price_fetch_ms: u64,
     quote_quality: Option<route_provider::QuoteQuality>,
@@ -1299,6 +1415,54 @@ fn sell_order_bid_output(
     QuoteRequest::min_out_with_slippage(expected_output, bid_slippage_bps)
         .max(calldata_min_out)
         .max(order_floor)
+}
+
+struct EffectiveTradeAmounts {
+    sell: eth::U256,
+    buy: eth::U256,
+    executed: eth::U256,
+    limit_price_satisfied: bool,
+}
+
+fn effective_trade_amounts(
+    order: &Order,
+    input_amount: eth::U256,
+    output_amount: eth::U256,
+    fee_in_sell_token: eth::U256,
+) -> Option<EffectiveTradeAmounts> {
+    let surplus_fee = if order.solver_determines_fee() {
+        fee_in_sell_token
+    } else {
+        U256::ZERO
+    };
+
+    let (sell, buy) = match order.side {
+        order::Side::Buy => (input_amount.checked_add(surplus_fee)?, output_amount),
+        order::Side::Sell => {
+            let sell = input_amount
+                .checked_add(surplus_fee)?
+                .min(order.sell.amount);
+            let buy = sell
+                .checked_sub(surplus_fee)?
+                .checked_mul(output_amount)?
+                .checked_div(input_amount)?;
+            (sell, buy)
+        }
+    };
+
+    let limit_price_satisfied =
+        order.sell.amount.checked_mul(buy)? >= order.buy.amount.checked_mul(sell)?;
+    let executed = match order.side {
+        order::Side::Buy => buy,
+        order::Side::Sell => sell.checked_sub(surplus_fee)?,
+    };
+
+    Some(EffectiveTradeAmounts {
+        sell,
+        buy,
+        executed,
+        limit_price_satisfied,
+    })
 }
 
 fn should_backoff_general_failure(err: &SolveError) -> bool {
@@ -2019,6 +2183,41 @@ mod tests {
         assert_eq!(counts.priority, 0);
         assert_eq!(counts.general, 1);
         assert_eq!(counts.marketability_filtered_general, 1);
+    }
+
+    #[test]
+    fn effective_trade_amounts_reduce_sell_order_output_by_fee() {
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+        let mut order = sell_order_with_amounts(usdc, weth, 1_000, 900);
+        order.class = order::Class::Limit;
+
+        let effective =
+            effective_trade_amounts(&order, U256::from(1_000), U256::from(950), U256::from(10))
+                .unwrap();
+
+        assert_eq!(effective.sell, U256::from(1_000));
+        assert_eq!(effective.buy, U256::from(940));
+        assert_eq!(effective.executed, U256::from(990));
+        assert!(effective.limit_price_satisfied);
+    }
+
+    #[test]
+    fn effective_trade_amounts_buy_order_adds_fee_to_input() {
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+        let mut order = sell_order_with_amounts(usdc, weth, 1_000, 1);
+        order.side = order::Side::Buy;
+        order.class = order::Class::Limit;
+
+        let effective =
+            effective_trade_amounts(&order, U256::from(990), U256::from(1), U256::from(10))
+                .unwrap();
+
+        assert_eq!(effective.sell, U256::from(1_000));
+        assert_eq!(effective.buy, U256::from(1));
+        assert_eq!(effective.executed, U256::from(1));
+        assert!(effective.limit_price_satisfied);
     }
 
     #[test]

@@ -476,6 +476,9 @@ while true; do
             input_amt="$sell_amt"
         fi
         buy_amt=$(echo "$log_line" | grep -oP '"solution_output":"\K[0-9]+' || echo "???")
+        effective_buy_amt=$(echo "$log_line" | grep -oP '"effective_buy_amount":"\K[0-9]+' || true)
+        fee_amt=$(echo "$log_line" | grep -oP '"fee_in_sell_token":"\K[0-9]+' || true)
+        estimated_gas=$(echo "$log_line" | grep -oP '"estimated_gas":"\K[0-9]+' || true)
         side=$(echo "$log_line" | grep -oP '"side":"\K[^"]+' || echo "???")
         # New-router / legacy telemetry (sidechain only). Empty if absent.
         quality=$(echo "$log_line" | grep -oP '"new_router_quality":"\K[^"]+' || true)
@@ -487,13 +490,29 @@ while true; do
         buy_short="${buy_tok:0:6}...${buy_tok: -4}"
         input_display="$(format_token_amount "$chain" "$sell_tok" "$input_amt")"
         output_display="$(format_token_amount "$chain" "$buy_tok" "$buy_amt")"
+        effective_output_display="$output_display"
+        if [ -n "$effective_buy_amt" ]; then
+            effective_output_display="$(format_token_amount "$chain" "$buy_tok" "$effective_buy_amt")"
+        fi
 
         msg="Solution Candidate
 Chain: ${chain} | Env: ${env_name}
 ${sell_short} -> ${buy_short}
 Side: ${side}
 Input: ${input_display}
-Output: ${output_display}"
+Output: ${effective_output_display}"
+        if [ -n "$effective_buy_amt" ] && [ "$effective_buy_amt" != "$buy_amt" ]; then
+            msg+="
+Route output: ${output_display}"
+        fi
+        if [ -n "$fee_amt" ] && [ "$fee_amt" != "0" ]; then
+            msg+="
+Fee: $(format_token_amount "$chain" "$sell_tok" "$fee_amt")"
+        fi
+        if [ -n "$estimated_gas" ]; then
+            msg+="
+Gas: ${estimated_gas}"
+        fi
         if [ -n "$quality" ]; then
             msg+="
 Quality: ${quality}"
