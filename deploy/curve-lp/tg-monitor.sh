@@ -116,6 +116,7 @@ token_meta() {
         gnosis:0x6a023ccd1ff6f2045c3309768ead9e68f978f6e1) echo "WETH|18" ;;
         gnosis:0x9c58bacc331c9aa871afd802db6379a98e80cedb) echo "GNO|18" ;;
         gnosis:0x44fa8e6f47987339850636f88629646662444217) echo "WXDAI|18" ;;
+        gnosis:0xe91d153e0b41518a2ce8dd3d7944fa863463a97d) echo "WXDAI|18" ;;
         gnosis:0xcb444e90d8198415266c6a2724b7900fb12fc56e) echo "EURe|18" ;;
         gnosis:0x83f20f44975d03b1b09e64809b757c47f942beea) echo "sDAI|18" ;;
         gnosis:0x2a22f9c3b484c3629090feed35f17ff8f88f76f0) echo "USDC.e|6" ;;
@@ -144,17 +145,20 @@ format_amount() {
                 exit;
             }
             if (length(raw) <= decimals) {
-                int = "0";
-                frac = sprintf("%0*d", decimals, raw);
+                whole = "0";
+                frac = raw;
+                while (length(frac) < decimals) {
+                    frac = "0" frac;
+                }
             } else {
-                int = substr(raw, 1, length(raw) - decimals);
+                whole = substr(raw, 1, length(raw) - decimals);
                 frac = substr(raw, length(raw) - decimals + 1);
             }
             sub(/0+$/, "", frac);
             if (frac == "") {
-                print int;
+                print whole;
             } else {
-                print int "." frac;
+                print whole "." frac;
             }
         }'
 }
