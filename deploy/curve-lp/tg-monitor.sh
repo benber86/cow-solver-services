@@ -26,7 +26,6 @@ TG_TRADES_THREAD=${TG_TRADES_THREAD:-3}             # Legacy/default trades topi
 TG_TRADES_THREAD_MAINNET=${TG_TRADES_THREAD_MAINNET:-$TG_TRADES_THREAD}
 TG_TRADES_THREAD_ARBITRUM=${TG_TRADES_THREAD_ARBITRUM:-$TG_TRADES_THREAD}
 TG_TRADES_THREAD_GNOSIS=${TG_TRADES_THREAD_GNOSIS:-$TG_TRADES_THREAD}
-TG_WINS_CHAT_ID=${TG_WINS_CHAT_ID-$TG_CHAT_ID}     # Optional separate wins channel
 TG_WINS_THREAD=${TG_WINS_THREAD-$TG_TRADES_THREAD}
 TG_WINS_THREAD_MAINNET=${TG_WINS_THREAD_MAINNET-$TG_WINS_THREAD}
 TG_WINS_THREAD_ARBITRUM=${TG_WINS_THREAD_ARBITRUM-$TG_WINS_THREAD}
@@ -88,7 +87,7 @@ send_tg() {
 send_win_tg() {
     local chain="$1"
     local text="$2"
-    send_tg_to_chat "$TG_WINS_CHAT_ID" "$(chain_wins_thread "$chain")" "$text" ""
+    send_tg_to_chat "$TG_CHAT_ID" "$(chain_wins_thread "$chain")" "$text" ""
 }
 
 service_chain() {
@@ -384,7 +383,6 @@ send_win_notifications_for_candidate() {
     local uid="$3"
 
     [ "$env_name" = "prod" ] || return
-    [ -n "$TG_WINS_CHAT_ID" ] || return
     [ "$uid" != "???" ] || return
 
     local tx_hash block_number sell_amount buy_amount sell_token buy_token score ranking key
@@ -424,7 +422,6 @@ send_tg "$TG_STATS_THREAD" "🟢 Solver monitor started
 
 Watching: mainnet, arbitrum, gnosis
 Trades threads: mainnet=${TG_TRADES_THREAD_MAINNET:-default}, arbitrum=${TG_TRADES_THREAD_ARBITRUM:-default}, gnosis=${TG_TRADES_THREAD_GNOSIS:-default}
-Wins chat: ${TG_WINS_CHAT_ID:-disabled}
 Wins threads: mainnet=${TG_WINS_THREAD_MAINNET:-default}, arbitrum=${TG_WINS_THREAD_ARBITRUM:-default}, gnosis=${TG_WINS_THREAD_GNOSIS:-default}"
 
 while true; do

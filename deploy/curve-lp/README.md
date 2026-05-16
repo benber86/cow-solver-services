@@ -235,20 +235,20 @@ routed by chain:
 Prod and staging notifications for the same chain land in the same Telegram
 topic; the message body includes `Chain:` and `Env:` so you can tell them apart.
 
-Confirmed win notifications can go to a separate chat or topic:
+Confirmed win notifications are sent to `TG_CHAT_ID` and can use separate
+topics:
 
 ```
-TG_WINS_CHAT_ID=-100...
 TG_WINS_THREAD=
 TG_WINS_THREAD_MAINNET=
 TG_WINS_THREAD_ARBITRUM=
 TG_WINS_THREAD_GNOSIS=
 ```
 
-If `TG_WINS_CHAT_ID` is omitted, wins use `TG_CHAT_ID`. If a wins thread is
-omitted, it falls back to `TG_WINS_THREAD`; setting a thread variable to an
-empty value is valid for a non-forum channel. The monitor keeps a bounded
-`processed/tg-wins-seen.txt` state file to avoid duplicate win alerts.
+If a per-chain wins thread is omitted, it falls back to `TG_WINS_THREAD`;
+setting a thread variable to an empty value is valid for a non-forum channel.
+The monitor keeps a bounded `processed/tg-wins-seen.txt` state file to avoid
+duplicate win alerts.
 
 `monitor.sh` is still mainnet-only unless extended separately.
 
