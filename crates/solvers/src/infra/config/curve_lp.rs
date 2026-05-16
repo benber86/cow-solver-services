@@ -113,6 +113,16 @@ struct Config {
     /// If set, general orders with missing reference prices are skipped.
     #[serde(default)]
     max_general_order_market_deviation_bps: Option<u32>,
+
+    /// Maximum absolute validity window for non-LP general orders, in seconds.
+    /// If set, long-lived general orders are skipped before routing.
+    #[serde(default)]
+    max_general_order_validity_secs: Option<u64>,
+
+    /// If true, non-LP general orders with pre/post interactions, flashloan
+    /// hints, or wrappers are skipped before routing.
+    #[serde(default)]
+    skip_general_orders_with_hooks: bool,
 }
 
 fn default_slippage_bps() -> u32 {
@@ -183,6 +193,8 @@ pub async fn load(path: &Path) -> curve_lp::Config {
         max_general_orders_per_auction: config.max_general_orders_per_auction,
         max_general_orders_per_pair: config.max_general_orders_per_pair,
         max_general_order_market_deviation_bps: config.max_general_order_market_deviation_bps,
+        max_general_order_validity_secs: config.max_general_order_validity_secs,
+        skip_general_orders_with_hooks: config.skip_general_orders_with_hooks,
     }
 }
 

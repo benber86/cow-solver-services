@@ -58,7 +58,10 @@ pub fn into_domain(auction: Auction) -> Result<auction::Auction, Error> {
                     Class::Market => order::Class::Market,
                     Class::Limit => order::Class::Limit,
                 },
+                valid_to: order.valid_to,
                 partially_fillable: order.partially_fillable,
+                has_pre_interactions: !order.pre_interactions.is_empty(),
+                has_post_interactions: !order.post_interactions.is_empty(),
                 flashloan_hint: order
                     .flashloan_hint
                     .clone()

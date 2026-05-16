@@ -171,14 +171,18 @@ Shared safety knobs across all chain configs:
 - `max-quote-deviation-bps = 300` rejects API/on-chain quote drift above 3%
 - `max-general-order-market-deviation-bps = 200` skips non-LP general orders
   whose limit price is more than 2% off the auction reference prices
+- `max-general-order-validity-secs = 86400` skips non-LP general orders that
+  remain valid for more than 1 day
+- `skip-general-orders-with-hooks = true` skips non-LP general orders with
+  pre/post interactions, flashloan hints, or wrappers
 
 Sidechain general-order caps keep broad routing opportunistic instead of
 letting common pairs consume the whole auction:
 - `max-general-orders-per-auction = 24` on Mainnet/Arbitrum, `48` on Gnosis
 - `max-general-orders-per-pair = 2` on Mainnet/Arbitrum, `3` on Gnosis
 
-These caps apply only to non-LP orders. LP-priority orders are always attempted
-first and are not capped by these settings.
+These filters and caps apply only to non-LP orders. LP-priority orders are
+always attempted first and are not capped by these settings.
 
 ### Secrets
 

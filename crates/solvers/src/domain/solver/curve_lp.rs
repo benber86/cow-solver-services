@@ -25,7 +25,7 @@ use {
         collections::{HashMap, HashSet},
         fmt,
         sync::{Arc, Mutex},
-        time::{Duration, Instant},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     },
     tracing::Instrument,
 };
@@ -206,6 +206,12 @@ pub struct Config {
     /// Maximum accepted off-market deviation for non-LP general orders, in bps.
     /// `None` disables the pre-router marketability filter.
     pub max_general_order_market_deviation_bps: Option<u32>,
+    /// Maximum absolute validity window for non-LP general orders, in seconds.
+    /// `None` disables the long-lived general-order filter.
+    pub max_general_order_validity_secs: Option<u64>,
+    /// Skip non-LP general orders that carry hooks, flashloan hints, or
+    /// wrappers. LP-priority orders and quote requests bypass this.
+    pub skip_general_orders_with_hooks: bool,
 }
 
 struct Inner {
@@ -225,6 +231,8 @@ struct Inner {
     max_general_orders_per_auction: Option<usize>,
     max_general_orders_per_pair: Option<usize>,
     max_general_order_market_deviation_bps: Option<u32>,
+    max_general_order_validity_secs: Option<u64>,
+    skip_general_orders_with_hooks: bool,
     general_order_failure_backoff: Mutex<HashMap<order::Uid, Instant>>,
 }
 
@@ -234,6 +242,8 @@ struct SelectedCounts {
     priority: usize,
     general: usize,
     marketability_filtered_general: usize,
+    validity_filtered_general: usize,
+    hook_filtered_general: usize,
     backoff_filtered_general: usize,
 }
 
@@ -312,6 +322,8 @@ impl Solver {
                 max_general_orders_per_pair: config.max_general_orders_per_pair,
                 max_general_order_market_deviation_bps: config
                     .max_general_order_market_deviation_bps,
+                max_general_order_validity_secs: config.max_general_order_validity_secs,
+                skip_general_orders_with_hooks: config.skip_general_orders_with_hooks,
                 general_order_failure_backoff: Mutex::new(HashMap::new()),
             }),
         }
@@ -339,9 +351,11 @@ impl Solver {
                 self.inner.rejection_reason(order).is_none() && self.inner.is_priority_order(order)
             })
             .count();
-        let selected_counts = self.inner.selected_counts(&auction.orders, &auction.tokens);
         let auction_id = auction.id;
         let is_quote = matches!(auction.id, auction::Id::Quote);
+        let selected_counts =
+            self.inner
+                .selected_counts(&auction.orders, &auction.tokens, is_quote);
 
         // For quote auctions, extract token info before moving auction
         let (quote_sell_token, quote_buy_token, quote_sell_amount) = if is_quote {
@@ -362,6 +376,8 @@ impl Solver {
             selected_priority_orders = selected_counts.priority,
             selected_general_orders = selected_counts.general,
             marketability_filtered_general_orders = selected_counts.marketability_filtered_general,
+            validity_filtered_general_orders = selected_counts.validity_filtered_general,
+            hook_filtered_general_orders = selected_counts.hook_filtered_general,
             backoff_filtered_general_orders = selected_counts.backoff_filtered_general,
             remaining_ms = remaining.as_millis(),
             "starting Curve LP solver"
@@ -393,6 +409,8 @@ impl Solver {
                     selected_general_orders = selected_counts.general,
                     marketability_filtered_general_orders =
                         selected_counts.marketability_filtered_general,
+                    validity_filtered_general_orders = selected_counts.validity_filtered_general,
+                    hook_filtered_general_orders = selected_counts.hook_filtered_general,
                     backoff_filtered_general_orders = selected_counts.backoff_filtered_general,
                     remaining_ms = remaining.as_millis(),
                     "reached timeout while solving Curve LP orders"
@@ -418,6 +436,8 @@ impl Solver {
             selected_priority_orders = selected_counts.priority,
             selected_general_orders = selected_counts.general,
             marketability_filtered_general_orders = selected_counts.marketability_filtered_general,
+            validity_filtered_general_orders = selected_counts.validity_filtered_general,
+            hook_filtered_general_orders = selected_counts.hook_filtered_general,
             backoff_filtered_general_orders = selected_counts.backoff_filtered_general,
             num_solutions = solutions.len(),
             elapsed_ms = elapsed.as_millis() as u64,
@@ -468,7 +488,7 @@ impl Inner {
                 Some(_) => false,
             })
             .collect();
-        let selected = self.select_orders(supported, &auction.tokens);
+        let selected = self.select_orders(supported, &auction.tokens, is_quote);
 
         let mut stream = futures::stream::iter(selected.into_iter().map(|(i, order)| {
             let tokens = &auction.tokens;
@@ -669,6 +689,28 @@ impl Inner {
         }
     }
 
+    fn general_validity_rejection_reason(
+        &self,
+        order: &Order,
+        now_epoch_secs: u64,
+    ) -> Option<&'static str> {
+        let max_validity_secs = self.max_general_order_validity_secs?;
+        let max_valid_to = now_epoch_secs.saturating_add(max_validity_secs);
+        if u64::from(order.valid_to) > max_valid_to {
+            Some("validity_too_long")
+        } else {
+            None
+        }
+    }
+
+    fn general_hook_rejection_reason(&self, order: &Order) -> Option<&'static str> {
+        if self.skip_general_orders_with_hooks && order.has_hooks() {
+            Some("hooks_not_supported_for_general_order")
+        } else {
+            None
+        }
+    }
+
     fn general_order_backoff_active(&self, order: &Order) -> bool {
         let now = Instant::now();
         let mut backoff = self
@@ -714,16 +756,21 @@ impl Inner {
         &self,
         supported: Vec<(usize, Order)>,
         tokens: &Tokens,
+        is_quote: bool,
     ) -> Vec<(usize, Order)> {
         let mut priority = Vec::new();
         let mut general = Vec::new();
         let mut marketability_filtered_general = 0usize;
+        let mut validity_filtered_general = 0usize;
+        let mut hook_filtered_general = 0usize;
         let mut backoff_filtered_general = 0usize;
+        let now_epoch_secs = current_epoch_secs();
 
         for item in supported {
             if self.is_priority_order(&item.1) {
                 priority.push(item);
-            } else if let Some(reason) = self.general_marketability_rejection_reason(&item.1, tokens)
+            } else if let Some(reason) =
+                self.general_marketability_rejection_reason(&item.1, tokens)
             {
                 marketability_filtered_general += 1;
                 tracing::debug!(
@@ -732,6 +779,38 @@ impl Inner {
                     buy_token = ?item.1.buy.token,
                     reason,
                     "general order skipped by marketability filter"
+                );
+            } else if let Some(reason) = if is_quote {
+                None
+            } else {
+                self.general_validity_rejection_reason(&item.1, now_epoch_secs)
+            } {
+                validity_filtered_general += 1;
+                tracing::debug!(
+                    order_uid = %item.1.uid,
+                    sell_token = ?item.1.sell.token,
+                    buy_token = ?item.1.buy.token,
+                    valid_to = item.1.valid_to,
+                    max_general_order_validity_secs = self.max_general_order_validity_secs,
+                    reason,
+                    "general order skipped by validity filter"
+                );
+            } else if let Some(reason) = if is_quote {
+                None
+            } else {
+                self.general_hook_rejection_reason(&item.1)
+            } {
+                hook_filtered_general += 1;
+                tracing::debug!(
+                    order_uid = %item.1.uid,
+                    sell_token = ?item.1.sell.token,
+                    buy_token = ?item.1.buy.token,
+                    has_pre_interactions = item.1.has_pre_interactions,
+                    has_post_interactions = item.1.has_post_interactions,
+                    has_flashloan_hint = item.1.flashloan_hint.is_some(),
+                    wrappers = item.1.wrappers.len(),
+                    reason,
+                    "general order skipped by hook filter"
                 );
             } else if self.general_order_backoff_active(&item.1) {
                 backoff_filtered_general += 1;
@@ -775,10 +854,14 @@ impl Inner {
             priority_orders = priority.len(),
             selected_general_orders = general.len(),
             marketability_filtered_general_orders = marketability_filtered_general,
+            validity_filtered_general_orders = validity_filtered_general,
+            hook_filtered_general_orders = hook_filtered_general,
             backoff_filtered_general_orders = backoff_filtered_general,
             max_general_orders_per_auction = self.max_general_orders_per_auction,
             max_general_orders_per_pair = self.max_general_orders_per_pair,
             max_general_order_market_deviation_bps = self.max_general_order_market_deviation_bps,
+            max_general_order_validity_secs = self.max_general_order_validity_secs,
+            skip_general_orders_with_hooks = self.skip_general_orders_with_hooks,
             "selected Curve LP solver orders"
         );
 
@@ -786,11 +869,14 @@ impl Inner {
         priority
     }
 
-    fn selected_counts(&self, orders: &[Order], tokens: &Tokens) -> SelectedCounts {
+    fn selected_counts(&self, orders: &[Order], tokens: &Tokens, is_quote: bool) -> SelectedCounts {
         let mut priority = 0usize;
         let mut general = Vec::new();
         let mut marketability_filtered_general = 0usize;
+        let mut validity_filtered_general = 0usize;
+        let mut hook_filtered_general = 0usize;
         let mut backoff_filtered_general = 0usize;
+        let now_epoch_secs = current_epoch_secs();
 
         for (i, order) in orders
             .iter()
@@ -804,6 +890,14 @@ impl Inner {
                 .is_some()
             {
                 marketability_filtered_general += 1;
+            } else if !is_quote
+                && self
+                    .general_validity_rejection_reason(order, now_epoch_secs)
+                    .is_some()
+            {
+                validity_filtered_general += 1;
+            } else if !is_quote && self.general_hook_rejection_reason(order).is_some() {
+                hook_filtered_general += 1;
             } else if self.general_order_backoff_active(order) {
                 backoff_filtered_general += 1;
             } else {
@@ -840,6 +934,8 @@ impl Inner {
             priority,
             general: general.len(),
             marketability_filtered_general,
+            validity_filtered_general,
+            hook_filtered_general,
             backoff_filtered_general,
         }
     }
@@ -1399,6 +1495,13 @@ fn order_value(amount: eth::U256, price: auction::Price) -> eth::U256 {
     amount.saturating_mul(price.0.0) / eth::U256::from(TOKEN_PRICE_BASE)
 }
 
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 fn order_side_key(side: order::Side) -> u8 {
     match side {
         order::Side::Buy => 0,
@@ -1692,7 +1795,10 @@ mod tests {
             },
             side: order::Side::Buy,
             class: order::Class::Market,
+            valid_to: u32::MAX,
             partially_fillable: false,
+            has_pre_interactions: false,
+            has_post_interactions: false,
             flashloan_hint: None,
             wrappers: vec![],
         }
@@ -1775,6 +1881,8 @@ mod tests {
             max_general_orders_per_auction: None,
             max_general_orders_per_pair: None,
             max_general_order_market_deviation_bps: None,
+            max_general_order_validity_secs: None,
+            skip_general_orders_with_hooks: false,
             general_order_failure_backoff: Mutex::new(HashMap::new()),
         }
     }
@@ -1937,7 +2045,10 @@ mod tests {
             },
             side: order::Side::Sell,
             class: order::Class::Market,
+            valid_to: u32::MAX,
             partially_fillable: false,
+            has_pre_interactions: false,
+            has_post_interactions: false,
             flashloan_hint: None,
             wrappers: vec![],
         }
@@ -1974,6 +2085,16 @@ mod tests {
 
     fn with_uid(mut order: Order, byte: u8) -> Order {
         order.uid = order::Uid([byte; 56]);
+        order
+    }
+
+    fn with_valid_to(mut order: Order, valid_to: u32) -> Order {
+        order.valid_to = valid_to;
+        order
+    }
+
+    fn with_pre_interactions(mut order: Order) -> Order {
+        order.has_pre_interactions = true;
         order
     }
 
@@ -2129,7 +2250,7 @@ mod tests {
         ];
         let tokens = tokens_with_unit_prices(&[lp, usdc, weth, usdt]);
 
-        let selected = inner.select_orders(orders, &tokens);
+        let selected = inner.select_orders(orders, &tokens, false);
         let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
 
         // Both LP orders are retained and come first, even though their
@@ -2156,7 +2277,7 @@ mod tests {
         ];
         let tokens = tokens_with_unit_prices(&[lp, usdc, weth]);
 
-        let selected = inner.select_orders(orders, &tokens);
+        let selected = inner.select_orders(orders, &tokens, false);
         let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
 
         // General order 0 is >2% off-market and skipped. The LP-priority order
@@ -2178,11 +2299,90 @@ mod tests {
         ];
         let tokens = tokens_with_unit_prices(&[usdc, weth]);
 
-        let counts = inner.selected_counts(&orders, &tokens);
+        let counts = inner.selected_counts(&orders, &tokens, false);
         assert_eq!(counts.total, 1);
         assert_eq!(counts.priority, 0);
         assert_eq!(counts.general, 1);
         assert_eq!(counts.marketability_filtered_general, 1);
+    }
+
+    #[test]
+    fn select_orders_filters_long_lived_general_orders_only() {
+        let lp = eth::Address::repeat_byte(0x01);
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+        let now = current_epoch_secs();
+
+        let mut inner = test_inner(100, 50);
+        inner.lp_tokens = Some([lp].into_iter().collect());
+        inner.token_allowlist = Some([lp, usdc, weth].into_iter().collect());
+        inner.max_general_order_validity_secs = Some(86_400);
+
+        let orders = vec![
+            (
+                0,
+                with_valid_to(
+                    sell_order(usdc, weth),
+                    now.saturating_add(2 * 86_400) as u32,
+                ),
+            ),
+            (
+                1,
+                with_valid_to(sell_order(usdc, weth), now.saturating_add(3_600) as u32),
+            ),
+            (2, with_valid_to(sell_order(lp, usdc), u32::MAX)),
+        ];
+        let tokens = tokens_with_unit_prices(&[lp, usdc, weth]);
+
+        let selected = inner.select_orders(orders, &tokens, false);
+        let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
+
+        assert_eq!(selected_indices, vec![2, 1]);
+    }
+
+    #[test]
+    fn select_orders_filters_hooked_general_orders_only() {
+        let lp = eth::Address::repeat_byte(0x01);
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+
+        let mut inner = test_inner(100, 50);
+        inner.lp_tokens = Some([lp].into_iter().collect());
+        inner.token_allowlist = Some([lp, usdc, weth].into_iter().collect());
+        inner.skip_general_orders_with_hooks = true;
+
+        let orders = vec![
+            (0, with_pre_interactions(sell_order(usdc, weth))),
+            (1, sell_order(usdc, weth)),
+            (2, with_pre_interactions(sell_order(lp, usdc))),
+        ];
+        let tokens = tokens_with_unit_prices(&[lp, usdc, weth]);
+
+        let selected = inner.select_orders(orders, &tokens, false);
+        let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
+
+        assert_eq!(selected_indices, vec![2, 1]);
+    }
+
+    #[test]
+    fn quote_requests_bypass_general_validity_and_hook_filters() {
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+
+        let mut inner = test_inner(100, 50);
+        inner.max_general_order_validity_secs = Some(86_400);
+        inner.skip_general_orders_with_hooks = true;
+
+        let orders = vec![(
+            0,
+            with_pre_interactions(with_valid_to(sell_order(usdc, weth), u32::MAX)),
+        )];
+        let tokens = tokens_with_unit_prices(&[usdc, weth]);
+
+        let selected = inner.select_orders(orders, &tokens, true);
+        let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
+
+        assert_eq!(selected_indices, vec![0]);
     }
 
     #[test]
@@ -2245,11 +2445,11 @@ mod tests {
         ];
         let tokens = tokens_with_unit_prices(&[lp, usdc, weth]);
 
-        let selected = inner.select_orders(orders, &tokens);
+        let selected = inner.select_orders(orders, &tokens, false);
         let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
         assert_eq!(selected_indices, vec![2, 1]);
 
-        let counts = inner.selected_counts(&[bad_general], &tokens);
+        let counts = inner.selected_counts(&[bad_general], &tokens, false);
         assert_eq!(counts.total, 0);
         assert_eq!(counts.backoff_filtered_general, 1);
     }

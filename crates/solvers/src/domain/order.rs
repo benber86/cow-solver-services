@@ -15,7 +15,10 @@ pub struct Order {
     pub buy: eth::Asset,
     pub side: Side,
     pub class: Class,
+    pub valid_to: u32,
     pub partially_fillable: bool,
+    pub has_pre_interactions: bool,
+    pub has_post_interactions: bool,
     pub flashloan_hint: Option<FlashloanHint>,
     pub wrappers: Vec<WrapperCall>,
 }
@@ -24,6 +27,13 @@ impl Order {
     /// Returns `true` if the order expects a solver-computed fee.
     pub fn solver_determines_fee(&self) -> bool {
         self.class == Class::Limit
+    }
+
+    pub fn has_hooks(&self) -> bool {
+        self.has_pre_interactions
+            || self.has_post_interactions
+            || self.flashloan_hint.is_some()
+            || !self.wrappers.is_empty()
     }
 }
 
