@@ -150,7 +150,7 @@ a chain.
 
 ### Token filters
 
-Three filter knobs control what the solver engages with and which orders it
+Four filter knobs control what the solver engages with and which orders it
 tries first. All are optional.
 
 | filter                 | semantics                                                            | use when                                          |
@@ -158,12 +158,14 @@ tries first. All are optional.
 | `lp-tokens`            | either-side LP set. Alone, it is a hard filter; with `token-allowlist`, it becomes priority ordering | "LP orders first, general Curve pairs if time remains" |
 | `allowed-buy-tokens`   | either-side — at least one side must be in this list (misleadingly named; symmetric) | historical crvUSD-style filter                    |
 | `token-allowlist`      | **both-sides** — reject if either `sell.token` or `buy.token` is outside `token-allowlist ∪ lp-tokens` | "confine the solver to a known universe"          |
+| `general-edge-tokens`  | real-auction, non-LP-only — at least one side must be in this list; quote requests and LP-priority orders bypass it | "avoid generic blue-chip flow unless it touches a Curve-edge token" |
 
 Mainnet uses `lp-tokens` as a hard LP-specialist filter. Arbitrum/Gnosis use
-`token-allowlist` as a broad safety universe and `lp-tokens` as priority:
-LP-involved orders are attempted first, then non-LP allowlisted pairs consume
-whatever deadline remains. Leaving all three omitted attempts every order and
-can cause deadline timeouts.
+`token-allowlist` as a broad safety universe, `lp-tokens` as priority, and
+`general-edge-tokens` to keep non-LP general attempts focused on chain-specific
+Curve-edge assets. LP-involved orders are attempted first, then eligible non-LP
+allowlisted pairs consume whatever deadline remains. Leaving all four omitted
+attempts every order and can cause deadline timeouts.
 
 Shared safety knobs across all chain configs:
 - `slippage-bps = 100` keeps a 1% calldata revert buffer
@@ -180,6 +182,9 @@ Sidechain general-order caps keep broad routing opportunistic instead of
 letting common pairs consume the whole auction:
 - `max-general-orders-per-auction = 24` on Mainnet/Arbitrum, `48` on Gnosis
 - `max-general-orders-per-pair = 2` on Mainnet/Arbitrum, `3` on Gnosis
+- `general-edge-tokens` is chain-specific and should list tokens where Curve
+  routing has a plausible edge; keep generic counterparties like USDC/WETH in
+  `token-allowlist` rather than here
 
 These filters and caps apply only to non-LP orders. LP-priority orders are
 always attempted first and are not capped by these settings.

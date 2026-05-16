@@ -60,6 +60,12 @@ struct Config {
     #[serde(default)]
     token_allowlist: Option<Vec<eth::Address>>,
 
+    /// Optional non-LP general-order edge set. If set, real-auction general
+    /// orders must have at least one side in this list. LP-priority orders and
+    /// quote requests bypass it.
+    #[serde(default)]
+    general_edge_tokens: Option<Vec<eth::Address>>,
+
     /// Curve Router API URL.
     curve_api_url: Url,
 
@@ -182,6 +188,7 @@ pub async fn load(path: &Path) -> curve_lp::Config {
         lp_tokens: config.lp_tokens,
         allowed_buy_tokens: config.allowed_buy_tokens,
         token_allowlist: config.token_allowlist,
+        general_edge_tokens: config.general_edge_tokens,
         curve_api_url: config.curve_api_url,
         curve_price_api_url: config.curve_price_api_url,
         node_url: config.node_url,
@@ -342,6 +349,35 @@ token-allowlist = [
         let raw = minimal_toml("");
         let parsed: Config = toml::de::from_str(&raw).expect("should parse");
         assert!(parsed.token_allowlist.is_none());
+    }
+
+    #[test]
+    fn general_edge_tokens_populated_parses_and_preserves_addresses() {
+        let raw = minimal_toml(
+            r#"
+general-edge-tokens = [
+    "0x498Bf2B1e120FeD3ad3D42EA2165E9b73f99C1e5",
+    "0x17FC002b466eEc40DaE837Fc4bE5c67993ddBd6F",
+]
+"#,
+        );
+        let parsed: Config = toml::de::from_str(&raw).expect("should parse");
+        let list = parsed
+            .general_edge_tokens
+            .expect("general_edge_tokens should be present");
+        assert_eq!(list.len(), 2);
+        assert_eq!(
+            list[0],
+            "0x498Bf2B1e120FeD3ad3D42EA2165E9b73f99C1e5"
+                .parse::<eth::Address>()
+                .unwrap()
+        );
+        assert_eq!(
+            list[1],
+            "0x17FC002b466eEc40DaE837Fc4bE5c67993ddBd6F"
+                .parse::<eth::Address>()
+                .unwrap()
+        );
     }
 
     #[test]

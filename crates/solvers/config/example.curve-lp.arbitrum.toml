@@ -20,6 +20,12 @@ price-api-chain = "arbitrum"
 #     "0xa7CF5543a27BaDC3a74d51EA0A02E84799140E4E",  # sUSDai/USDC
 #     "0xBeb177D05ac67330224291B259c401366C0974B4",  # alETH/WETH
 # ]
+#
+# Optional non-LP real-auction filter. If set, general orders must touch at
+# least one edge token; LP-priority orders and quote requests bypass it.
+# general-edge-tokens = [
+#     "0x498Bf2B1e120FeD3ad3D42EA2165E9b73f99C1e5",  # crvUSD
+# ]
 
 # Curve Router API URL (chain selected via chainId query param). Used for
 # sidechain telemetry comparison even when route-provider = "new-router".

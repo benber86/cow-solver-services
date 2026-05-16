@@ -180,6 +180,10 @@ pub struct Config {
     /// use this one when you want to confine the solver to a known universe
     /// of tokens regardless of whether an LP is involved.
     pub token_allowlist: Option<Vec<eth::Address>>,
+    /// Optional edge-token set for non-LP real-auction orders. If set, a
+    /// general order must have at least one side in this set. LP-priority
+    /// orders and quote requests bypass it.
+    pub general_edge_tokens: Option<Vec<eth::Address>>,
     /// Curve Router API URL.
     pub curve_api_url: Url,
     /// Curve Price API URL.
@@ -219,6 +223,7 @@ struct Inner {
     lp_tokens: Option<HashSet<eth::Address>>,
     allowed_buy_tokens: Option<HashSet<eth::Address>>,
     token_allowlist: Option<HashSet<eth::Address>>,
+    general_edge_tokens: Option<HashSet<eth::Address>>,
     provider: Arc<dyn RouteProvider>,
     /// Best-effort legacy probe alongside new-router real solves on
     /// sidechains. `None` on mainnet (legacy is the primary path so the
@@ -241,6 +246,7 @@ struct SelectedCounts {
     total: usize,
     priority: usize,
     general: usize,
+    edge_filtered_general: usize,
     marketability_filtered_general: usize,
     validity_filtered_general: usize,
     hook_filtered_general: usize,
@@ -254,6 +260,7 @@ impl Solver {
             lp_token_filter_count = config.lp_tokens.as_ref().map_or(0, Vec::len),
             buy_token_filter_count = config.allowed_buy_tokens.as_ref().map_or(0, Vec::len),
             token_allowlist_count = config.token_allowlist.as_ref().map_or(0, Vec::len),
+            general_edge_token_count = config.general_edge_tokens.as_ref().map_or(0, Vec::len),
             "initialized Curve LP token filters"
         );
 
@@ -312,6 +319,7 @@ impl Solver {
                 lp_tokens: config.lp_tokens.map(|v| v.into_iter().collect()),
                 allowed_buy_tokens: config.allowed_buy_tokens.map(|v| v.into_iter().collect()),
                 token_allowlist: config.token_allowlist.map(|v| v.into_iter().collect()),
+                general_edge_tokens: config.general_edge_tokens.map(|v| v.into_iter().collect()),
                 provider,
                 legacy_telemetry,
                 price_client,
@@ -375,6 +383,7 @@ impl Solver {
             selected_orders = selected_counts.total,
             selected_priority_orders = selected_counts.priority,
             selected_general_orders = selected_counts.general,
+            edge_filtered_general_orders = selected_counts.edge_filtered_general,
             marketability_filtered_general_orders = selected_counts.marketability_filtered_general,
             validity_filtered_general_orders = selected_counts.validity_filtered_general,
             hook_filtered_general_orders = selected_counts.hook_filtered_general,
@@ -407,6 +416,7 @@ impl Solver {
                     selected_orders = selected_counts.total,
                     selected_priority_orders = selected_counts.priority,
                     selected_general_orders = selected_counts.general,
+                    edge_filtered_general_orders = selected_counts.edge_filtered_general,
                     marketability_filtered_general_orders =
                         selected_counts.marketability_filtered_general,
                     validity_filtered_general_orders = selected_counts.validity_filtered_general,
@@ -435,6 +445,7 @@ impl Solver {
             selected_orders = selected_counts.total,
             selected_priority_orders = selected_counts.priority,
             selected_general_orders = selected_counts.general,
+            edge_filtered_general_orders = selected_counts.edge_filtered_general,
             marketability_filtered_general_orders = selected_counts.marketability_filtered_general,
             validity_filtered_general_orders = selected_counts.validity_filtered_general,
             hook_filtered_general_orders = selected_counts.hook_filtered_general,
@@ -689,6 +700,22 @@ impl Inner {
         }
     }
 
+    fn general_edge_rejection_reason(
+        &self,
+        order: &Order,
+        is_quote: bool,
+    ) -> Option<&'static str> {
+        if is_quote {
+            return None;
+        }
+        let edge_tokens = self.general_edge_tokens.as_ref()?;
+        if edge_tokens.contains(&order.sell.token.0) || edge_tokens.contains(&order.buy.token.0) {
+            None
+        } else {
+            Some("no_general_edge_token_match")
+        }
+    }
+
     fn general_validity_rejection_reason(
         &self,
         order: &Order,
@@ -760,6 +787,7 @@ impl Inner {
     ) -> Vec<(usize, Order)> {
         let mut priority = Vec::new();
         let mut general = Vec::new();
+        let mut edge_filtered_general = 0usize;
         let mut marketability_filtered_general = 0usize;
         let mut validity_filtered_general = 0usize;
         let mut hook_filtered_general = 0usize;
@@ -769,6 +797,15 @@ impl Inner {
         for item in supported {
             if self.is_priority_order(&item.1) {
                 priority.push(item);
+            } else if let Some(reason) = self.general_edge_rejection_reason(&item.1, is_quote) {
+                edge_filtered_general += 1;
+                tracing::debug!(
+                    order_uid = %item.1.uid,
+                    sell_token = ?item.1.sell.token,
+                    buy_token = ?item.1.buy.token,
+                    reason,
+                    "general order skipped by edge-token filter"
+                );
             } else if let Some(reason) =
                 self.general_marketability_rejection_reason(&item.1, tokens)
             {
@@ -853,12 +890,14 @@ impl Inner {
         tracing::debug!(
             priority_orders = priority.len(),
             selected_general_orders = general.len(),
+            edge_filtered_general_orders = edge_filtered_general,
             marketability_filtered_general_orders = marketability_filtered_general,
             validity_filtered_general_orders = validity_filtered_general,
             hook_filtered_general_orders = hook_filtered_general,
             backoff_filtered_general_orders = backoff_filtered_general,
             max_general_orders_per_auction = self.max_general_orders_per_auction,
             max_general_orders_per_pair = self.max_general_orders_per_pair,
+            general_edge_token_count = self.general_edge_tokens.as_ref().map_or(0, HashSet::len),
             max_general_order_market_deviation_bps = self.max_general_order_market_deviation_bps,
             max_general_order_validity_secs = self.max_general_order_validity_secs,
             skip_general_orders_with_hooks = self.skip_general_orders_with_hooks,
@@ -872,6 +911,7 @@ impl Inner {
     fn selected_counts(&self, orders: &[Order], tokens: &Tokens, is_quote: bool) -> SelectedCounts {
         let mut priority = 0usize;
         let mut general = Vec::new();
+        let mut edge_filtered_general = 0usize;
         let mut marketability_filtered_general = 0usize;
         let mut validity_filtered_general = 0usize;
         let mut hook_filtered_general = 0usize;
@@ -885,6 +925,11 @@ impl Inner {
         {
             if self.is_priority_order(order) {
                 priority += 1;
+            } else if self
+                .general_edge_rejection_reason(order, is_quote)
+                .is_some()
+            {
+                edge_filtered_general += 1;
             } else if self
                 .general_marketability_rejection_reason(order, tokens)
                 .is_some()
@@ -933,6 +978,7 @@ impl Inner {
             total: priority + general.len(),
             priority,
             general: general.len(),
+            edge_filtered_general,
             marketability_filtered_general,
             validity_filtered_general,
             hook_filtered_general,
@@ -1872,6 +1918,7 @@ mod tests {
             lp_tokens: None,
             allowed_buy_tokens: None,
             token_allowlist: None,
+            general_edge_tokens: None,
             provider: Arc::new(NoopProvider),
             legacy_telemetry: None,
             price_client: price_api::Client::new("http://localhost:1".parse().unwrap()),
@@ -2286,6 +2333,33 @@ mod tests {
     }
 
     #[test]
+    fn select_orders_filters_general_orders_without_edge_tokens_only() {
+        let lp = eth::Address::repeat_byte(0x01);
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+        let crvusd = eth::Address::repeat_byte(0x04);
+
+        let mut inner = test_inner(100, 50);
+        inner.lp_tokens = Some([lp].into_iter().collect());
+        inner.token_allowlist = Some([lp, usdc, weth, crvusd].into_iter().collect());
+        inner.general_edge_tokens = Some([crvusd].into_iter().collect());
+
+        let orders = vec![
+            (0, sell_order(usdc, weth)),
+            (1, sell_order(crvusd, usdc)),
+            (2, sell_order(lp, usdc)),
+        ];
+        let tokens = tokens_with_unit_prices(&[lp, usdc, weth, crvusd]);
+
+        let selected = inner.select_orders(orders, &tokens, false);
+        let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
+
+        // The generic USDC/WETH order is skipped because neither side is an
+        // edge token. LP-priority orders bypass the edge filter entirely.
+        assert_eq!(selected_indices, vec![2, 1]);
+    }
+
+    #[test]
     fn selected_counts_include_marketability_filtered_general_orders() {
         let usdc = eth::Address::repeat_byte(0x02);
         let weth = eth::Address::repeat_byte(0x03);
@@ -2304,6 +2378,25 @@ mod tests {
         assert_eq!(counts.priority, 0);
         assert_eq!(counts.general, 1);
         assert_eq!(counts.marketability_filtered_general, 1);
+    }
+
+    #[test]
+    fn selected_counts_include_edge_filtered_general_orders() {
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+        let crvusd = eth::Address::repeat_byte(0x04);
+
+        let mut inner = test_inner(100, 50);
+        inner.general_edge_tokens = Some([crvusd].into_iter().collect());
+
+        let orders = vec![sell_order(usdc, weth), sell_order(crvusd, usdc)];
+        let tokens = tokens_with_unit_prices(&[usdc, weth, crvusd]);
+
+        let counts = inner.selected_counts(&orders, &tokens, false);
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.priority, 0);
+        assert_eq!(counts.general, 1);
+        assert_eq!(counts.edge_filtered_general, 1);
     }
 
     #[test]
@@ -2372,6 +2465,7 @@ mod tests {
         let mut inner = test_inner(100, 50);
         inner.max_general_order_validity_secs = Some(86_400);
         inner.skip_general_orders_with_hooks = true;
+        inner.general_edge_tokens = Some([eth::Address::repeat_byte(0x04)].into_iter().collect());
 
         let orders = vec![(
             0,

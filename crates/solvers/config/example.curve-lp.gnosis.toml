@@ -22,6 +22,12 @@ price-api-chain = "xdai"
 #     "0x0CA1C1eC4EBf3CC67a9f545fF90a3795b318cA4a",  # EURe/x3CRV
 #     "0x0b9036F639f4E7498aFA34751a2710159373fC7B",  # USDC.e/EURe
 # ]
+#
+# Optional non-LP real-auction filter. If set, general orders must touch at
+# least one edge token; LP-priority orders and quote requests bypass it.
+# general-edge-tokens = [
+#     "0xcB444e90D8198415266c6a2724b7900fb12FC56E",  # EURe
+# ]
 
 # Curve Router API URL (chain selected via chainId query param). Used for
 # sidechain telemetry comparison even when route-provider = "new-router".
