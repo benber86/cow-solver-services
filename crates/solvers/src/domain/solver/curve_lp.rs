@@ -24,8 +24,8 @@ use {
     std::{
         collections::{HashMap, HashSet},
         fmt,
-        sync::Arc,
-        time::Duration,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
     },
     tracing::Instrument,
 };
@@ -44,6 +44,10 @@ const PRICE_FETCH_TIMEOUT: Duration = Duration::from_millis(1200);
 /// Sidechain-only: legacy comparison probe budget. Tighter than the route
 /// timeout so a slow/down legacy never delays the real solve.
 const LEGACY_TELEMETRY_TIMEOUT: Duration = Duration::from_millis(1500);
+/// Failed non-LP general orders are skipped briefly by UID so stale/bad limit
+/// orders don't consume the same capped slots every auction.
+const GENERAL_ORDER_FAILURE_BACKOFF: Duration = Duration::from_secs(5 * 60);
+const MAX_GENERAL_ORDER_FAILURE_BACKOFF_ENTRIES: usize = 4096;
 
 // CoW native-price probe detection constants
 /// The sentinel sell_amount CoW uses for native price probes (2^144).
@@ -221,6 +225,7 @@ struct Inner {
     max_general_orders_per_auction: Option<usize>,
     max_general_orders_per_pair: Option<usize>,
     max_general_order_market_deviation_bps: Option<u32>,
+    general_order_failure_backoff: Mutex<HashMap<order::Uid, Instant>>,
 }
 
 #[derive(Clone, Copy)]
@@ -229,6 +234,7 @@ struct SelectedCounts {
     priority: usize,
     general: usize,
     marketability_filtered_general: usize,
+    backoff_filtered_general: usize,
 }
 
 impl Solver {
@@ -306,6 +312,7 @@ impl Solver {
                 max_general_orders_per_pair: config.max_general_orders_per_pair,
                 max_general_order_market_deviation_bps: config
                     .max_general_order_market_deviation_bps,
+                general_order_failure_backoff: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -355,6 +362,7 @@ impl Solver {
             selected_priority_orders = selected_counts.priority,
             selected_general_orders = selected_counts.general,
             marketability_filtered_general_orders = selected_counts.marketability_filtered_general,
+            backoff_filtered_general_orders = selected_counts.backoff_filtered_general,
             remaining_ms = remaining.as_millis(),
             "starting Curve LP solver"
         );
@@ -385,6 +393,7 @@ impl Solver {
                     selected_general_orders = selected_counts.general,
                     marketability_filtered_general_orders =
                         selected_counts.marketability_filtered_general,
+                    backoff_filtered_general_orders = selected_counts.backoff_filtered_general,
                     remaining_ms = remaining.as_millis(),
                     "reached timeout while solving Curve LP orders"
                 );
@@ -409,6 +418,7 @@ impl Solver {
             selected_priority_orders = selected_counts.priority,
             selected_general_orders = selected_counts.general,
             marketability_filtered_general_orders = selected_counts.marketability_filtered_general,
+            backoff_filtered_general_orders = selected_counts.backoff_filtered_general,
             num_solutions = solutions.len(),
             elapsed_ms = elapsed.as_millis() as u64,
             budget_ms = remaining.as_millis() as u64,
@@ -518,6 +528,7 @@ impl Inner {
                         Some((solved.solution.with_id(solution::Id(i as u64)), order))
                     }
                     Err(err) => {
+                        self.record_general_order_failure(&order, &err, is_quote);
                         tracing::warn!(order_uid = %order.uid, ?err, "failed to solve order");
                         None
                     }
@@ -652,6 +663,47 @@ impl Inner {
         }
     }
 
+    fn general_order_backoff_active(&self, order: &Order) -> bool {
+        let now = Instant::now();
+        let mut backoff = self
+            .general_order_failure_backoff
+            .lock()
+            .expect("general order backoff mutex poisoned");
+        match backoff.get(&order.uid).copied() {
+            Some(expires_at) if expires_at > now => true,
+            Some(_) => {
+                backoff.remove(&order.uid);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn record_general_order_failure(&self, order: &Order, err: &SolveError, is_quote: bool) {
+        if is_quote || self.is_priority_order(order) || !should_backoff_general_failure(err) {
+            return;
+        }
+
+        let now = Instant::now();
+        let expires_at = now + GENERAL_ORDER_FAILURE_BACKOFF;
+        let mut backoff = self
+            .general_order_failure_backoff
+            .lock()
+            .expect("general order backoff mutex poisoned");
+        backoff.insert(order.uid, expires_at);
+        if backoff.len() > MAX_GENERAL_ORDER_FAILURE_BACKOFF_ENTRIES {
+            backoff.retain(|_, expires_at| *expires_at > now);
+        }
+        tracing::debug!(
+            order_uid = %order.uid,
+            sell_token = ?order.sell.token,
+            buy_token = ?order.buy.token,
+            backoff_secs = GENERAL_ORDER_FAILURE_BACKOFF.as_secs(),
+            ?err,
+            "backing off failed general order"
+        );
+    }
+
     fn select_orders(
         &self,
         supported: Vec<(usize, Order)>,
@@ -660,6 +712,7 @@ impl Inner {
         let mut priority = Vec::new();
         let mut general = Vec::new();
         let mut marketability_filtered_general = 0usize;
+        let mut backoff_filtered_general = 0usize;
 
         for item in supported {
             if self.is_priority_order(&item.1) {
@@ -673,6 +726,14 @@ impl Inner {
                     buy_token = ?item.1.buy.token,
                     reason,
                     "general order skipped by marketability filter"
+                );
+            } else if self.general_order_backoff_active(&item.1) {
+                backoff_filtered_general += 1;
+                tracing::debug!(
+                    order_uid = %item.1.uid,
+                    sell_token = ?item.1.sell.token,
+                    buy_token = ?item.1.buy.token,
+                    "general order skipped by failure backoff"
                 );
             } else {
                 general.push(item);
@@ -708,6 +769,7 @@ impl Inner {
             priority_orders = priority.len(),
             selected_general_orders = general.len(),
             marketability_filtered_general_orders = marketability_filtered_general,
+            backoff_filtered_general_orders = backoff_filtered_general,
             max_general_orders_per_auction = self.max_general_orders_per_auction,
             max_general_orders_per_pair = self.max_general_orders_per_pair,
             max_general_order_market_deviation_bps = self.max_general_order_market_deviation_bps,
@@ -722,6 +784,7 @@ impl Inner {
         let mut priority = 0usize;
         let mut general = Vec::new();
         let mut marketability_filtered_general = 0usize;
+        let mut backoff_filtered_general = 0usize;
 
         for (i, order) in orders
             .iter()
@@ -735,6 +798,8 @@ impl Inner {
                 .is_some()
             {
                 marketability_filtered_general += 1;
+            } else if self.general_order_backoff_active(order) {
+                backoff_filtered_general += 1;
             } else {
                 general.push((i, order));
             }
@@ -769,6 +834,7 @@ impl Inner {
             priority,
             general: general.len(),
             marketability_filtered_general,
+            backoff_filtered_general,
         }
     }
 
@@ -1235,6 +1301,39 @@ fn sell_order_bid_output(
         .max(order_floor)
 }
 
+fn should_backoff_general_failure(err: &SolveError) -> bool {
+    match err {
+        SolveError::InsufficientOutput { .. } => true,
+        SolveError::Provider(route_provider::Error::CalldataUnavailable(msg)) => {
+            is_route_failure_backoff_message(msg)
+        }
+        SolveError::Provider(route_provider::Error::Api(api::Error::InvalidRoute(_))) => true,
+        SolveError::Provider(route_provider::Error::Api(api::Error::Api {
+            status,
+            message,
+        })) => *status == 422 || is_route_failure_backoff_message(message),
+        _ => false,
+    }
+}
+
+fn is_route_failure_backoff_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "http 422",
+        "http 503",
+        "min_out",
+        "no route",
+        "no_route",
+        "snapshot",
+        "sim_validation",
+        "simulator validation",
+        "repeated",
+        "below required",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 fn gas_price_to_gwei(gas_price: &auction::GasPrice) -> Option<f64> {
     let wei: u128 = gas_price.0.0.try_into().ok()?;
     Some((wei as f64) / 1e9)
@@ -1512,6 +1611,7 @@ mod tests {
             max_general_orders_per_auction: None,
             max_general_orders_per_pair: None,
             max_general_order_market_deviation_bps: None,
+            general_order_failure_backoff: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1706,6 +1806,11 @@ mod tests {
             },
             ..sell_order(sell, buy)
         }
+    }
+
+    fn with_uid(mut order: Order, byte: u8) -> Order {
+        order.uid = order::Uid([byte; 56]);
+        order
     }
 
     fn tokens_with_unit_prices(tokens: &[eth::Address]) -> auction::Tokens {
@@ -1914,5 +2019,39 @@ mod tests {
         assert_eq!(counts.priority, 0);
         assert_eq!(counts.general, 1);
         assert_eq!(counts.marketability_filtered_general, 1);
+    }
+
+    #[test]
+    fn select_orders_skips_backed_off_general_orders_only() {
+        let lp = eth::Address::repeat_byte(0x01);
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+
+        let mut inner = test_inner(100, 50);
+        inner.lp_tokens = Some([lp].into_iter().collect());
+        inner.token_allowlist = Some([lp, usdc, weth].into_iter().collect());
+
+        let bad_general = with_uid(sell_order(usdc, weth), 0xA1);
+        let ok_general = with_uid(sell_order(usdc, weth), 0xA2);
+        let lp_priority_same_uid = with_uid(sell_order(lp, usdc), 0xA1);
+        let err = SolveError::Provider(route_provider::Error::CalldataUnavailable(
+            "HTTP 422: min_out_exceeds_route_outputs".into(),
+        ));
+        inner.record_general_order_failure(&bad_general, &err, false);
+
+        let orders = vec![
+            (0, bad_general.clone()),
+            (1, ok_general),
+            (2, lp_priority_same_uid),
+        ];
+        let tokens = tokens_with_unit_prices(&[lp, usdc, weth]);
+
+        let selected = inner.select_orders(orders, &tokens);
+        let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
+        assert_eq!(selected_indices, vec![2, 1]);
+
+        let counts = inner.selected_counts(&[bad_general], &tokens);
+        assert_eq!(counts.total, 0);
+        assert_eq!(counts.backoff_filtered_general, 1);
     }
 }
