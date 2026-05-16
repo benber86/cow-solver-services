@@ -165,12 +165,17 @@ LP-involved orders are attempted first, then non-LP allowlisted pairs consume
 whatever deadline remains. Leaving all three omitted attempts every order and
 can cause deadline timeouts.
 
+Shared safety knobs across all chain configs:
+- `slippage-bps = 100` keeps a 1% calldata revert buffer
+- `bid-slippage-bps = 5` uses a 0.05% competitive bid haircut
+- `max-quote-deviation-bps = 300` rejects API/on-chain quote drift above 3%
+- `max-general-order-market-deviation-bps = 200` skips non-LP general orders
+  whose limit price is more than 2% off the auction reference prices
+
 Sidechain general-order caps keep broad routing opportunistic instead of
 letting common pairs consume the whole auction:
 - `max-general-orders-per-auction = 24` on Arbitrum, `48` on Gnosis
 - `max-general-orders-per-pair = 2` on Arbitrum, `3` on Gnosis
-- `max-general-order-market-deviation-bps = 200` skips non-LP general orders
-  whose limit price is more than 2% off the auction reference prices
 
 These caps apply only to non-LP orders. LP-priority orders are always attempted
 first and are not capped by these settings.
