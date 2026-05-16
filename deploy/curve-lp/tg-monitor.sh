@@ -161,6 +161,10 @@ explorer_order_url() {
     esac
 }
 
+valid_order_uid() {
+    [[ "$1" =~ ^0x[0-9a-fA-F]{112}$ ]]
+}
+
 explorer_tx_url() {
     local chain="$1"
     local tx="$2"
@@ -383,7 +387,7 @@ send_win_notifications_for_candidate() {
     local uid="$3"
 
     [ "$env_name" = "prod" ] || return
-    [ "$uid" != "???" ] || return
+    valid_order_uid "$uid" || return
 
     local tx_hash block_number sell_amount buy_amount sell_token buy_token score ranking key
     while IFS=$'\t' read -r tx_hash block_number sell_amount buy_amount sell_token buy_token score ranking; do
@@ -501,8 +505,13 @@ Legacy ref: ${legacy_out}"
                 msg+=" (Δ ${delta_bps}bps)"
             fi
         fi
-        msg+="
+        if valid_order_uid "$uid"; then
+            msg+="
 Order: $(explorer_order_url "$chain" "$uid")"
+        else
+            msg+="
+Order UID: unavailable"
+        fi
         send_tg "$thread_id" "$msg" ""
         send_win_notifications_for_candidate "$chain" "$env_name" "$uid"
     done < <(echo "$logs" | grep '"solved order"' | grep '"is_quote":false' || true)
