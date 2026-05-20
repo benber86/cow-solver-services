@@ -115,6 +115,15 @@ struct Config {
     #[serde(default)]
     max_general_orders_per_pair: Option<usize>,
 
+    /// Maximum regular non-edge non-LP orders to attempt after LP-priority and
+    /// edge-token general orders. Omit or set to 0 to disable fallback.
+    #[serde(default)]
+    max_regular_orders_per_auction: Option<usize>,
+
+    /// Maximum regular non-edge non-LP orders to attempt per pair.
+    #[serde(default)]
+    max_regular_orders_per_pair: Option<usize>,
+
     /// Maximum accepted off-market deviation for non-LP general orders, in bps.
     /// If set, general orders with missing reference prices are skipped.
     #[serde(default)]
@@ -199,6 +208,8 @@ pub async fn load(path: &Path) -> curve_lp::Config {
         route_provider,
         max_general_orders_per_auction: config.max_general_orders_per_auction,
         max_general_orders_per_pair: config.max_general_orders_per_pair,
+        max_regular_orders_per_auction: config.max_regular_orders_per_auction,
+        max_regular_orders_per_pair: config.max_regular_orders_per_pair,
         max_general_order_market_deviation_bps: config.max_general_order_market_deviation_bps,
         max_general_order_validity_secs: config.max_general_order_validity_secs,
         skip_general_orders_with_hooks: config.skip_general_orders_with_hooks,

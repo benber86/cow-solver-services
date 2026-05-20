@@ -207,6 +207,11 @@ pub struct Config {
     /// Maximum non-LP orders to attempt per (sell token, buy token, side).
     /// `None` means uncapped.
     pub max_general_orders_per_pair: Option<usize>,
+    /// Maximum regular non-edge non-LP orders to attempt after LP-priority and
+    /// edge-token general orders. `None` or `Some(0)` disables fallback.
+    pub max_regular_orders_per_auction: Option<usize>,
+    /// Maximum regular non-edge non-LP orders to attempt per pair.
+    pub max_regular_orders_per_pair: Option<usize>,
     /// Maximum accepted off-market deviation for non-LP general orders, in bps.
     /// `None` disables the pre-router marketability filter.
     pub max_general_order_market_deviation_bps: Option<u32>,
@@ -235,6 +240,8 @@ struct Inner {
     solution_gas_offset: eth::SignedGas,
     max_general_orders_per_auction: Option<usize>,
     max_general_orders_per_pair: Option<usize>,
+    max_regular_orders_per_auction: Option<usize>,
+    max_regular_orders_per_pair: Option<usize>,
     max_general_order_market_deviation_bps: Option<u32>,
     max_general_order_validity_secs: Option<u64>,
     skip_general_orders_with_hooks: bool,
@@ -246,6 +253,7 @@ struct SelectedCounts {
     total: usize,
     priority: usize,
     general: usize,
+    regular: usize,
     edge_filtered_general: usize,
     marketability_filtered_general: usize,
     validity_filtered_general: usize,
@@ -328,6 +336,8 @@ impl Solver {
                 solution_gas_offset: config.solution_gas_offset,
                 max_general_orders_per_auction: config.max_general_orders_per_auction,
                 max_general_orders_per_pair: config.max_general_orders_per_pair,
+                max_regular_orders_per_auction: config.max_regular_orders_per_auction,
+                max_regular_orders_per_pair: config.max_regular_orders_per_pair,
                 max_general_order_market_deviation_bps: config
                     .max_general_order_market_deviation_bps,
                 max_general_order_validity_secs: config.max_general_order_validity_secs,
@@ -383,6 +393,7 @@ impl Solver {
             selected_orders = selected_counts.total,
             selected_priority_orders = selected_counts.priority,
             selected_general_orders = selected_counts.general,
+            selected_regular_orders = selected_counts.regular,
             edge_filtered_general_orders = selected_counts.edge_filtered_general,
             marketability_filtered_general_orders = selected_counts.marketability_filtered_general,
             validity_filtered_general_orders = selected_counts.validity_filtered_general,
@@ -416,6 +427,7 @@ impl Solver {
                     selected_orders = selected_counts.total,
                     selected_priority_orders = selected_counts.priority,
                     selected_general_orders = selected_counts.general,
+                    selected_regular_orders = selected_counts.regular,
                     edge_filtered_general_orders = selected_counts.edge_filtered_general,
                     marketability_filtered_general_orders =
                         selected_counts.marketability_filtered_general,
@@ -445,6 +457,7 @@ impl Solver {
             selected_orders = selected_counts.total,
             selected_priority_orders = selected_counts.priority,
             selected_general_orders = selected_counts.general,
+            selected_regular_orders = selected_counts.regular,
             edge_filtered_general_orders = selected_counts.edge_filtered_general,
             marketability_filtered_general_orders = selected_counts.marketability_filtered_general,
             validity_filtered_general_orders = selected_counts.validity_filtered_general,
@@ -476,6 +489,11 @@ fn is_native_price_probe(order: &Order, is_quote: bool, wrapped_native: eth::Add
 }
 
 impl Inner {
+    fn regular_fallback_enabled(&self) -> bool {
+        self.max_regular_orders_per_auction
+            .is_some_and(|limit| limit > 0)
+    }
+
     async fn solve(&self, auction: Auction, sender: tokio::sync::mpsc::UnboundedSender<Solution>) {
         let is_quote = matches!(auction.id, auction::Id::Quote);
         let mut sent_count: usize = 0;
@@ -787,6 +805,7 @@ impl Inner {
     ) -> Vec<(usize, Order)> {
         let mut priority = Vec::new();
         let mut general = Vec::new();
+        let mut regular = Vec::new();
         let mut edge_filtered_general = 0usize;
         let mut marketability_filtered_general = 0usize;
         let mut validity_filtered_general = 0usize;
@@ -797,13 +816,19 @@ impl Inner {
         for item in supported {
             if self.is_priority_order(&item.1) {
                 priority.push(item);
-            } else if let Some(reason) = self.general_edge_rejection_reason(&item.1, is_quote) {
+                continue;
+            }
+
+            let is_regular_fallback = self
+                .general_edge_rejection_reason(&item.1, is_quote)
+                .is_some();
+            if is_regular_fallback && !self.regular_fallback_enabled() {
                 edge_filtered_general += 1;
                 tracing::debug!(
                     order_uid = %item.1.uid,
                     sell_token = ?item.1.sell.token,
                     buy_token = ?item.1.buy.token,
-                    reason,
+                    reason = "no_general_edge_token_match",
                     "general order skipped by edge-token filter"
                 );
             } else if let Some(reason) =
@@ -858,38 +883,32 @@ impl Inner {
                     "general order skipped by failure backoff"
                 );
             } else {
-                general.push(item);
+                if is_regular_fallback {
+                    regular.push(item);
+                } else {
+                    general.push(item);
+                }
             }
         }
 
         priority.sort_by_key(|(i, order)| (std::cmp::Reverse(order_notional(order, tokens)), *i));
         general.sort_by_key(|(i, order)| (std::cmp::Reverse(order_notional(order, tokens)), *i));
-
-        if let Some(per_pair) = self.max_general_orders_per_pair {
-            let mut counts = HashMap::<(eth::Address, eth::Address, u8), usize>::new();
-            general.retain(|(_, order)| {
-                let key = (
-                    order.sell.token.0,
-                    order.buy.token.0,
-                    order_side_key(order.side),
-                );
-                let count = counts.entry(key).or_default();
-                if *count >= per_pair {
-                    false
-                } else {
-                    *count += 1;
-                    true
-                }
-            });
-        }
-
-        if let Some(limit) = self.max_general_orders_per_auction {
-            general.truncate(limit);
-        }
+        regular.sort_by_key(|(i, order)| (std::cmp::Reverse(order_notional(order, tokens)), *i));
+        cap_orders(
+            &mut general,
+            self.max_general_orders_per_pair,
+            self.max_general_orders_per_auction,
+        );
+        cap_orders(
+            &mut regular,
+            self.max_regular_orders_per_pair,
+            self.max_regular_orders_per_auction,
+        );
 
         tracing::debug!(
             priority_orders = priority.len(),
             selected_general_orders = general.len(),
+            selected_regular_orders = regular.len(),
             edge_filtered_general_orders = edge_filtered_general,
             marketability_filtered_general_orders = marketability_filtered_general,
             validity_filtered_general_orders = validity_filtered_general,
@@ -897,6 +916,8 @@ impl Inner {
             backoff_filtered_general_orders = backoff_filtered_general,
             max_general_orders_per_auction = self.max_general_orders_per_auction,
             max_general_orders_per_pair = self.max_general_orders_per_pair,
+            max_regular_orders_per_auction = self.max_regular_orders_per_auction,
+            max_regular_orders_per_pair = self.max_regular_orders_per_pair,
             general_edge_token_count = self.general_edge_tokens.as_ref().map_or(0, HashSet::len),
             max_general_order_market_deviation_bps = self.max_general_order_market_deviation_bps,
             max_general_order_validity_secs = self.max_general_order_validity_secs,
@@ -905,12 +926,14 @@ impl Inner {
         );
 
         priority.extend(general);
+        priority.extend(regular);
         priority
     }
 
     fn selected_counts(&self, orders: &[Order], tokens: &Tokens, is_quote: bool) -> SelectedCounts {
         let mut priority = 0usize;
         let mut general = Vec::new();
+        let mut regular = Vec::new();
         let mut edge_filtered_general = 0usize;
         let mut marketability_filtered_general = 0usize;
         let mut validity_filtered_general = 0usize;
@@ -925,10 +948,13 @@ impl Inner {
         {
             if self.is_priority_order(order) {
                 priority += 1;
-            } else if self
+                continue;
+            }
+
+            let is_regular_fallback = self
                 .general_edge_rejection_reason(order, is_quote)
-                .is_some()
-            {
+                .is_some();
+            if is_regular_fallback && !self.regular_fallback_enabled() {
                 edge_filtered_general += 1;
             } else if self
                 .general_marketability_rejection_reason(order, tokens)
@@ -946,38 +972,32 @@ impl Inner {
             } else if self.general_order_backoff_active(order) {
                 backoff_filtered_general += 1;
             } else {
-                general.push((i, order));
+                if is_regular_fallback {
+                    regular.push((i, order));
+                } else {
+                    general.push((i, order));
+                }
             }
         }
 
         general.sort_by_key(|(i, order)| (std::cmp::Reverse(order_notional(order, tokens)), *i));
-
-        if let Some(per_pair) = self.max_general_orders_per_pair {
-            let mut counts = HashMap::<(eth::Address, eth::Address, u8), usize>::new();
-            general.retain(|(_, order)| {
-                let key = (
-                    order.sell.token.0,
-                    order.buy.token.0,
-                    order_side_key(order.side),
-                );
-                let count = counts.entry(key).or_default();
-                if *count >= per_pair {
-                    false
-                } else {
-                    *count += 1;
-                    true
-                }
-            });
-        }
-
-        if let Some(limit) = self.max_general_orders_per_auction {
-            general.truncate(limit);
-        }
+        regular.sort_by_key(|(i, order)| (std::cmp::Reverse(order_notional(order, tokens)), *i));
+        cap_orders(
+            &mut general,
+            self.max_general_orders_per_pair,
+            self.max_general_orders_per_auction,
+        );
+        cap_orders(
+            &mut regular,
+            self.max_regular_orders_per_pair,
+            self.max_regular_orders_per_auction,
+        );
 
         SelectedCounts {
-            total: priority + general.len(),
+            total: priority + general.len() + regular.len(),
             priority,
             general: general.len(),
+            regular: regular.len(),
             edge_filtered_general,
             marketability_filtered_general,
             validity_filtered_general,
@@ -1555,6 +1575,35 @@ fn order_side_key(side: order::Side) -> u8 {
     }
 }
 
+fn cap_orders<T: std::borrow::Borrow<Order>>(
+    orders: &mut Vec<(usize, T)>,
+    per_pair: Option<usize>,
+    per_auction: Option<usize>,
+) {
+    if let Some(per_pair) = per_pair {
+        let mut counts = HashMap::<(eth::Address, eth::Address, u8), usize>::new();
+        orders.retain(|(_, order)| {
+            let order = order.borrow();
+            let key = (
+                order.sell.token.0,
+                order.buy.token.0,
+                order_side_key(order.side),
+            );
+            let count = counts.entry(key).or_default();
+            if *count >= per_pair {
+                false
+            } else {
+                *count += 1;
+                true
+            }
+        });
+    }
+
+    if let Some(limit) = per_auction {
+        orders.truncate(limit);
+    }
+}
+
 fn sell_order_bid_output(
     expected_output: eth::U256,
     calldata_min_out: eth::U256,
@@ -1927,6 +1976,8 @@ mod tests {
             solution_gas_offset: eth::SignedGas::default(),
             max_general_orders_per_auction: None,
             max_general_orders_per_pair: None,
+            max_regular_orders_per_auction: None,
+            max_regular_orders_per_pair: None,
             max_general_order_market_deviation_bps: None,
             max_general_order_validity_secs: None,
             skip_general_orders_with_hooks: false,
@@ -2357,6 +2408,57 @@ mod tests {
         // The generic USDC/WETH order is skipped because neither side is an
         // edge token. LP-priority orders bypass the edge filter entirely.
         assert_eq!(selected_indices, vec![2, 1]);
+    }
+
+    #[test]
+    fn select_orders_uses_regular_fallback_after_edge_general_orders() {
+        let lp = eth::Address::repeat_byte(0x01);
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+        let crvusd = eth::Address::repeat_byte(0x04);
+
+        let mut inner = test_inner(100, 50);
+        inner.lp_tokens = Some([lp].into_iter().collect());
+        inner.token_allowlist = Some([lp, usdc, weth, crvusd].into_iter().collect());
+        inner.general_edge_tokens = Some([crvusd].into_iter().collect());
+        inner.max_general_orders_per_auction = Some(1);
+        inner.max_regular_orders_per_auction = Some(1);
+
+        let orders = vec![
+            (0, sell_order_with_amount(usdc, weth, 3_000_000)),
+            (1, sell_order_with_amount(crvusd, usdc, 1_000_000)),
+            (2, sell_order_with_amount(lp, usdc, 1)),
+            (3, sell_order_with_amount(usdc, weth, 2_000_000)),
+        ];
+        let tokens = tokens_with_unit_prices(&[lp, usdc, weth, crvusd]);
+
+        let selected = inner.select_orders(orders, &tokens, false);
+        let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
+
+        // LP-priority orders stay first, edge-token general orders stay
+        // second, and the best regular non-edge order is admitted last.
+        assert_eq!(selected_indices, vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn selected_counts_include_regular_fallback_orders() {
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+        let crvusd = eth::Address::repeat_byte(0x04);
+
+        let mut inner = test_inner(100, 50);
+        inner.general_edge_tokens = Some([crvusd].into_iter().collect());
+        inner.max_regular_orders_per_auction = Some(1);
+
+        let orders = vec![sell_order(usdc, weth), sell_order(crvusd, usdc)];
+        let tokens = tokens_with_unit_prices(&[usdc, weth, crvusd]);
+
+        let counts = inner.selected_counts(&orders, &tokens, false);
+        assert_eq!(counts.total, 2);
+        assert_eq!(counts.priority, 0);
+        assert_eq!(counts.general, 1);
+        assert_eq!(counts.regular, 1);
+        assert_eq!(counts.edge_filtered_general, 0);
     }
 
     #[test]

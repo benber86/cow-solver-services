@@ -261,6 +261,8 @@ max-general-order-validity-secs = 86400       # skip >1d non-LP general orders
 skip-general-orders-with-hooks = true         # skip non-LP hook/flashloan/wrapper orders
 max-general-orders-per-auction = 24
 max-general-orders-per-pair = 2
+max-regular-orders-per-auction = 4            # fallback for marketable non-edge generic flow
+max-regular-orders-per-pair = 1
 
 # CoW Protocol Staging / Shadow settlement contract (same on all chains)
 settlement-contract = "0xf553d092b50bdcbdded1a99af2ca29fbe5e2cb13"
