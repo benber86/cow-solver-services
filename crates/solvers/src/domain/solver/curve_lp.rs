@@ -1222,7 +1222,7 @@ impl Inner {
                     fee_in_sell_token = %fee_in_sell_token,
                     "solution construction failed while computing effective amounts"
                 );
-                return Err(SolveError::SolutionConstruction);
+                return Err(SolveError::EffectiveAmountUnderFee);
             }
         };
 
@@ -1665,6 +1665,7 @@ fn effective_trade_amounts(
 
 fn should_backoff_general_failure(err: &SolveError) -> bool {
     match err {
+        SolveError::EffectiveAmountUnderFee => true,
         SolveError::InsufficientOutput { .. } => true,
         SolveError::Provider(route_provider::Error::CalldataUnavailable(msg)) => {
             is_route_failure_backoff_message(msg)
@@ -1710,6 +1711,7 @@ pub enum SolveError {
     },
     NoPriceForSellToken,
     FeeCalculation,
+    EffectiveAmountUnderFee,
     SolutionConstruction,
 }
 
@@ -1727,6 +1729,9 @@ impl fmt::Display for SolveError {
             ),
             SolveError::NoPriceForSellToken => write!(f, "no price available for sell token"),
             SolveError::FeeCalculation => write!(f, "fee calculation failed"),
+            SolveError::EffectiveAmountUnderFee => {
+                write!(f, "effective amount is below fee")
+            }
             SolveError::SolutionConstruction => write!(f, "solution construction failed"),
         }
     }
@@ -2648,5 +2653,56 @@ mod tests {
         let counts = inner.selected_counts(&[bad_general], &tokens, false);
         assert_eq!(counts.total, 0);
         assert_eq!(counts.backoff_filtered_general, 1);
+    }
+
+    #[test]
+    fn effective_amount_under_fee_backs_off_general_orders_only() {
+        let lp = eth::Address::repeat_byte(0x01);
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+
+        let mut inner = test_inner(100, 50);
+        inner.lp_tokens = Some([lp].into_iter().collect());
+        inner.token_allowlist = Some([lp, usdc, weth].into_iter().collect());
+
+        let bad_general = with_uid(sell_order(usdc, weth), 0xA1);
+        let lp_priority_same_uid = with_uid(sell_order(lp, usdc), 0xA1);
+        inner.record_general_order_failure(
+            &bad_general,
+            &SolveError::EffectiveAmountUnderFee,
+            false,
+        );
+
+        let orders = vec![(0, bad_general.clone()), (1, lp_priority_same_uid)];
+        let tokens = tokens_with_unit_prices(&[lp, usdc, weth]);
+
+        let selected = inner.select_orders(orders, &tokens, false);
+        let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
+        assert_eq!(selected_indices, vec![1]);
+
+        let counts = inner.selected_counts(&[bad_general], &tokens, false);
+        assert_eq!(counts.total, 0);
+        assert_eq!(counts.backoff_filtered_general, 1);
+    }
+
+    #[test]
+    fn generic_solution_construction_failure_does_not_backoff_general_orders() {
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+
+        let inner = test_inner(100, 50);
+        let bad_general = with_uid(sell_order(usdc, weth), 0xA1);
+        inner.record_general_order_failure(
+            &bad_general,
+            &SolveError::SolutionConstruction,
+            false,
+        );
+
+        let orders = vec![(0, bad_general)];
+        let tokens = tokens_with_unit_prices(&[usdc, weth]);
+
+        let selected = inner.select_orders(orders, &tokens, false);
+        let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
+        assert_eq!(selected_indices, vec![0]);
     }
 }
