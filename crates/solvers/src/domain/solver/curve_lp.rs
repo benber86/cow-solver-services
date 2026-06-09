@@ -41,6 +41,9 @@ const ROUTE_REQUEST_TIMEOUT: Duration = Duration::from_millis(2500);
 const ONCHAIN_VERIFY_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Maximum time spent waiting for token price fallback per order.
 const PRICE_FETCH_TIMEOUT: Duration = Duration::from_millis(1200);
+/// Native-price probes are latency-sensitive quote requests; use the Curve
+/// Prices API only as a fast initial guess and fall back to forward quotes.
+const NATIVE_PRICE_PROBE_PRICE_TIMEOUT: Duration = Duration::from_millis(300);
 /// Sidechain-only: legacy comparison probe budget. Tighter than the route
 /// timeout so a slow/down legacy never delays the real solve.
 const LEGACY_TELEMETRY_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -54,6 +57,9 @@ const MAX_GENERAL_ORDER_FAILURE_BACKOFF_ENTRIES: usize = 4096;
 const NATIVE_PRICE_SELL_SENTINEL: U256 = U256::from_limbs([0, 0, 65536, 0]);
 const MARKETABILITY_BASE_BPS: u64 = 10_000;
 const TOKEN_PRICE_BASE: u128 = 1_000_000_000_000_000_000;
+const NATIVE_PRICE_PROBE_PRICE_PAD_BPS: u32 = 500;
+const NATIVE_PRICE_PROBE_EXPANSION_ATTEMPTS: usize = 8;
+const NATIVE_PRICE_PROBE_SHRINK_ATTEMPTS: usize = 4;
 
 /// Curve Price API chain slug used in the URL path.
 ///
@@ -1306,75 +1312,9 @@ impl Inner {
 
     async fn solve_native_price_probe(&self, order: &Order) -> Result<SolvedOrder, SolveError> {
         let route_start = std::time::Instant::now();
-
-        let reverse_req = QuoteRequest {
-            sell_token: order.buy.token.0,
-            buy_token: order.sell.token.0,
-            sell_amount: order.buy.amount,
-            is_quote: true,
-            receiver: self.chain.settlement_contract,
-            min_out: None,
-            gas_price_gwei: None,
-        };
-        let reverse =
-            tokio::time::timeout(ROUTE_REQUEST_TIMEOUT, self.provider.quote(&reverse_req))
-                .await
-                .map_err(|_| {
-                    SolveError::Provider(route_provider::Error::Api(api::Error::Network(format!(
-                        "reverse route timed out after {}ms",
-                        ROUTE_REQUEST_TIMEOUT.as_millis()
-                    ))))
-                })?
-                .map_err(SolveError::Provider)?;
-
-        let reverse_output = reverse.expected_output;
-        let padding_bps_attempts = [500u32, 1500u32];
-        let mut forward = None;
-
-        for (attempt, &padding_bps) in padding_bps_attempts.iter().enumerate() {
-            let estimated_sell = reverse_output.saturating_mul(U256::from(10_000 + padding_bps))
-                / U256::from(10_000u32);
-
-            let req = QuoteRequest {
-                sell_token: order.sell.token.0,
-                buy_token: order.buy.token.0,
-                sell_amount: estimated_sell,
-                is_quote: true,
-                receiver: self.chain.settlement_contract,
-                min_out: None,
-                gas_price_gwei: None,
-            };
-            let q = tokio::time::timeout(ROUTE_REQUEST_TIMEOUT, self.provider.quote(&req))
-                .await
-                .map_err(|_| {
-                    SolveError::Provider(route_provider::Error::Api(api::Error::Network(format!(
-                        "forward route timed out after {}ms",
-                        ROUTE_REQUEST_TIMEOUT.as_millis()
-                    ))))
-                })?
-                .map_err(SolveError::Provider)?;
-
-            tracing::debug!(
-                reverse_output = %reverse_output,
-                estimated_sell = %estimated_sell,
-                forward_output = %q.expected_output,
-                attempt,
-                padding_bps,
-                "native price probe routing"
-            );
-
-            if q.expected_output >= order.buy.amount {
-                forward = Some((q, estimated_sell));
-                break;
-            }
-        }
-
-        let (fwd, estimated_sell) = forward.ok_or(SolveError::InsufficientOutput {
-            min_output: U256::ZERO,
-            required: order.buy.amount,
-        })?;
-
-        let route_ms = route_start.elapsed().as_millis() as u64;
+        let (fwd, estimated_sell, route_ms) = self
+            .estimate_native_price_probe_sell_amount(order, route_start)
+            .await?;
 
         // Probes never settle; calldata may be empty (new-router quote mode).
         let interaction = solution::CustomInteraction {
@@ -1447,6 +1387,175 @@ impl Inner {
             gas_estimate: fwd.gas_estimate,
             legacy: None,
         })
+    }
+
+    async fn estimate_native_price_probe_sell_amount(
+        &self,
+        order: &Order,
+        route_start: std::time::Instant,
+    ) -> Result<(route_provider::ExecutableQuote, U256, u64), SolveError> {
+        let mut sell_amount = self.native_price_probe_initial_sell_amount(order).await;
+        if sell_amount.is_zero() {
+            sell_amount = U256::from(1u64);
+        }
+
+        let mut last_output = U256::ZERO;
+        let mut last_error = None;
+        let mut high = None;
+
+        for attempt in 0..=NATIVE_PRICE_PROBE_EXPANSION_ATTEMPTS {
+            match self
+                .quote_native_price_probe_forward(order, sell_amount)
+                .await
+            {
+                Ok(q) => {
+                    last_output = q.expected_output;
+                    tracing::debug!(
+                        sell_amount = %sell_amount,
+                        forward_output = %q.expected_output,
+                        attempt,
+                        phase = "expand",
+                        "native price probe routing"
+                    );
+
+                    if q.expected_output >= order.buy.amount {
+                        high = Some((q, sell_amount));
+                        break;
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        sell_amount = %sell_amount,
+                        attempt,
+                        phase = "expand",
+                        ?err,
+                        "native price probe forward quote failed"
+                    );
+                    last_error = Some(err);
+                }
+            }
+
+            let next = sell_amount.saturating_mul(U256::from(2u64));
+            if next == sell_amount {
+                break;
+            }
+            sell_amount = next;
+        }
+
+        let Some((mut quote, mut estimated_sell)) = high else {
+            return match last_error {
+                Some(err) if last_output.is_zero() => Err(err),
+                _ => Err(SolveError::InsufficientOutput {
+                    min_output: last_output,
+                    required: order.buy.amount,
+                }),
+            };
+        };
+
+        for attempt in 0..NATIVE_PRICE_PROBE_SHRINK_ATTEMPTS {
+            let candidate = estimated_sell / U256::from(2u64);
+            if candidate.is_zero() {
+                break;
+            }
+
+            match self
+                .quote_native_price_probe_forward(order, candidate)
+                .await
+            {
+                Ok(q) => {
+                    tracing::debug!(
+                        sell_amount = %candidate,
+                        forward_output = %q.expected_output,
+                        attempt,
+                        phase = "shrink",
+                        "native price probe routing"
+                    );
+
+                    if q.expected_output >= order.buy.amount {
+                        quote = q;
+                        estimated_sell = candidate;
+                    } else {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        sell_amount = %candidate,
+                        attempt,
+                        phase = "shrink",
+                        ?err,
+                        "native price probe forward quote failed"
+                    );
+                    break;
+                }
+            }
+        }
+
+        Ok((
+            quote,
+            estimated_sell,
+            route_start.elapsed().as_millis() as u64,
+        ))
+    }
+
+    async fn native_price_probe_initial_sell_amount(&self, order: &Order) -> U256 {
+        let fetched = tokio::time::timeout(
+            NATIVE_PRICE_PROBE_PRICE_TIMEOUT,
+            self.price_client.get_eth_price(
+                self.chain.price_api_chain.as_slug(),
+                self.chain.wrapped_native_token,
+                order.sell.token.0,
+            ),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
+
+        let Some(price) = fetched.filter(|price| !price.is_zero()) else {
+            return order.buy.amount;
+        };
+
+        let base = U256::from(TOKEN_PRICE_BASE);
+        let estimated = order
+            .buy
+            .amount
+            .checked_mul(base)
+            .and_then(|v| v.checked_div(price))
+            .unwrap_or(order.buy.amount);
+        let padded = estimated.saturating_mul(U256::from(
+            MARKETABILITY_BASE_BPS + u64::from(NATIVE_PRICE_PROBE_PRICE_PAD_BPS),
+        )) / U256::from(MARKETABILITY_BASE_BPS);
+
+        if padded.is_zero() {
+            U256::from(1u64)
+        } else {
+            padded
+        }
+    }
+
+    async fn quote_native_price_probe_forward(
+        &self,
+        order: &Order,
+        sell_amount: U256,
+    ) -> Result<route_provider::ExecutableQuote, SolveError> {
+        let req = QuoteRequest {
+            sell_token: order.sell.token.0,
+            buy_token: order.buy.token.0,
+            sell_amount,
+            is_quote: true,
+            receiver: self.chain.settlement_contract,
+            min_out: None,
+            gas_price_gwei: None,
+        };
+        tokio::time::timeout(ROUTE_REQUEST_TIMEOUT, self.provider.quote(&req))
+            .await
+            .map_err(|_| {
+                SolveError::Provider(route_provider::Error::Api(api::Error::Network(format!(
+                    "forward route timed out after {}ms",
+                    ROUTE_REQUEST_TIMEOUT.as_millis()
+                ))))
+            })?
+            .map_err(SolveError::Provider)
     }
 
     /// Fires the legacy provider in the background for telemetry purposes.
@@ -1966,6 +2075,42 @@ mod tests {
         }
     }
 
+    struct LinearForwardProvider {
+        sell_token: eth::Address,
+        buy_token: eth::Address,
+        router: eth::Address,
+        numerator: u64,
+        denominator: u64,
+        requests: Mutex<Vec<QuoteRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl RouteProvider for LinearForwardProvider {
+        async fn quote(
+            &self,
+            req: &QuoteRequest,
+        ) -> Result<route_provider::ExecutableQuote, route_provider::Error> {
+            self.requests.lock().unwrap().push(req.clone());
+
+            if req.sell_token != self.sell_token || req.buy_token != self.buy_token {
+                return Err(route_provider::Error::CalldataUnavailable(
+                    "no reverse route".into(),
+                ));
+            }
+
+            let expected_output = req.sell_amount.saturating_mul(U256::from(self.numerator))
+                / U256::from(self.denominator);
+            Ok(route_provider::ExecutableQuote {
+                expected_output,
+                min_out: expected_output,
+                router_address: self.router,
+                calldata: Vec::new(),
+                gas_estimate: Some(285_000),
+                quality: Some(route_provider::QuoteQuality::Route),
+            })
+        }
+    }
+
     fn test_inner(slippage_bps: u32, _max_quote_deviation_bps: u32) -> Inner {
         Inner {
             chain: test_chain_config(),
@@ -1988,6 +2133,71 @@ mod tests {
             skip_general_orders_with_hooks: false,
             general_order_failure_backoff: Mutex::new(HashMap::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn native_price_probe_uses_forward_quotes_when_reverse_route_is_unavailable() {
+        let lp = eth::Address::repeat_byte(0x11);
+        let wxdai = WXDAI_GNOSIS;
+        let router = eth::Address::repeat_byte(0x22);
+        let provider = Arc::new(LinearForwardProvider {
+            sell_token: lp,
+            buy_token: wxdai,
+            router,
+            numerator: 2,
+            denominator: 1,
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut inner = test_inner(100, 50);
+        inner.chain.wrapped_native_token = wxdai;
+        inner.chain.price_api_chain = CurvePriceApiChain::Xdai;
+        inner.provider = provider.clone();
+
+        let mut order = probe_order_with_buy_token(wxdai);
+        order.sell.token = eth::TokenAddress(lp);
+        order.buy.amount = U256::from(1_000u64);
+
+        let solved = inner.solve_native_price_probe(&order).await.unwrap();
+
+        assert_eq!(solved.input_amount, U256::from(500u64));
+        assert_eq!(solved.output_amount, U256::from(1_000u64));
+        assert_eq!(solved.expected_output, U256::from(1_000u64));
+        assert_eq!(solved.gas_estimate, Some(285_000));
+
+        let requests = provider.requests.lock().unwrap();
+        assert!(!requests.is_empty());
+        assert!(
+            requests
+                .iter()
+                .all(|req| req.sell_token == lp && req.buy_token == wxdai)
+        );
+    }
+
+    #[tokio::test]
+    async fn native_price_probe_expands_until_forward_quote_clears_target() {
+        let lp = eth::Address::repeat_byte(0x33);
+        let wxdai = WXDAI_GNOSIS;
+        let provider = Arc::new(LinearForwardProvider {
+            sell_token: lp,
+            buy_token: wxdai,
+            router: eth::Address::repeat_byte(0x44),
+            numerator: 1,
+            denominator: 4,
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut inner = test_inner(100, 50);
+        inner.chain.wrapped_native_token = wxdai;
+        inner.chain.price_api_chain = CurvePriceApiChain::Xdai;
+        inner.provider = provider;
+
+        let mut order = probe_order_with_buy_token(wxdai);
+        order.sell.token = eth::TokenAddress(lp);
+        order.buy.amount = U256::from(1_000u64);
+
+        let solved = inner.solve_native_price_probe(&order).await.unwrap();
+
+        assert_eq!(solved.input_amount, U256::from(4_000u64));
+        assert_eq!(solved.output_amount, U256::from(1_000u64));
     }
 
     #[test]
