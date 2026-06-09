@@ -29,6 +29,7 @@ impl Api {
             .route("/metrics", axum::routing::get(routes::metrics))
             .route("/healthz", axum::routing::get(routes::healthz))
             .route("/solve", axum::routing::post(routes::solve))
+            .route("/notify", axum::routing::post(routes::notify))
             .layer(
                 tower::ServiceBuilder::new()
                     .layer(tower_http::trace::TraceLayer::new_for_http().make_span_with(make_span))
