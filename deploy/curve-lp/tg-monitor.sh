@@ -291,16 +291,18 @@ fetch_winning_trades() {
     lookback_blocks="$(chain_win_lookback_blocks "$chain")"
     [ -z "$api_chain" ] && return
 
-    python3 - "$api_chain" "$uid" "$COW_SOLVER_NAME" "$TG_WIN_MAX_TRADES_PER_ORDER" "$rpc_url" "$lookback_blocks" <<'PY' || true
+    python3 - "$api_chain" "$uid" "$TG_WIN_MAX_TRADES_PER_ORDER" "$rpc_url" "$lookback_blocks" <<'PY' || true
 import json
 import sys
 import urllib.error
 import urllib.request
 
-api_chain, uid, solver_name, max_trades, rpc_url, lookback_blocks = sys.argv[1:]
+api_chain, uid, max_trades, rpc_url, lookback_blocks = sys.argv[1:]
 max_trades = int(max_trades)
 lookback_blocks = int(lookback_blocks)
+# /trades is v1; solver_competition moved to v2 (v1 was retired ~Jun 2026).
 base = f"https://api.cow.fi/{api_chain}/api/v1"
+base_v2 = f"https://api.cow.fi/{api_chain}/api/v2"
 
 
 def get_json(url):
@@ -352,13 +354,16 @@ for trade in trades:
         break
 
     try:
-        competition = get_json(f"{base}/solver_competition/by_tx_hash/{tx_hash}")
+        competition = get_json(f"{base_v2}/solver_competition/by_tx_hash/{tx_hash}")
     except Exception:
         continue
 
+    # CoW runs the driver and assigns the per-chain settlement address, so we
+    # can't identify our solver by name/address. Instead, a win is: our order
+    # appears in the solution flagged isWinner for this settlement tx.
     winning_solution = None
     for solution in competition.get("solutions", []):
-        if solution.get("solver") != solver_name or solution.get("isWinner") is not True:
+        if solution.get("isWinner") is not True:
             continue
         if any(order.get("id", "").lower() == uid.lower() for order in solution.get("orders", [])):
             winning_solution = solution
