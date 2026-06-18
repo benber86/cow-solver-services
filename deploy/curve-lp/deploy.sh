@@ -430,6 +430,7 @@ emit_monitor_json() {
         case "$chain" in
             arbitrum-one) router="\"$ROUTER_ADDRESS_ARBITRUM\"" ;;
             xdai) router="\"$ROUTER_ADDRESS_GNOSIS\"" ;;
+            base) router="\"$ROUTER_ADDRESS_BASE\"" ;;
             *)
                 echo -e "${RED}ERROR: router-address placeholder used for unsupported monitor chain '$chain'${NC}" >&2
                 exit 1

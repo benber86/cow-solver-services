@@ -150,7 +150,7 @@
 /*
  * curve-lp monitor UI
  *
- * Model: chain × env matrix. Chain = mainnet | arbitrum-one | xdai.
+ * Model: chain × env matrix. Chain = mainnet | arbitrum-one | xdai | base.
  * Env   = prod | staging. Every combination has a backend container and
  * a public route today. If we ever add more chains or envs, update CHAINS
  * and the path helper below.
@@ -168,10 +168,10 @@
  */
 // Keys match CoW's network slugs verbatim — they're path segments in the
 // upstream URL. UI labels are decoupled via CHAIN_LABEL below.
-const CHAINS = ["mainnet", "arbitrum-one", "xdai"];
+const CHAINS = ["mainnet", "arbitrum-one", "xdai", "base"];
 const ENVS = ["prod", "staging"];
 
-const CHAIN_LABEL = { mainnet: "Ethereum", "arbitrum-one": "Arbitrum", xdai: "Gnosis" };
+const CHAIN_LABEL = { mainnet: "Ethereum", "arbitrum-one": "Arbitrum", xdai: "Gnosis", base: "Base" };
 const ENV_LABEL   = { prod: "prod", staging: "staging" };
 
 function pathFor(chain, env) {
@@ -254,6 +254,26 @@ const PRESETS = {
       payload: basePayload(
         "0xdeAdBeef00000000000000000000000000000001", "1000000000000000000", 18, "SHIT",
         "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d", 18, "WXDAI"),
+    },
+  ],
+  base: [
+    {
+      label: "1e18 scrvUSDC → USDC (allowed)",
+      payload: basePayload(
+        "0x5aB01ee6208596f2204B85bDFA39d34c2aDD98F6", "1000000000000000000", 18, "scrvUSDC",
+        "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", 6, "USDC"),
+    },
+    {
+      label: "1e18 crvUSD → USDC (allowed)",
+      payload: basePayload(
+        "0x417Ac0e078398C154EdFadD9Ef675d30Be60Af93", "1000000000000000000", 18, "crvUSD",
+        "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", 6, "USDC"),
+    },
+    {
+      label: "negative: shitcoin → USDC (should reject)",
+      payload: basePayload(
+        "0xdeAdBeef00000000000000000000000000000001", "1000000000000000000", 18, "SHIT",
+        "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", 6, "USDC"),
     },
   ],
 };

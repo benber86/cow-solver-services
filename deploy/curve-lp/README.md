@@ -1,8 +1,8 @@
 # Curve LP Solver — Ops Memo
 
 Workflow notes for running the Curve LP solver against CoW Protocol. Lives on a
-single VPS, multi-chain (Ethereum, Arbitrum, Gnosis), decoupled solver/ingress
-deploy.
+single VPS, multi-chain (Ethereum, Arbitrum, Gnosis, Base), decoupled
+solver/ingress deploy.
 
 For **first-time-from-scratch** setup (AWS instance creation, DNS, initial
 certbot bootstrap, CoW onboarding) see [`COW_README.md`](./COW_README.md). That
@@ -22,9 +22,11 @@ container points at.
 | `solver`            | Ethereum | prod `0x9008…`  | `/prod/mainnet/`                                     | **Yes**        |
 | `solver-staging`    | Ethereum | shadow `0xf553…`| `/staging/mainnet/`, `/shadow/mainnet/`              | Yes            |
 | `arbitrum`          | Arbitrum | prod `0x9008…`  | `/prod/arbitrum-one/`                                | Yes            |
-| `arbitrum-staging`  | Arbitrum | shadow `0xf553…`| `/staging/arbitrum-one/`, `/shadow/arbitrum-one/`    | Yes            |
+| `arbitrum-staging`  | Arbitrum | prod `0x9008…`  | `/staging/arbitrum-one/`, `/shadow/arbitrum-one/`    | Yes            |
 | `gnosis`            | Gnosis   | prod `0x9008…`  | `/prod/xdai/`                                        | Yes            |
-| `gnosis-staging`    | Gnosis   | shadow `0xf553…`| `/staging/xdai/`, `/shadow/xdai/`                    | Yes            |
+| `gnosis-staging`    | Gnosis   | prod `0x9008…`  | `/staging/xdai/`, `/shadow/xdai/`                    | Yes            |
+| `base`              | Base     | prod `0x9008…`  | `/prod/base/`                                        | Yes            |
+| `base-staging`      | Base     | prod `0x9008…`  | `/staging/base/`, `/shadow/base/`                    | Yes            |
 | `nginx`             | —        | —             | —                                                    | —              |
 | `certbot`           | —        | —             | —                                                    | —              |
 
@@ -139,10 +141,12 @@ Per-chain TOMLs in `deploy/curve-lp/`:
 - `curve-lp.arbitrum-staging.toml`
 - `curve-lp.gnosis.toml`
 - `curve-lp.gnosis-staging.toml`
+- `curve-lp.base.toml`
+- `curve-lp.base-staging.toml`
 
-These are the source of truth. `deploy.sh` runs them through `envsubst` (only
-`${NODE_URL}` is substituted, scoped per-chain) into `./processed/` and mounts
-the result into the container.
+These are the source of truth. `deploy.sh` runs them through `envsubst`
+(`${NODE_URL}`, plus `${ROUTER_ADDRESS}` on sidechains — both scoped per-chain)
+into `./processed/` and mounts the result into the container.
 
 Compile-time tests (`cargo test -p solvers --lib infra::config::curve_lp`)
 parse every deploy TOML at build time, so a malformed or mis-chained config
