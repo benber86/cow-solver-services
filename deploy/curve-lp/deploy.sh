@@ -11,8 +11,8 @@ set -euo pipefail
 #   --skip-prod       Drop the `solver` (ETH mainnet prod) service from the
 #                     rebuild set.
 #   --chains=CSV      Restrict to a chain subset. Comma-separated values from:
-#                     mainnet (= solver + solver-staging), arbitrum, gnosis.
-#                     Default: all chains.
+#                     mainnet (= solver + solver-staging), arbitrum, gnosis,
+#                     base. Default: all chains.
 #
 # Ingress flags (mutually exclusive):
 #   --with-ingress    Also rebuild nginx + certbot alongside the selected
@@ -103,24 +103,27 @@ SOLVER_SERVICES=()
 REBUILD_PROD=0             # ETH mainnet prod — `solver`
 REBUILD_ARBITRUM=0         # Arbitrum prod   — `arbitrum`
 REBUILD_GNOSIS=0           # Gnosis prod     — `gnosis`
+REBUILD_BASE=0             # Base prod       — `base`
 # Staging containers (one per chain; same chain, CoW shadow settlement).
 REBUILD_STAGING=0          # ETH mainnet staging — `solver-staging`
 REBUILD_ARBITRUM_STAGING=0 # Arbitrum staging   — `arbitrum-staging`
 REBUILD_GNOSIS_STAGING=0   # Gnosis staging     — `gnosis-staging`
+REBUILD_BASE_STAGING=0     # Base staging       — `base-staging`
 
 if [ "$INGRESS_ONLY" = "0" ]; then
-    declare -A CHAIN_ENABLED=([mainnet]=0 [arbitrum]=0 [gnosis]=0)
+    declare -A CHAIN_ENABLED=([mainnet]=0 [arbitrum]=0 [gnosis]=0 [base]=0)
     if [ -z "$CHAINS_CSV" ]; then
         CHAIN_ENABLED[mainnet]=1
         CHAIN_ENABLED[arbitrum]=1
         CHAIN_ENABLED[gnosis]=1
+        CHAIN_ENABLED[base]=1
     else
         IFS=',' read -r -a _CHAIN_LIST <<< "$CHAINS_CSV"
         for c in "${_CHAIN_LIST[@]}"; do
             c_trimmed="$(echo "$c" | tr -d '[:space:]')"
             if [ -z "$c_trimmed" ]; then continue; fi
             if [ -z "${CHAIN_ENABLED[$c_trimmed]+set}" ]; then
-                echo -e "${RED}ERROR: unknown chain '$c_trimmed' in --chains. Expected: mainnet, arbitrum, gnosis${NC}" >&2
+                echo -e "${RED}ERROR: unknown chain '$c_trimmed' in --chains. Expected: mainnet, arbitrum, gnosis, base${NC}" >&2
                 exit 1
             fi
             CHAIN_ENABLED[$c_trimmed]=1
@@ -153,6 +156,14 @@ if [ "$INGRESS_ONLY" = "0" ]; then
         fi
         SOLVER_SERVICES+=(gnosis-staging)
         REBUILD_GNOSIS_STAGING=1
+    fi
+    if [ "${CHAIN_ENABLED[base]}" = "1" ]; then
+        if [ "$SKIP_PROD" = "0" ]; then
+            SOLVER_SERVICES+=(base)
+            REBUILD_BASE=1
+        fi
+        SOLVER_SERVICES+=(base-staging)
+        REBUILD_BASE_STAGING=1
     fi
 
     if [ ${#SOLVER_SERVICES[@]} -eq 0 ]; then
@@ -207,10 +218,13 @@ fi
 if [ "$REBUILD_GNOSIS" = "1" ] || [ "$REBUILD_GNOSIS_STAGING" = "1" ]; then
     REQUIRED_VARS+=("NODE_URL_GNOSIS" "ROUTER_ADDRESS_GNOSIS")
 fi
+if [ "$REBUILD_BASE" = "1" ] || [ "$REBUILD_BASE_STAGING" = "1" ]; then
+    REQUIRED_VARS+=("NODE_URL_BASE" "ROUTER_ADDRESS_BASE")
+fi
 # Ingress needs DOMAIN and SSL_EMAIL; also needed for the DOMAIN placeholder
 # in nginx.template that certbot-init and nginx substitute at startup.
 if [ ${#INGRESS_SERVICES[@]} -gt 0 ]; then
-    REQUIRED_VARS+=("DOMAIN" "SSL_EMAIL" "ROUTER_ADDRESS_ARBITRUM" "ROUTER_ADDRESS_GNOSIS")
+    REQUIRED_VARS+=("DOMAIN" "SSL_EMAIL" "ROUTER_ADDRESS_ARBITRUM" "ROUTER_ADDRESS_GNOSIS" "ROUTER_ADDRESS_BASE")
 fi
 
 MISSING_VARS=()
@@ -228,7 +242,7 @@ if [ ${#MISSING_VARS[@]} -ne 0 ]; then
 fi
 
 # URL format check for any NODE_URL we're about to use.
-for url_var in NODE_URL NODE_URL_ARBITRUM NODE_URL_GNOSIS; do
+for url_var in NODE_URL NODE_URL_ARBITRUM NODE_URL_GNOSIS NODE_URL_BASE; do
     val="${!url_var:-}"
     if [ -n "$val" ] && [[ ! "$val" =~ ^https?:// ]]; then
         echo -e "${RED}ERROR: $url_var must be a valid HTTP(S) URL${NC}"
@@ -236,7 +250,7 @@ for url_var in NODE_URL NODE_URL_ARBITRUM NODE_URL_GNOSIS; do
     fi
 done
 
-for address_var in ROUTER_ADDRESS_ARBITRUM ROUTER_ADDRESS_GNOSIS; do
+for address_var in ROUTER_ADDRESS_ARBITRUM ROUTER_ADDRESS_GNOSIS ROUTER_ADDRESS_BASE; do
     if [ -n "${!address_var:-}" ] && ! [[ "${!address_var}" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
         echo -e "${RED}ERROR: $address_var must be a 20-byte 0x-prefixed address${NC}" >&2
         exit 1
@@ -297,6 +311,16 @@ if [ ${#SOLVER_SERVICES[@]} -gt 0 ]; then
         NODE_URL="$NODE_URL_GNOSIS" ROUTER_ADDRESS="$ROUTER_ADDRESS_GNOSIS" \
             envsubst '${NODE_URL} ${ROUTER_ADDRESS}' \
             < curve-lp.gnosis-staging.toml > ./processed/curve-lp-gnosis-staging.toml
+    fi
+    if [ "$REBUILD_BASE" = "1" ]; then
+        NODE_URL="$NODE_URL_BASE" ROUTER_ADDRESS="$ROUTER_ADDRESS_BASE" \
+            envsubst '${NODE_URL} ${ROUTER_ADDRESS}' \
+            < curve-lp.base.toml > ./processed/curve-lp-base.toml
+    fi
+    if [ "$REBUILD_BASE_STAGING" = "1" ]; then
+        NODE_URL="$NODE_URL_BASE" ROUTER_ADDRESS="$ROUTER_ADDRESS_BASE" \
+            envsubst '${NODE_URL} ${ROUTER_ADDRESS}' \
+            < curve-lp.base-staging.toml > ./processed/curve-lp-base-staging.toml
     fi
 
     echo -e "${GREEN}✓ Config files processed${NC}"
@@ -475,7 +499,9 @@ if [ "$MONITOR_JSON_REFRESH" = "1" ]; then
         emit_monitor_json arbitrum-one staging curve-lp.arbitrum-staging.toml ./processed/monitor/arbitrum-one-staging.json
         emit_monitor_json xdai         prod    curve-lp.gnosis.toml           ./processed/monitor/xdai-prod.json
         emit_monitor_json xdai         staging curve-lp.gnosis-staging.toml   ./processed/monitor/xdai-staging.json
-        REFRESHED=(mainnet-prod mainnet-staging arbitrum-one-prod arbitrum-one-staging xdai-prod xdai-staging)
+        emit_monitor_json base         prod    curve-lp.base.toml             ./processed/monitor/base-prod.json
+        emit_monitor_json base         staging curve-lp.base-staging.toml     ./processed/monitor/base-staging.json
+        REFRESHED=(mainnet-prod mainnet-staging arbitrum-one-prod arbitrum-one-staging xdai-prod xdai-staging base-prod base-staging)
     else
         if [ "$REBUILD_PROD" = "1" ]; then
             emit_monitor_json mainnet prod curve-lp.prod.toml ./processed/monitor/mainnet-prod.json
@@ -500,6 +526,14 @@ if [ "$MONITOR_JSON_REFRESH" = "1" ]; then
         if [ "$REBUILD_GNOSIS_STAGING" = "1" ]; then
             emit_monitor_json xdai staging curve-lp.gnosis-staging.toml ./processed/monitor/xdai-staging.json
             REFRESHED+=(xdai-staging)
+        fi
+        if [ "$REBUILD_BASE" = "1" ]; then
+            emit_monitor_json base prod curve-lp.base.toml ./processed/monitor/base-prod.json
+            REFRESHED+=(base-prod)
+        fi
+        if [ "$REBUILD_BASE_STAGING" = "1" ]; then
+            emit_monitor_json base staging curve-lp.base-staging.toml ./processed/monitor/base-staging.json
+            REFRESHED+=(base-staging)
         fi
     fi
 

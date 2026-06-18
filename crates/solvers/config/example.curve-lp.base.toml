@@ -1,0 +1,50 @@
+# Curve LP Token Solver Configuration — Base
+#
+# This solver handles LP sell orders for Curve LP tokens on Base.
+
+chain-id = 8453
+router-address = "0xa1c7a8360eb4049595a24d6919e74e105b409cb5"
+wrapped-native-token = "0x4200000000000000000000000000000000000006"
+price-api-chain = "base"
+
+# Token filtering: omitting lp-tokens and allowed-buy-tokens means the solver
+# accepts any sell order. Populate these once a smoke test confirms routing
+# works for the target pools.
+#
+# Candidate Base LP tokens (top TVL):
+# lp-tokens = [
+#     "0x302A94E3C28c290EAF2a4605FC52e11Eb915f378",  # superOETHb/WETH
+#     "0x98244d93D42b42aB3E3A4D12A5dc0B3e7f8F32f9",  # cbETH/WETH
+#     "0x33885a2851f68B02863cDA6a7622d26fB1172884",  # USDSM/USDC
+#     "0x5aB01ee6208596f2204B85bDFA39d34c2aDD98F6",  # USDC/Savings crvUSD
+#     "0x6e53131F68a034873b6bFA15502aF094Ef0c5854",  # tricrypto
+# ]
+#
+# Optional non-LP real-auction filter. If set, general orders must touch at
+# least one edge token; LP-priority orders and quote requests bypass it.
+# general-edge-tokens = [
+#     "0x417Ac0e078398C154EdFadD9Ef675d30Be60Af93",  # crvUSD
+# ]
+
+# Curve Router API URL (chain selected via chainId query param). Used for
+# sidechain telemetry comparison even when route-provider = "new-router".
+curve-api-url = "https://www.curve.finance/api/router/optimal-route"
+
+# Use the new curve_new_router service for execution quotes.
+route-provider = "new-router"
+new-router-url = "https://base.router.curve.finance/quote"
+
+# Curve Price API (for LP token pricing)
+curve-price-api-url = "https://prices.curve.finance/"
+
+# RPC node URL for on-chain verification
+node-url = "https://base-mainnet.g.alchemy.com/v2/YOUR_API_KEY"
+
+# Slippage buffer (basis points) - 1% for crypto pools
+slippage-bps = 100
+
+# Max deviation between API quote and on-chain get_dy (basis points)
+max-quote-deviation-bps = 50
+
+# CoW Protocol Settlement contract (same on all chains)
+settlement-contract = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"

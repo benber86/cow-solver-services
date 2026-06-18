@@ -1,0 +1,139 @@
+# Curve LP Solver - Base Staging Configuration
+#
+# Shares the same chain, RPC, router and token-allowlist as the prod
+# Base config. On sidechains the CoW staging settlement contract is the
+# same as production (0x9008…ab41) — only mainnet staging uses the shadow
+# contract — so this file is identical to curve-lp.base.toml apart from
+# this header.
+#
+# SECRETS: This file contains NO secrets.
+# NODE_URL and ROUTER_ADDRESS are injected by deploy.sh from
+# NODE_URL_BASE and ROUTER_ADDRESS_BASE in .env; RPC quota is shared
+# between prod and staging.
+
+chain-id = 8453
+router-address = "${ROUTER_ADDRESS}"
+wrapped-native-token = "0x4200000000000000000000000000000000000006"
+price-api-chain = "base"
+
+# RPC for on-chain verification (injected from environment)
+node-url = "${NODE_URL}"
+
+# Curve APIs (public, no auth needed). curve-api-url stays for sidechain
+# telemetry (parallel comparison logging on real solves).
+curve-api-url = "https://www.curve.finance/api/router/v1/routes"
+curve-price-api-url = "https://prices.curve.finance/"
+
+# Use the new curve_new_router service for execution quotes.
+route-provider = "new-router"
+new-router-url = "https://base.router.curve.finance/quote"
+
+# Token filtering — see README for how lp-tokens / allowed-buy-tokens /
+# token-allowlist interact. We use token-allowlist here (both-sides): any
+# order whose sell OR buy token is absent gets rejected before we pay for
+# Curve API / on-chain quotes. This list spans Curve-relevant Base tokens
+# + their pool LPs.
+#
+# Source: prod DB Base Curve pool universe (deduped by address).
+# Labels are informational; comment-drift is possible, the address is what
+# matters.
+lp-tokens = [
+    "0x302A94E3C28c290EAF2a4605FC52e11Eb915f378",  # sOETH/WETH
+    "0x98244d93D42b42aB3E3A4D12A5dc0B3e7f8F32f9",  # cbeth-f
+    "0x33885a2851f68B02863cDA6a7622d26fB1172884",  # USDSM/USDC
+    "0x5aB01ee6208596f2204B85bDFA39d34c2aDD98F6",  # scrvUSDC
+    "0x6e53131F68a034873b6bFA15502aF094Ef0c5854",  # tricrypto
+    "0xfac15A759d0F887Bc7F5ab874491258CF6EC8acE",  # cb-t-W-BTC
+    "0xba0C274085A078D19C46F2D902698A841cBFb289",  # LCAPeUSD
+    "0xf6C5F01C7F3148891ad0e19DF78743D31E390D1f",  # 4poolUSD-f
+    "0x6DfE79cecE4f64c1a34F48cF5802492aB595257E",  # CRV crvUSD-f
+    "0x09bF787B9AB2D52D7836272A41e9809481795AB0",  # DFBTesouro
+    "0x04f8Ade3a52E5c9d20C1A7ccbA1b86e745DfEE91",  # crvWcb
+    "0x39c0Fcc0e43A182A50356319565848A098491E00",  # cbbtcusdc2
+    "0xa9D6867C347B8b5f395B8421FB31710B8Fb21a16",  # USDCcgUSD
+    "0x4545410f7601b34A779EDcEbC641e529f465eeaa",  # wethusdc
+    "0x6771Bb9ec8da900eeBa738599c3CC4f8Fc07aEa7",  # BRZ/USDC
+    "0x773FdE6F33522d7A92775F2375AC76A6E6F279b7",  # ONES
+    "0x1C53971800C111a32B7889177C56E3488cfe0BE0",  # USDC/EURC A50-5
+    "0xbedD35F23Ea055C6af039f9c6a6fC8bdEe4d7a13",  # dfmDAI
+    "0xd6c283655B42FA0eb2685F7AB819784F071459dc",  # GREEN/USDC
+    "0x5eCFA6940a33A2dAd5c473896452f018c6c04577",  # dfmUSDbC
+    "0x8177AEcEea79097F1BB38866d6f3c90E9B73026f",  # USDA+USDC
+    "0x0F4DA4A9270C6002115FCE38949a7af48D089C5f",  # wcgUSDUSDC
+    "0xa0D3911349e701A1F49C1Ba2dDA34b4ce9636569",  # FROKETH
+    "0x70d410b739Da81303a76169CDD406A746BDE8b34",  # dfmUSDC
+    "0x3490B07C107a6836f2Fd9Dd0F53cfA8eFd4aD6ef",  # NPR-PT/USR@17/6/2025
+    "0xF2EcC3A2dEFB4ECC1Ac510CBbc405a539A990BE4",  # USDC/WETH A3
+    "0x1090a57182746d1b4Dad650459d474fe8a023cec",  # USDC/WETH A5
+    "0xf96A0eC41AE502d2Bc58B7D5838ED39A33Ae1d9f",  # USDC/WETH A10
+    "0xb387837E3E9Ff063bF407632f18ff9232dC66ea7",  # USDC/WETH A20
+    "0x2bad5A4EdDB7ab7188c629B4B93166d07985059F",  # USDeADUSDC
+    "0xbc2c6645431F7C4A96748f2c9f290B909F8A1113",  # USDC/WETH A40
+    "0x8bb3d81Aabb1361Bf639bB07c53abe1C7fE53f2D",  # frxUSDUSDC
+    "0x3CeA080D303bD105c48cA4C24D8426da99f75524",  # USDC/AERO A20
+    "0xcF846b006925F9E60A52373fbfA81595663A2ee4",  # VVVWBTC
+    "0x8B1eb9240dAE949680468E9f174adFb4fb247744",  # EVG3
+    "0xbeBefF1cdc324ADEc7feeCbee1F72E7022895456",  # WETHCBBTC
+    "0x63Eb7846642630456707C3efBb50A03c79B89D81",  # usdc-usdm
+    "0xF25E1dB1f0c7BD1a29761a1FcDaE187B8718CF18",  # BTC
+    "0x451C64deC35170B9fc73c877d6aD1346D59Da6A5",  # USDSANCHO
+]
+
+token-allowlist = [
+    "0x0555E30da8f98308EdB960aa94C0Db47230d2B9c",  # WBTC
+    "0x236aa50979D5f3De3Bd1Eeb40E81137F22ab794b",  # tBTC
+    "0x26C358F7c5fEdB20a6ddEf108cD91Efb6B8Da0Cb",  # USDSM
+    "0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22",  # cbETH
+    "0x35E5dB674D8e93a03d814FA0ADa70731efe8a4b9",  # USR
+    "0x417Ac0e078398C154EdFadD9Ef675d30Be60Af93",  # crvUSD
+    "0x4200000000000000000000000000000000000006",  # WETH
+    "0x42069BAbe14fB1802C5CB0F50BB9D2Ad6FEf55e2",  # FROK
+    "0x4552FA6b0D21b1b135Ffa2a573A568D58300b5A9",  # SANCHO
+    "0x4dA9A0f397dB1397902070f93a4D6ddBC0E0E6e8",  # LCAP
+    "0x4e44fB5c61a89CF44a9080AB987335889FCaA6bd",  # USDA+
+    "0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb",  # DAI
+    "0x59D9356E565Ab3A36dD77763Fc0d87fEaf85508C",  # USDM
+    "0x5AE84075F0E34946821A8015dAB5299A00992721",  # wcgUSD
+    "0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42",  # EURC
+    "0x646A737B9B6024e49f5908762B3fF73e65B5160c",  # scrvUSD
+    "0x69420f9E38a4e60a62224C489be4BF7a94402496",  # MONEY
+    "0x698b203b4C4275B098d7434D6B8aBDCDe451F048",  # PT-USR@17/6/2025
+    "0x7ceE47e7B7CD04CF984e8Dd86C42595B5771A9B2",  # TESOURO
+    "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",  # USDC
+    "0x8eA57c4D7a6A88C90bcF038d37939FAE61305A88",  # EVRGROW
+    "0x8Ee73c484A26e0A5df2Ee2a4960B789967dd0415",  # CRV
+    "0x940181a94A35A4569E4529A3CDfB74e38FD98631",  # AERO
+    "0x9Bc2C28DF6560C343d3fa9c152Bed80D4511DEAd",  # USDeAD
+    "0xacfE6019Ed1A7Dc6f7B508C02d1b04ec88cC21bf",  # VVV
+    "0xCa32694B58FD19b23F585054e4A8d8b84a6e3177",  # ONE
+    "0xCa72827a3D211CfD8F6b00Ac98824872b72CAb49",  # cgUSD
+    "0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf",  # cbBTC
+    "0xCfA3Ef56d303AE4fAabA0592388F19d7C3399FB4",  # eUSD
+    "0xd1Eac76497D06Cf15475A5e3984D5bC03de7C707",  # GREEN
+    "0xd63EA19D53DbA102fa0e6a250326B7aC50bf5050",  # usBTC
+    "0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA",  # USDbC
+    "0xDBFeFD2e8460a6Ee4955A68582F85708BAEA60A3",  # superOETHb
+    "0xe5020A6d073a794B6E7f05678707dE47986Fb0b6",  # frxUSD
+    "0xE9185Ee218cae427aF7B9764A011bb89FeA761B4",  # BRZ
+    "0xEB466342C4d449BC9f53A865D5Cb90586f405215",  # axlUSDC
+]
+
+# Optional buy-token either-side filter (left disabled):
+# allowed-buy-tokens = [
+# ]
+
+# Safety settings
+slippage-bps = 100              # 1% calldata slippage buffer
+bid-slippage-bps = 5            # 0.05% competitive bid haircut
+max-quote-deviation-bps = 300   # 3% max deviation between API and on-chain quote
+max-general-order-market-deviation-bps = 200  # 2% pre-router general-order filter
+max-general-order-validity-secs = 86400       # skip >1d non-LP general orders
+skip-general-orders-with-hooks = true         # skip non-LP hook/flashloan/wrapper orders
+max-general-orders-per-auction = 24
+max-general-orders-per-pair = 2
+max-regular-orders-per-auction = 4            # fallback for marketable non-edge generic flow
+max-regular-orders-per-pair = 1
+
+# CoW Protocol Settlement contract. On sidechains, staging uses the
+# production address (only mainnet staging differs).
+settlement-contract = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"

@@ -72,6 +72,7 @@ pub enum CurvePriceApiChain {
     Ethereum,
     Arbitrum,
     Xdai,
+    Base,
 }
 
 impl CurvePriceApiChain {
@@ -80,6 +81,7 @@ impl CurvePriceApiChain {
             Self::Ethereum => "ethereum",
             Self::Arbitrum => "arbitrum",
             Self::Xdai => "xdai",
+            Self::Base => "base",
         }
     }
 }
@@ -116,7 +118,7 @@ impl fmt::Display for ChainConfigError {
             Self::UnsupportedChain(id) => {
                 write!(
                     f,
-                    "unsupported chain_id {id}; expected one of 1, 100, 42161"
+                    "unsupported chain_id {id}; expected one of 1, 100, 8453, 42161"
                 )
             }
             Self::PriceApiChainMismatch { chain_id, slug } => write!(
@@ -148,6 +150,7 @@ impl ChainConfig {
             1 => CurvePriceApiChain::Ethereum,
             42161 => CurvePriceApiChain::Arbitrum,
             100 => CurvePriceApiChain::Xdai,
+            8453 => CurvePriceApiChain::Base,
             _ => return Err(ChainConfigError::UnsupportedChain(self.chain_id)),
         };
 

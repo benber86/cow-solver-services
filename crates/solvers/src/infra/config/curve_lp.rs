@@ -263,6 +263,12 @@ mod tests {
     }
 
     #[test]
+    fn example_base_config_is_valid() {
+        let raw = include_str!("../../../config/example.curve-lp.base.toml");
+        parse_and_validate(raw).expect("base example should parse and validate");
+    }
+
+    #[test]
     fn local_config_is_valid() {
         let raw = include_str!("../../../../../configs/local/curve-lp.local.toml");
         parse_and_validate(raw).expect("local config should parse and validate");
@@ -302,6 +308,18 @@ mod tests {
     fn gnosis_staging_deploy_config_is_valid() {
         let raw = include_str!("../../../../../deploy/curve-lp/curve-lp.gnosis-staging.toml");
         parse_and_validate(raw).expect("gnosis staging deploy config should parse and validate");
+    }
+
+    #[test]
+    fn base_deploy_config_is_valid() {
+        let raw = include_str!("../../../../../deploy/curve-lp/curve-lp.base.toml");
+        parse_and_validate(raw).expect("base deploy config should parse and validate");
+    }
+
+    #[test]
+    fn base_staging_deploy_config_is_valid() {
+        let raw = include_str!("../../../../../deploy/curve-lp/curve-lp.base-staging.toml");
+        parse_and_validate(raw).expect("base staging deploy config should parse and validate");
     }
 
     /// A minimal TOML document with just the required fields, plus whatever

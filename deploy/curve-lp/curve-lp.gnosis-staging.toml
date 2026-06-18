@@ -1,9 +1,10 @@
 # Curve LP Solver - Gnosis Chain Staging Configuration
 #
 # Shares the same chain, RPC, router and token-allowlist as the prod
-# Gnosis config; only the settlement contract differs (CoW staging /
-# shadow settlement at 0xf553…cb13 — orders routed to this container go
-# through CoW shadow competitions, not real settlement).
+# Gnosis config. On sidechains the CoW staging settlement contract is the
+# same as production (0x9008…ab41) — only mainnet staging uses the shadow
+# contract — so this file is identical to curve-lp.gnosis.toml apart from
+# this header.
 #
 # SECRETS: This file contains NO secrets.
 # NODE_URL and ROUTER_ADDRESS are injected by deploy.sh from
@@ -112,5 +113,6 @@ max-general-orders-per-pair = 3
 max-regular-orders-per-auction = 4            # fallback for marketable non-edge generic flow
 max-regular-orders-per-pair = 1
 
-# CoW Protocol Staging / Shadow settlement contract (same on all chains)
-settlement-contract = "0xf553d092b50bdcbdded1a99af2ca29fbe5e2cb13"
+# CoW Protocol Settlement contract. On sidechains, staging uses the
+# production address (only mainnet staging uses the shadow contract).
+settlement-contract = "0x9008D19f58AAbD9eD0D60971565AA8510560ab41"

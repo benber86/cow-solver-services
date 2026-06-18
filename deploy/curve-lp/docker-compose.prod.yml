@@ -241,6 +241,52 @@ services:
         max-size: "100m"
         max-file: "3"
 
+  base:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: solvers
+    command: >
+      --addr 0.0.0.0:7872
+      curvelp
+      --config /config/curve-lp-base.toml
+    expose:
+      - "7872"
+    volumes:
+      - ./processed/curve-lp-base.toml:/config/curve-lp-base.toml:ro
+    environment:
+      - NODE_URL=${NODE_URL_BASE}
+      - USE_JSON_LOGS=true
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
+  base-staging:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: solvers
+    command: >
+      --addr 0.0.0.0:7872
+      curvelp
+      --config /config/curve-lp-base-staging.toml
+    expose:
+      - "7872"
+    volumes:
+      - ./processed/curve-lp-base-staging.toml:/config/curve-lp-base-staging.toml:ro
+    environment:
+      - NODE_URL=${NODE_URL_BASE}
+      - USE_JSON_LOGS=true
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "3"
+
 volumes:
   certbot-etc:
   certbot-www:
