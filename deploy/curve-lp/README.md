@@ -167,12 +167,13 @@ tries first. All are optional.
 | `token-allowlist`      | **both-sides** — reject if either `sell.token` or `buy.token` is outside `token-allowlist ∪ lp-tokens` | "confine the solver to a known universe"          |
 | `general-edge-tokens`  | real-auction, non-LP-only — at least one side must be in this list; quote requests and LP-priority orders bypass it | "avoid generic blue-chip flow unless it touches a Curve-edge token" |
 
-Mainnet uses `lp-tokens` as a hard LP-specialist filter. Arbitrum/Gnosis use
-`token-allowlist` as a broad safety universe, `lp-tokens` as priority, and
-`general-edge-tokens` to keep non-LP general attempts focused on chain-specific
-Curve-edge assets. LP-involved orders are attempted first, then eligible non-LP
-allowlisted pairs consume whatever deadline remains. Leaving all four omitted
-attempts every order and can cause deadline timeouts.
+All chains use `lp-tokens` as priority: LP-involved orders are attempted first
+and are not capped by the general-order limits. `token-allowlist` defines the
+eligible token universe for non-LP orders. `general-edge-tokens`, when present,
+is an extra non-LP-only filter that keeps broad routing focused on pairs where
+Curve has a plausible edge. After LP orders, eligible non-LP allowlisted pairs
+consume whatever deadline remains. Leaving all four omitted attempts every order
+and can cause deadline timeouts.
 
 Shared safety knobs across all chain configs:
 - `slippage-bps = 100` keeps a 1% calldata revert buffer
@@ -252,8 +253,15 @@ What it reports (every 5 min tick):
 - Hourly summary across all solver containers: auctions, quotes, orders processed, solution candidates, errors.
 - Idle heartbeat every 30 min if no activity.
 
-`tg-monitor.sh` watches all eight solver containers. Solve notifications are
-routed by chain:
+`tg-monitor.sh` watches all eight solver containers. There are **two**
+notification streams per chain, each with its own topic — don't conflate them:
+
+- **Candidates** (`TG_TRADES_THREAD_*`): "Solution Candidate" — we produced a
+  candidate solution (got *selected* to bid). NOT settled.
+- **Settled** (`TG_WINS_THREAD_*`): "Auction Won" — confirmed *settled* on-chain
+  transaction (has tx hash + block). The real executed trade.
+
+Candidate notifications are routed by chain:
 - mainnet -> `TG_TRADES_THREAD_MAINNET` (fallback `TG_TRADES_THREAD`)
 - arbitrum -> `TG_TRADES_THREAD_ARBITRUM` (fallback `TG_TRADES_THREAD`)
 - gnosis -> `TG_TRADES_THREAD_GNOSIS` (fallback `TG_TRADES_THREAD`)
@@ -262,7 +270,7 @@ routed by chain:
 Prod and staging notifications for the same chain land in the same Telegram
 topic; the message body includes `Chain:` and `Env:` so you can tell them apart.
 
-Confirmed win notifications are sent to `TG_CHAT_ID` and can use separate
+Settled-transaction notifications are sent to `TG_CHAT_ID` and can use separate
 topics:
 
 ```
@@ -270,6 +278,7 @@ TG_WINS_THREAD=
 TG_WINS_THREAD_MAINNET=
 TG_WINS_THREAD_ARBITRUM=
 TG_WINS_THREAD_GNOSIS=
+TG_WINS_THREAD_BASE=
 ```
 
 If a per-chain wins thread is omitted, it falls back to `TG_WINS_THREAD`;
