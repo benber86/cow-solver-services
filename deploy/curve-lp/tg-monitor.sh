@@ -26,16 +26,19 @@ TG_TRADES_THREAD=${TG_TRADES_THREAD:-3}             # Legacy/default trades topi
 TG_TRADES_THREAD_MAINNET=${TG_TRADES_THREAD_MAINNET:-$TG_TRADES_THREAD}
 TG_TRADES_THREAD_ARBITRUM=${TG_TRADES_THREAD_ARBITRUM:-$TG_TRADES_THREAD}
 TG_TRADES_THREAD_GNOSIS=${TG_TRADES_THREAD_GNOSIS:-$TG_TRADES_THREAD}
+TG_TRADES_THREAD_BASE=${TG_TRADES_THREAD_BASE:-$TG_TRADES_THREAD}
 TG_WINS_THREAD=${TG_WINS_THREAD-$TG_TRADES_THREAD}
 TG_WINS_THREAD_MAINNET=${TG_WINS_THREAD_MAINNET-$TG_WINS_THREAD}
 TG_WINS_THREAD_ARBITRUM=${TG_WINS_THREAD_ARBITRUM-$TG_WINS_THREAD}
 TG_WINS_THREAD_GNOSIS=${TG_WINS_THREAD_GNOSIS-$TG_WINS_THREAD}
+TG_WINS_THREAD_BASE=${TG_WINS_THREAD_BASE-$TG_WINS_THREAD}
 COW_SOLVER_NAME=${COW_SOLVER_NAME:-curve}
 TG_WIN_MAX_TRADES_PER_ORDER=${TG_WIN_MAX_TRADES_PER_ORDER:-20}
 TG_WIN_STATE_FILE=${TG_WIN_STATE_FILE-./processed/tg-wins-seen.txt}
 TG_WIN_LOOKBACK_BLOCKS_MAINNET=${TG_WIN_LOOKBACK_BLOCKS_MAINNET:-200}
 TG_WIN_LOOKBACK_BLOCKS_ARBITRUM=${TG_WIN_LOOKBACK_BLOCKS_ARBITRUM:-5000}
 TG_WIN_LOOKBACK_BLOCKS_GNOSIS=${TG_WIN_LOOKBACK_BLOCKS_GNOSIS:-240}
+TG_WIN_LOOKBACK_BLOCKS_BASE=${TG_WIN_LOOKBACK_BLOCKS_BASE:-5000}
 
 COMPOSE_FILE="docker-compose.prod.yml"
 INTERVAL=300  # 5 minutes
@@ -48,6 +51,8 @@ SOLVER_SERVICES=(
     arbitrum-staging
     gnosis
     gnosis-staging
+    base
+    base-staging
 )
 
 idle_cycles=0
@@ -95,6 +100,7 @@ service_chain() {
         solver|solver-staging) echo "mainnet" ;;
         arbitrum|arbitrum-staging) echo "arbitrum" ;;
         gnosis|gnosis-staging) echo "gnosis" ;;
+        base|base-staging) echo "base" ;;
         *) echo "unknown" ;;
     esac
 }
@@ -111,6 +117,7 @@ chain_thread() {
         mainnet) echo "$TG_TRADES_THREAD_MAINNET" ;;
         arbitrum) echo "$TG_TRADES_THREAD_ARBITRUM" ;;
         gnosis) echo "$TG_TRADES_THREAD_GNOSIS" ;;
+        base) echo "$TG_TRADES_THREAD_BASE" ;;
         *) echo "$TG_TRADES_THREAD" ;;
     esac
 }
@@ -120,6 +127,7 @@ chain_wins_thread() {
         mainnet) echo "$TG_WINS_THREAD_MAINNET" ;;
         arbitrum) echo "$TG_WINS_THREAD_ARBITRUM" ;;
         gnosis) echo "$TG_WINS_THREAD_GNOSIS" ;;
+        base) echo "$TG_WINS_THREAD_BASE" ;;
         *) echo "$TG_WINS_THREAD" ;;
     esac
 }
@@ -129,6 +137,7 @@ cow_api_chain() {
         mainnet) echo "mainnet" ;;
         arbitrum) echo "arbitrum_one" ;;
         gnosis) echo "xdai" ;;
+        base) echo "base" ;;
         *) echo "" ;;
     esac
 }
@@ -138,6 +147,7 @@ chain_rpc_url() {
         mainnet) echo "${NODE_URL:-https://ethereum.publicnode.com}" ;;
         arbitrum) echo "${NODE_URL_ARBITRUM:-https://arb1.arbitrum.io/rpc}" ;;
         gnosis) echo "${NODE_URL_GNOSIS:-https://rpc.gnosischain.com}" ;;
+        base) echo "${NODE_URL_BASE:-https://mainnet.base.org}" ;;
         *) echo "" ;;
     esac
 }
@@ -147,6 +157,7 @@ chain_win_lookback_blocks() {
         mainnet) echo "$TG_WIN_LOOKBACK_BLOCKS_MAINNET" ;;
         arbitrum) echo "$TG_WIN_LOOKBACK_BLOCKS_ARBITRUM" ;;
         gnosis) echo "$TG_WIN_LOOKBACK_BLOCKS_GNOSIS" ;;
+        base) echo "$TG_WIN_LOOKBACK_BLOCKS_BASE" ;;
         *) echo "0" ;;
     esac
 }
@@ -157,6 +168,7 @@ explorer_order_url() {
     case "$chain" in
         arbitrum) echo "https://explorer.cow.fi/arb1/orders/${uid}" ;;
         gnosis) echo "https://explorer.cow.fi/gc/orders/${uid}" ;;
+        base) echo "https://explorer.cow.fi/base/orders/${uid}" ;;
         *) echo "https://explorer.cow.fi/orders/${uid}" ;;
     esac
 }
@@ -171,6 +183,7 @@ explorer_tx_url() {
     case "$chain" in
         arbitrum) echo "https://arbiscan.io/tx/${tx}" ;;
         gnosis) echo "https://gnosisscan.io/tx/${tx}" ;;
+        base) echo "https://basescan.io/tx/${tx}" ;;
         *) echo "https://etherscan.io/tx/${tx}" ;;
     esac
 }
@@ -210,6 +223,21 @@ token_meta() {
         mainnet:0x6b175474e89094c44da98b954eedeac495271d0f) echo "DAI|18" ;;
         mainnet:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2) echo "WETH|18" ;;
         mainnet:0xd533a949740bb3306d119cc777fa900ba034cd52) echo "CRV|18" ;;
+        base:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913) echo "USDC|6" ;;
+        base:0xd9aaec86b65d86f6a7b5b1b0c42ffa531710b6ca) echo "USDbC|6" ;;
+        base:0x60a3e35cc302bfa44cb288bc5a4f316fdb1adb42) echo "EURC|6" ;;
+        base:0x4200000000000000000000000000000000000006) echo "WETH|18" ;;
+        base:0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22) echo "cbETH|18" ;;
+        base:0xdbfefd2e8460a6ee4955a68582f85708baea60a3) echo "superOETHb|18" ;;
+        base:0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf) echo "cbBTC|8" ;;
+        base:0x0555e30da8f98308edb960aa94c0db47230d2b9c) echo "WBTC|8" ;;
+        base:0x236aa50979d5f3de3bd1eeb40e81137f22ab794b) echo "tBTC|18" ;;
+        base:0x417ac0e078398c154edfadd9ef675d30be60af93) echo "crvUSD|18" ;;
+        base:0x646a737b9b6024e49f5908762b3ff73e65b5160c) echo "scrvUSD|18" ;;
+        base:0x59d9356e565ab3a36dd77763fc0d87feaf85508c) echo "USDM|18" ;;
+        base:0x50c5725949a6f0c72e6c4a641f24049a917db0cb) echo "DAI|18" ;;
+        base:0x8ee73c484a26e0a5df2ee2a4960b789967dd0415) echo "CRV|18" ;;
+        base:0x940181a94a35a4569e4529a3cdfb74e38fd98631) echo "AERO|18" ;;
         *) echo "raw|18" ;;
     esac
 }
@@ -429,9 +457,9 @@ Ranking: ${ranking}"
 # Startup message
 send_tg "$TG_STATS_THREAD" "🟢 Solver monitor started
 
-Watching: mainnet, arbitrum, gnosis
-Trades threads: mainnet=${TG_TRADES_THREAD_MAINNET:-default}, arbitrum=${TG_TRADES_THREAD_ARBITRUM:-default}, gnosis=${TG_TRADES_THREAD_GNOSIS:-default}
-Wins threads: mainnet=${TG_WINS_THREAD_MAINNET:-default}, arbitrum=${TG_WINS_THREAD_ARBITRUM:-default}, gnosis=${TG_WINS_THREAD_GNOSIS:-default}"
+Watching: mainnet, arbitrum, gnosis, base
+Trades threads: mainnet=${TG_TRADES_THREAD_MAINNET:-default}, arbitrum=${TG_TRADES_THREAD_ARBITRUM:-default}, gnosis=${TG_TRADES_THREAD_GNOSIS:-default}, base=${TG_TRADES_THREAD_BASE:-default}
+Wins threads: mainnet=${TG_WINS_THREAD_MAINNET:-default}, arbitrum=${TG_WINS_THREAD_ARBITRUM:-default}, gnosis=${TG_WINS_THREAD_GNOSIS:-default}, base=${TG_WINS_THREAD_BASE:-default}"
 
 while true; do
     sleep "$INTERVAL"
