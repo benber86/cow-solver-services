@@ -5,16 +5,22 @@
 
 # Chain ID (1 = Ethereum mainnet)
 chain-id = 1
-router-address = "0x45312ea0eFf7E09C83CBE249fa1d7598c4C8cd4e"
+router-address = "${ROUTER_ADDRESS}"
 wrapped-native-token = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
 price-api-chain = "ethereum"
 
 # RPC for on-chain verification (injected from environment)
 node-url = "${NODE_URL}"
 
-# Curve APIs (public, no auth needed)
+# Curve APIs (public, no auth needed). curve-api-url stays for telemetry
+# (parallel legacy-vs-new comparison logging on real solves).
 curve-api-url = "https://www.curve.finance/api/router/v1/routes"
 curve-price-api-url = "https://prices.curve.finance/"
+
+# Use the new curve_new_router service for execution quotes (Curve uses the
+# `ethereum` slug for the mainnet host).
+route-provider = "new-router"
+new-router-url = "https://ethereum.router.curve.finance/quote"
 
 # Token filtering: keep this solver scoped to known Curve LP sell tokens.
 # Running without lp-tokens means every sell order is attempted, which can

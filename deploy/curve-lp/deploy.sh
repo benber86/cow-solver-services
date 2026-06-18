@@ -210,7 +210,7 @@ set +a
 # Required vars depend on which services we're building.
 REQUIRED_VARS=()
 if [ "$REBUILD_PROD" = "1" ] || [ "$REBUILD_STAGING" = "1" ]; then
-    REQUIRED_VARS+=("NODE_URL")
+    REQUIRED_VARS+=("NODE_URL" "ROUTER_ADDRESS_MAINNET")
 fi
 if [ "$REBUILD_ARBITRUM" = "1" ] || [ "$REBUILD_ARBITRUM_STAGING" = "1" ]; then
     REQUIRED_VARS+=("NODE_URL_ARBITRUM" "ROUTER_ADDRESS_ARBITRUM")
@@ -224,7 +224,7 @@ fi
 # Ingress needs DOMAIN and SSL_EMAIL; also needed for the DOMAIN placeholder
 # in nginx.template that certbot-init and nginx substitute at startup.
 if [ ${#INGRESS_SERVICES[@]} -gt 0 ]; then
-    REQUIRED_VARS+=("DOMAIN" "SSL_EMAIL" "ROUTER_ADDRESS_ARBITRUM" "ROUTER_ADDRESS_GNOSIS" "ROUTER_ADDRESS_BASE")
+    REQUIRED_VARS+=("DOMAIN" "SSL_EMAIL" "ROUTER_ADDRESS_MAINNET" "ROUTER_ADDRESS_ARBITRUM" "ROUTER_ADDRESS_GNOSIS" "ROUTER_ADDRESS_BASE")
 fi
 
 MISSING_VARS=()
@@ -250,9 +250,13 @@ for url_var in NODE_URL NODE_URL_ARBITRUM NODE_URL_GNOSIS NODE_URL_BASE; do
     fi
 done
 
-for address_var in ROUTER_ADDRESS_ARBITRUM ROUTER_ADDRESS_GNOSIS ROUTER_ADDRESS_BASE; do
+for address_var in ROUTER_ADDRESS_MAINNET ROUTER_ADDRESS_ARBITRUM ROUTER_ADDRESS_GNOSIS ROUTER_ADDRESS_BASE; do
     if [ -n "${!address_var:-}" ] && ! [[ "${!address_var}" =~ ^0x[0-9a-fA-F]{40}$ ]]; then
         echo -e "${RED}ERROR: $address_var must be a 20-byte 0x-prefixed address${NC}" >&2
+        exit 1
+    fi
+    if [ -n "${!address_var:-}" ] && [ "${!address_var}" = "0x0000000000000000000000000000000000000000" ]; then
+        echo -e "${RED}ERROR: $address_var must not be the zero address${NC}" >&2
         exit 1
     fi
 done
@@ -285,11 +289,13 @@ if [ ${#SOLVER_SERVICES[@]} -gt 0 ]; then
     # left alone. Only process the configs whose services are being rebuilt.
 
     if [ "$REBUILD_PROD" = "1" ]; then
-        NODE_URL="$NODE_URL" envsubst '${NODE_URL}' \
+        NODE_URL="$NODE_URL" ROUTER_ADDRESS="$ROUTER_ADDRESS_MAINNET" \
+            envsubst '${NODE_URL} ${ROUTER_ADDRESS}' \
             < curve-lp.prod.toml > ./processed/curve-lp.toml
     fi
     if [ "$REBUILD_STAGING" = "1" ]; then
-        NODE_URL="$NODE_URL" envsubst '${NODE_URL}' \
+        NODE_URL="$NODE_URL" ROUTER_ADDRESS="$ROUTER_ADDRESS_MAINNET" \
+            envsubst '${NODE_URL} ${ROUTER_ADDRESS}' \
             < curve-lp.staging.toml > ./processed/curve-lp-staging.toml
     fi
     if [ "$REBUILD_ARBITRUM" = "1" ]; then
@@ -411,7 +417,7 @@ extract_token_allowlist() {
 }
 
 # emit_monitor_json <chain> <env> <source-toml> <output-json>
-# `chain` matches CoW's network slug (mainnet|arbitrum-one|xdai), `env` is
+# `chain` matches CoW's network slug (mainnet|arbitrum-one|xdai|base), `env` is
 # prod|staging. Both are emitted into the JSON so the UI can render the
 # chain × env matrix without having to infer either from the filename.
 emit_monitor_json() {
@@ -428,6 +434,7 @@ emit_monitor_json() {
     router="$(extract_scalar "$src" "router-address")"
     if [ "$router" = '"${ROUTER_ADDRESS}"' ]; then
         case "$chain" in
+            mainnet) router="\"$ROUTER_ADDRESS_MAINNET\"" ;;
             arbitrum-one) router="\"$ROUTER_ADDRESS_ARBITRUM\"" ;;
             xdai) router="\"$ROUTER_ADDRESS_GNOSIS\"" ;;
             base) router="\"$ROUTER_ADDRESS_BASE\"" ;;

@@ -22,11 +22,11 @@ container points at.
 | `solver`            | Ethereum | prod `0x9008…`  | `/prod/mainnet/`                                     | **Yes**        |
 | `solver-staging`    | Ethereum | shadow `0xf553…`| `/staging/mainnet/`, `/shadow/mainnet/`              | Yes            |
 | `arbitrum`          | Arbitrum | prod `0x9008…`  | `/prod/arbitrum-one/`                                | Yes            |
-| `arbitrum-staging`  | Arbitrum | prod `0x9008…`  | `/staging/arbitrum-one/`, `/shadow/arbitrum-one/`    | Yes            |
+| `arbitrum-staging`  | Arbitrum | shadow `0xf553…`| `/staging/arbitrum-one/`, `/shadow/arbitrum-one/`    | Yes            |
 | `gnosis`            | Gnosis   | prod `0x9008…`  | `/prod/xdai/`                                        | Yes            |
-| `gnosis-staging`    | Gnosis   | prod `0x9008…`  | `/staging/xdai/`, `/shadow/xdai/`                    | Yes            |
+| `gnosis-staging`    | Gnosis   | shadow `0xf553…`| `/staging/xdai/`, `/shadow/xdai/`                    | Yes            |
 | `base`              | Base     | prod `0x9008…`  | `/prod/base/`                                        | Yes            |
-| `base-staging`      | Base     | prod `0x9008…`  | `/staging/base/`, `/shadow/base/`                    | Yes            |
+| `base-staging`      | Base     | shadow `0xf553…`| `/staging/base/`, `/shadow/base/`                    | Yes            |
 | `nginx`             | —        | —             | —                                                    | —              |
 | `certbot`           | —        | —             | —                                                    | —              |
 
@@ -45,7 +45,7 @@ about operationally.
 
 Chain support is mostly config-driven once the solver knows the chain ID / price
 slug pair. To add a new chain you need: a Curve Router deployment, a Curve
-Price API slug (`ethereum`/`arbitrum`/`xdai` today), wrapped-native token, a
+Price API slug (`ethereum`/`arbitrum`/`xdai`/`base` today), wrapped-native token, a
 compose service, an nginx location, and the corresponding `ChainConfig`
 validation entry in `crates/solvers/src/domain/solver/curve_lp.rs`.
 
@@ -145,7 +145,9 @@ Per-chain TOMLs in `deploy/curve-lp/`:
 - `curve-lp.base-staging.toml`
 
 These are the source of truth. `deploy.sh` runs them through `envsubst`
-(`${NODE_URL}`, plus `${ROUTER_ADDRESS}` on sidechains — both scoped per-chain)
+(`${NODE_URL}` plus `${ROUTER_ADDRESS}` — both scoped per-chain from
+`NODE_URL` / `ROUTER_ADDRESS_MAINNET` on mainnet and the corresponding
+`NODE_URL_*` / `ROUTER_ADDRESS_*` vars on sidechains)
 into `./processed/` and mounts the result into the container.
 
 Compile-time tests (`cargo test -p solvers --lib infra::config::curve_lp`)
@@ -205,6 +207,7 @@ not committed. `.env.example` is the template. Required vars:
 | `NODE_URL_ARBITRUM`  | rebuilding `arbitrum` or `arbitrum-staging` |
 | `NODE_URL_GNOSIS`    | rebuilding `gnosis` or `gnosis-staging` |
 | `NODE_URL_BASE`      | rebuilding `base` or `base-staging` |
+| `ROUTER_ADDRESS_MAINNET` | rebuilding `solver` / `solver-staging`, or refreshing ingress monitor config |
 | `ROUTER_ADDRESS_ARBITRUM` | rebuilding `arbitrum` / `arbitrum-staging`, or refreshing ingress monitor config |
 | `ROUTER_ADDRESS_GNOSIS` | rebuilding `gnosis` / `gnosis-staging`, or refreshing ingress monitor config |
 | `ROUTER_ADDRESS_BASE` | rebuilding `base` / `base-staging`, or refreshing ingress monitor config |
