@@ -488,7 +488,7 @@ if [ "$MONITOR_JSON_REFRESH" = "1" ]; then
     mkdir -p ./processed/monitor
 
     # JSON files are `{chain}-{env}.json` — the UI fetches them by chain×env
-    # combo. On ingress rebuild we refresh all six so the UI can't be ahead
+    # combo. On ingress rebuild we refresh all eight so the UI can't be ahead
     # of reality anywhere. Otherwise refresh only the cells whose solver is
     # being rebuilt right now.
     REFRESHED=()
@@ -597,6 +597,9 @@ if [ ${#INGRESS_SERVICES[@]} -gt 0 ] && [ -n "${DOMAIN:-}" ]; then
     fi
     if [ "$REBUILD_GNOSIS" = "1" ] || [ "$INGRESS_ONLY" = "1" ]; then
         echo "  curl https://$DOMAIN/prod/xdai/healthz"
+    fi
+    if [ "$REBUILD_BASE" = "1" ] || [ "$INGRESS_ONLY" = "1" ]; then
+        echo "  curl https://$DOMAIN/prod/base/healthz"
     fi
     echo "  curl https://$DOMAIN/healthz   # back-compat: probes mainnet prod"
 fi

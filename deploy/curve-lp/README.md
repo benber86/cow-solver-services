@@ -71,13 +71,14 @@ independently).
 
 | invocation                                       | rebuilds                                                                 |
 |--------------------------------------------------|--------------------------------------------------------------------------|
-| `./deploy.sh`                                    | all six solvers (prod + staging for each of mainnet/arbi/gnosis)          |
-| `./deploy.sh --skip-prod`                        | the three `*-staging` containers only                                    |
+| `./deploy.sh`                                    | all eight solvers (prod + staging for each of mainnet/arbi/gnosis/base)   |
+| `./deploy.sh --skip-prod`                        | the four `*-staging` containers only                                     |
 | `./deploy.sh --chains=arbitrum`                  | arbitrum + arbitrum-staging                                              |
 | `./deploy.sh --chains=arbitrum,gnosis`           | those four: arbitrum, arbitrum-staging, gnosis, gnosis-staging           |
+| `./deploy.sh --chains=base`                      | base + base-staging                                                      |
 | `./deploy.sh --chains=mainnet --skip-prod`       | solver-staging only                                                       |
 | `./deploy.sh --chains=arbitrum --with-ingress`   | arbitrum + arbitrum-staging + nginx + certbot                            |
-| `./deploy.sh --with-ingress`                     | all six solvers + nginx + certbot                                        |
+| `./deploy.sh --with-ingress`                     | all eight solvers + nginx + certbot                                      |
 | `./deploy.sh --ingress-only`                     | nginx + certbot, no solvers                                              |
 
 **When to use `--with-ingress`**: new chain, new public route, or any
@@ -199,8 +200,10 @@ not committed. `.env.example` is the template. Required vars:
 | `NODE_URL`           | rebuilding `solver` or `solver-staging` |
 | `NODE_URL_ARBITRUM`  | rebuilding `arbitrum` or `arbitrum-staging` |
 | `NODE_URL_GNOSIS`    | rebuilding `gnosis` or `gnosis-staging` |
+| `NODE_URL_BASE`      | rebuilding `base` or `base-staging` |
 | `ROUTER_ADDRESS_ARBITRUM` | rebuilding `arbitrum` / `arbitrum-staging`, or refreshing ingress monitor config |
 | `ROUTER_ADDRESS_GNOSIS` | rebuilding `gnosis` / `gnosis-staging`, or refreshing ingress monitor config |
+| `ROUTER_ADDRESS_BASE` | rebuilding `base` / `base-staging`, or refreshing ingress monitor config |
 | `DOMAIN`             | ingress (nginx/certbot)                 |
 | `SSL_EMAIL`          | ingress                                 |
 | `TG_BOT_TOKEN`, `TG_CHAT_ID`, `TG_*_THREAD` | telegram monitor (optional) |
@@ -242,11 +245,12 @@ What it reports (every 5 min tick):
 - Hourly summary across all solver containers: auctions, quotes, orders processed, solution candidates, errors.
 - Idle heartbeat every 30 min if no activity.
 
-`tg-monitor.sh` watches all six solver containers. Solve notifications are
+`tg-monitor.sh` watches all eight solver containers. Solve notifications are
 routed by chain:
 - mainnet -> `TG_TRADES_THREAD_MAINNET` (fallback `TG_TRADES_THREAD`)
 - arbitrum -> `TG_TRADES_THREAD_ARBITRUM` (fallback `TG_TRADES_THREAD`)
 - gnosis -> `TG_TRADES_THREAD_GNOSIS` (fallback `TG_TRADES_THREAD`)
+- base -> `TG_TRADES_THREAD_BASE` (fallback `TG_TRADES_THREAD`)
 
 Prod and staging notifications for the same chain land in the same Telegram
 topic; the message body includes `Chain:` and `Env:` so you can tell them apart.
