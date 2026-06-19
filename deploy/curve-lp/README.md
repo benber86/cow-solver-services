@@ -247,9 +247,9 @@ nohup ./tg-monitor.sh >/dev/null 2>&1 &
 
 What it reports (every 5 min tick):
 - Solver-candidate trade notifications (per-order, with CoW explorer link).
-- Confirmed win notifications for prod settlements. These are checked against
-  CoW's `solver_competition/by_tx_hash` API and only fire when `solver=curve`
-  is `isWinner=true`.
+- Confirmed win notifications for prod settlements. These come from the driver's
+  `/notify` success callback to our solver endpoint, then the monitor enriches
+  the tx with CoW's `transactions/{txHash}/orders` API.
 - Hourly summary across all solver containers: auctions, quotes, orders processed, solution candidates, errors.
 - Idle heartbeat every 30 min if no activity.
 
@@ -259,7 +259,7 @@ notification streams per chain, each with its own topic — don't conflate them:
 - **Candidates** (`TG_TRADES_THREAD_*`): "Solution Candidate" — we produced a
   candidate solution (got *selected* to bid). NOT settled.
 - **Settled** (`TG_WINS_THREAD_*`): "Auction Won" — confirmed *settled* on-chain
-  transaction (has tx hash + block). The real executed trade.
+  transaction from a driver success notification. The real executed trade.
 
 Candidate notifications are routed by chain:
 - mainnet -> `TG_TRADES_THREAD_MAINNET` (fallback `TG_TRADES_THREAD`)

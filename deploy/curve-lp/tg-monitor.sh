@@ -32,13 +32,8 @@ TG_WINS_THREAD_MAINNET=${TG_WINS_THREAD_MAINNET-$TG_WINS_THREAD}
 TG_WINS_THREAD_ARBITRUM=${TG_WINS_THREAD_ARBITRUM-$TG_WINS_THREAD}
 TG_WINS_THREAD_GNOSIS=${TG_WINS_THREAD_GNOSIS-$TG_WINS_THREAD}
 TG_WINS_THREAD_BASE=${TG_WINS_THREAD_BASE-$TG_WINS_THREAD}
-COW_SOLVER_NAME=${COW_SOLVER_NAME:-curve}
-TG_WIN_MAX_TRADES_PER_ORDER=${TG_WIN_MAX_TRADES_PER_ORDER:-20}
+TG_WIN_MAX_ORDERS=${TG_WIN_MAX_ORDERS:-5}
 TG_WIN_STATE_FILE=${TG_WIN_STATE_FILE-./processed/tg-wins-seen.txt}
-TG_WIN_LOOKBACK_BLOCKS_MAINNET=${TG_WIN_LOOKBACK_BLOCKS_MAINNET:-200}
-TG_WIN_LOOKBACK_BLOCKS_ARBITRUM=${TG_WIN_LOOKBACK_BLOCKS_ARBITRUM:-5000}
-TG_WIN_LOOKBACK_BLOCKS_GNOSIS=${TG_WIN_LOOKBACK_BLOCKS_GNOSIS:-240}
-TG_WIN_LOOKBACK_BLOCKS_BASE=${TG_WIN_LOOKBACK_BLOCKS_BASE:-5000}
 
 COMPOSE_FILE="docker-compose.prod.yml"
 INTERVAL=300  # 5 minutes
@@ -139,26 +134,6 @@ cow_api_chain() {
         gnosis) echo "xdai" ;;
         base) echo "base" ;;
         *) echo "" ;;
-    esac
-}
-
-chain_rpc_url() {
-    case "$1" in
-        mainnet) echo "${NODE_URL:-https://ethereum.publicnode.com}" ;;
-        arbitrum) echo "${NODE_URL_ARBITRUM:-https://arb1.arbitrum.io/rpc}" ;;
-        gnosis) echo "${NODE_URL_GNOSIS:-https://rpc.gnosischain.com}" ;;
-        base) echo "${NODE_URL_BASE:-https://mainnet.base.org}" ;;
-        *) echo "" ;;
-    esac
-}
-
-chain_win_lookback_blocks() {
-    case "$1" in
-        mainnet) echo "$TG_WIN_LOOKBACK_BLOCKS_MAINNET" ;;
-        arbitrum) echo "$TG_WIN_LOOKBACK_BLOCKS_ARBITRUM" ;;
-        gnosis) echo "$TG_WIN_LOOKBACK_BLOCKS_GNOSIS" ;;
-        base) echo "$TG_WIN_LOOKBACK_BLOCKS_BASE" ;;
-        *) echo "0" ;;
     esac
 }
 
@@ -308,150 +283,199 @@ mark_win_seen() {
     fi
 }
 
-fetch_winning_trades() {
+fetch_success_notifications() {
+    command -v python3 >/dev/null 2>&1 || return
+
+    python3 -c '
+import json
+import sys
+
+
+def clean(value):
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        value = json.dumps(value, separators=(",", ":"))
+    return str(value).replace("\t", " ").replace("\n", " ")
+
+
+for raw_line in sys.stdin:
+    raw_line = raw_line.rstrip("\n")
+    if "driver notification" not in raw_line:
+        continue
+
+    service = ""
+    payload = raw_line
+    if "|" in raw_line:
+        service, payload = raw_line.split("|", 1)
+        service = service.strip().split()[0] if service.strip() else ""
+    payload = payload.strip()
+
+    try:
+        outer = json.loads(payload)
+    except Exception:
+        continue
+
+    fields = outer.get("fields") or {}
+    if fields.get("message") != "driver notification":
+        continue
+
+    notification = fields.get("notification")
+    if isinstance(notification, str):
+        try:
+            notification = json.loads(notification)
+        except Exception:
+            continue
+    if not isinstance(notification, dict):
+        continue
+    if notification.get("kind") != "success":
+        continue
+
+    tx_hash = notification.get("transaction") or ""
+    if not tx_hash:
+        continue
+
+    print("\t".join(clean(value) for value in [
+        service,
+        outer.get("timestamp", ""),
+        notification.get("auctionId", ""),
+        notification.get("solutionId", ""),
+        tx_hash,
+    ]))
+' || true
+}
+
+fetch_transaction_orders() {
     local chain="$1"
-    local uid="$2"
-    local api_chain rpc_url lookback_blocks
+    local tx_hash="$2"
+    local api_chain
 
     command -v python3 >/dev/null 2>&1 || return
     api_chain="$(cow_api_chain "$chain")"
-    rpc_url="$(chain_rpc_url "$chain")"
-    lookback_blocks="$(chain_win_lookback_blocks "$chain")"
     [ -z "$api_chain" ] && return
 
-    python3 - "$api_chain" "$uid" "$TG_WIN_MAX_TRADES_PER_ORDER" "$rpc_url" "$lookback_blocks" <<'PY' || true
+    if ! python3 -c '
 import json
 import sys
-import urllib.error
 import urllib.request
 
-api_chain, uid, max_trades, rpc_url, lookback_blocks = sys.argv[1:]
-max_trades = int(max_trades)
-lookback_blocks = int(lookback_blocks)
-# /trades is v1; solver_competition moved to v2 (v1 was retired ~Jun 2026).
-base = f"https://api.cow.fi/{api_chain}/api/v1"
-base_v2 = f"https://api.cow.fi/{api_chain}/api/v2"
+api_chain, tx_hash = sys.argv[1:]
+url = f"https://api.cow.fi/{api_chain}/api/v1/transactions/{tx_hash}/orders"
 
 
-def get_json(url):
-    req = urllib.request.Request(url, headers={"user-agent": "curve-lp-tg-monitor"})
-    with urllib.request.urlopen(req, timeout=8) as response:
-        return json.load(response)
+def clean(value):
+    if value is None:
+        return ""
+    return str(value).replace("\t", " ").replace("\n", " ")
 
-
-def rpc(method, params):
-    if not rpc_url:
-        return None
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).encode()
-    req = urllib.request.Request(
-        rpc_url,
-        data=body,
-        headers={"content-type": "application/json", "user-agent": "curve-lp-tg-monitor"},
-    )
-    with urllib.request.urlopen(req, timeout=8) as response:
-        return json.load(response).get("result")
-
-
-min_block = 0
-if lookback_blocks > 0:
-    try:
-        current_block = int(rpc("eth_blockNumber", []), 16)
-        min_block = max(0, current_block - lookback_blocks)
-    except Exception:
-        min_block = 0
 
 try:
-    trades = get_json(f"{base}/trades?orderUid={uid}")
+    req = urllib.request.Request(url, headers={"user-agent": "curve-lp-tg-monitor"})
+    with urllib.request.urlopen(req, timeout=8) as response:
+        orders = json.load(response)
 except Exception:
     sys.exit(0)
 
-seen_txs = set()
-checked = 0
-for trade in trades:
-    tx_hash = trade.get("txHash")
-    if not tx_hash or tx_hash in seen_txs:
+if not isinstance(orders, list):
+    sys.exit(0)
+
+for order in orders:
+    if not isinstance(order, dict):
         continue
-    seen_txs.add(tx_hash)
-
-    block_number = int(trade.get("blockNumber") or 0)
-    if min_block and block_number < min_block:
-        continue
-
-    checked += 1
-    if checked > max_trades:
-        break
-
-    try:
-        competition = get_json(f"{base_v2}/solver_competition/by_tx_hash/{tx_hash}")
-    except Exception:
-        continue
-
-    # CoW runs the driver and assigns the per-chain settlement address, so we
-    # can't identify our solver by name/address. Instead, a win is: our order
-    # appears in the solution flagged isWinner for this settlement tx.
-    winning_solution = None
-    for solution in competition.get("solutions", []):
-        if solution.get("isWinner") is not True:
-            continue
-        if any(order.get("id", "").lower() == uid.lower() for order in solution.get("orders", [])):
-            winning_solution = solution
-            break
-
-    if not winning_solution:
-        continue
-
-    fields = [
-        tx_hash,
-        str(block_number),
-        trade.get("sellAmount", ""),
-        trade.get("buyAmount", ""),
-        trade.get("sellToken", ""),
-        trade.get("buyToken", ""),
-        str(winning_solution.get("score", "")),
-        str(winning_solution.get("ranking", "")),
-    ]
-    print("\t".join(fields))
-PY
+    print("\t".join(clean(value) for value in [
+        order.get("uid") or order.get("orderUid") or order.get("id") or "",
+        order.get("sellToken", ""),
+        order.get("buyToken", ""),
+        order.get("executedSellAmount") or order.get("sellAmount") or "",
+        order.get("executedBuyAmount") or order.get("buyAmount") or "",
+        order.get("kind", ""),
+        order.get("status", ""),
+    ]))
+' "$api_chain" "$tx_hash"
+    then
+        true
+    fi
 }
 
-send_win_notifications_for_candidate() {
-    local chain="$1"
-    local env_name="$2"
-    local uid="$3"
+send_win_notification_for_success() {
+    local service_name="$1"
+    local timestamp="$2"
+    local auction_id="$3"
+    local solution_id="$4"
+    local tx_hash="$5"
+    local normalized_service chain env_name key
 
+    normalized_service="$(normalize_service_name "$service_name")"
+    chain="$(service_chain "$normalized_service")"
+    env_name="$(service_env "$normalized_service")"
     [ "$env_name" = "prod" ] || return
-    valid_order_uid "$uid" || return
+    [ "$chain" != "unknown" ] || return
+    [ -n "$tx_hash" ] || return
 
-    local tx_hash block_number sell_amount buy_amount sell_token buy_token score ranking key
-    while IFS=$'\t' read -r tx_hash block_number sell_amount buy_amount sell_token buy_token score ranking; do
-        [ -n "$tx_hash" ] || continue
-        key="${chain}:${tx_hash}:${uid}"
-        if win_seen "$key"; then
+    key="notify-success:${chain}:${tx_hash}:${auction_id}:${solution_id}"
+    if win_seen "$key"; then
+        return
+    fi
+    mark_win_seen "$key"
+
+    local msg order_count shown uid sell_token buy_token sell_amount buy_amount kind status
+    msg="Auction Won
+Chain: ${chain}"
+    if [ -n "$auction_id" ]; then
+        msg+="
+Auction: ${auction_id}"
+    fi
+    if [ -n "$solution_id" ]; then
+        msg+="
+Solution: ${solution_id}"
+    fi
+    if [ -n "$timestamp" ]; then
+        msg+="
+Notified: ${timestamp}"
+    fi
+    msg+="
+Tx: $(explorer_tx_url "$chain" "$tx_hash")"
+
+    order_count=0
+    shown=0
+    while IFS=$'\t' read -r uid sell_token buy_token sell_amount buy_amount kind status; do
+        [ -n "$uid$sell_token$buy_token$sell_amount$buy_amount" ] || continue
+        order_count=$((order_count + 1))
+        if [ "$shown" -ge "$TG_WIN_MAX_ORDERS" ]; then
             continue
         fi
-        mark_win_seen "$key"
+        shown=$((shown + 1))
 
-        local sell_short buy_short sell_display buy_display msg
+        local sell_short buy_short sell_display buy_display
         sell_short="${sell_token:0:6}...${sell_token: -4}"
         buy_short="${buy_token:0:6}...${buy_token: -4}"
         sell_display="$(format_token_amount "$chain" "$sell_token" "$sell_amount")"
         buy_display="$(format_token_amount "$chain" "$buy_token" "$buy_amount")"
 
-        msg="Auction Won
-Chain: ${chain}
-${sell_short} -> ${buy_short}
-Sold: ${sell_display}
-Bought: ${buy_display}
-Score: ${score}
-Block: ${block_number}
-Order: $(explorer_order_url "$chain" "$uid")
-Tx: $(explorer_tx_url "$chain" "$tx_hash")"
-        if [ -n "$ranking" ]; then
+        if [ "$shown" -eq 1 ]; then
             msg+="
-Ranking: ${ranking}"
+Orders:"
         fi
-        send_win_tg "$chain" "$msg"
-    done < <(fetch_winning_trades "$chain" "$uid")
+        msg+="
+- ${sell_short} -> ${buy_short}: ${sell_display} -> ${buy_display}"
+        if [ -n "$kind$status" ]; then
+            msg+=" (${kind}${status:+, ${status}})"
+        fi
+        if valid_order_uid "$uid"; then
+            msg+="
+  $(explorer_order_url "$chain" "$uid")"
+        fi
+    done < <(fetch_transaction_orders "$chain" "$tx_hash")
+
+    if [ "$order_count" -eq 0 ]; then
+        msg+="
+Orders: unavailable from CoW API"
+    elif [ "$order_count" -gt "$shown" ]; then
+        msg+="
+... plus $((order_count - shown)) more order(s)"
+    fi
+
+    send_win_tg "$chain" "$msg"
 }
 
 # Startup message
@@ -465,7 +489,7 @@ while true; do
     sleep "$INTERVAL"
 
     # Grab last 5 min of logs
-    logs=$(docker compose -f "$COMPOSE_FILE" logs --since 5m "${SOLVER_SERVICES[@]}" 2>&1 || true)
+    logs=$(docker compose -f "$COMPOSE_FILE" logs --since 5m "${SOLVER_SERVICES[@]}" 2>&1 | tr -d '\000' || true)
 
     if [ -z "$logs" ]; then
         idle_cycles=$((idle_cycles + 1))
@@ -482,6 +506,13 @@ while true; do
     solutions=$(echo "$logs" | grep '"solve_completed"' | grep '"is_quote":false' | grep -oP '"num_solutions":\K[0-9]+' | awk '{s+=$1} END {print s+0}' || true)
     orders=$(echo "$logs" | grep -c '"processing Curve LP order"' || true)
     errors=$(echo "$logs" | grep -c '"failed to solve order"' || true)
+
+    # The driver sends /notify only to this solver endpoint. A success
+    # notification is the ownership signal for a settled win; the competition API
+    # can include the same user order in other solvers' winning settlements.
+    while IFS=$'\t' read -r service_name timestamp auction_id solution_id tx_hash; do
+        send_win_notification_for_success "$service_name" "$timestamp" "$auction_id" "$solution_id" "$tx_hash"
+    done < <(printf '%s\n' "$logs" | fetch_success_notifications)
 
     # Log candidate solutions for real auctions (not quotes).
     # Note: "solved order" means the solver produced a candidate, NOT that it
@@ -565,7 +596,6 @@ Order: $(explorer_order_url "$chain" "$uid")"
 Order UID: unavailable"
         fi
         send_tg "$thread_id" "$msg" ""
-        send_win_notifications_for_candidate "$chain" "$env_name" "$uid"
     done < <(echo "$logs" | grep '"solved order"' | grep '"is_quote":false' || true)
 
     # Accumulate hourly stats
