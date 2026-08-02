@@ -34,6 +34,8 @@ TG_WINS_THREAD_GNOSIS=${TG_WINS_THREAD_GNOSIS-$TG_WINS_THREAD}
 TG_WINS_THREAD_BASE=${TG_WINS_THREAD_BASE-$TG_WINS_THREAD}
 TG_WIN_MAX_ORDERS=${TG_WIN_MAX_ORDERS:-5}
 TG_WIN_STATE_FILE=${TG_WIN_STATE_FILE-./processed/tg-wins-seen.txt}
+TG_SEND_TIMEOUT=${TG_SEND_TIMEOUT:-15}
+TG_SEND_MAX_ATTEMPTS=${TG_SEND_MAX_ATTEMPTS:-3}
 
 COMPOSE_FILE="docker-compose.prod.yml"
 INTERVAL=300  # 5 minutes
@@ -66,7 +68,9 @@ send_tg_to_chat() {
     local thread_id="$2"
     local text="$3"
     local parse_mode="${4-Markdown}"
+    local retry_on_rate_limit="${5:-0}"
     local args=(-d chat_id="$chat_id" -d text="$text")
+    local response http_status body attempt retry_after
     [ -z "$chat_id" ] && return
     if [ -n "$parse_mode" ]; then
         args+=(-d parse_mode="$parse_mode")
@@ -74,10 +78,36 @@ send_tg_to_chat() {
     if [ -n "$thread_id" ]; then
         args+=(-d message_thread_id="$thread_id")
     fi
-    curl -s -X POST \
-        "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-        "${args[@]}" \
-        > /dev/null 2>&1 || true
+
+    attempt=1
+    while true; do
+        if ! response=$(curl -sS --max-time "$TG_SEND_TIMEOUT" -w $'\n%{http_code}' -X POST \
+            "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            "${args[@]}" 2>&1); then
+            echo "telegram send transport failed chat=${chat_id} thread=${thread_id:-default} attempt=${attempt}: ${response}" >&2
+            return
+        fi
+
+        http_status="${response##*$'\n'}"
+        body="${response%$'\n'*}"
+        if [[ "$http_status" == 2* ]] && [[ "$body" == *'"ok":true'* ]]; then
+            return
+        fi
+
+        if [[ "$retry_on_rate_limit" = "1" && "$http_status" = "429" && "$attempt" -lt "$TG_SEND_MAX_ATTEMPTS" ]]; then
+            retry_after=1
+            if [[ "$body" =~ \"retry_after\"[[:space:]]*:[[:space:]]*([0-9]+) ]]; then
+                retry_after="${BASH_REMATCH[1]}"
+            fi
+            echo "telegram send rate limited chat=${chat_id} thread=${thread_id:-default} attempt=${attempt}; retrying after ${retry_after}s" >&2
+            sleep "$retry_after"
+            attempt=$((attempt + 1))
+            continue
+        fi
+
+        echo "telegram send rejected chat=${chat_id} thread=${thread_id:-default} attempt=${attempt} http=${http_status}: ${body:0:500}" >&2
+        return
+    done
 }
 
 send_tg() {
@@ -87,7 +117,7 @@ send_tg() {
 send_win_tg() {
     local chain="$1"
     local text="$2"
-    send_tg_to_chat "$TG_CHAT_ID" "$(chain_wins_thread "$chain")" "$text" ""
+    send_tg_to_chat "$TG_CHAT_ID" "$(chain_wins_thread "$chain")" "$text" "" "1"
 }
 
 service_chain() {
