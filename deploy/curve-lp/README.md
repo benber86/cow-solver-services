@@ -176,9 +176,13 @@ consume whatever deadline remains. Leaving all four omitted attempts every order
 and can cause deadline timeouts.
 
 Shared safety knobs across all chain configs:
-- `slippage-bps = 30` sets the `min_dy` floor baked into the router calldata,
-  and with it the amount we promise CoW — the two are the same number by
-  construction (see "Slippage and overdrafts" below)
+- `slippage-bps` sets the `min_dy` floor baked into the router calldata, and
+  with it the amount we promise CoW — the two are the same number by
+  construction (see "Slippage and overdrafts" below). **This is the one knob
+  that differs per chain**: `30` everywhere except Base prod, which runs `100`.
+  Base is participation-constrained rather than overdraft-constrained, so it
+  trades surplus for a better chance of the settlement simulating. Base staging
+  stays at `30` as the A/B — see the comment in `curve-lp.base.toml`
 - `bid-slippage-bps` is omitted, so it defaults to `slippage-bps`. It is
   clamped to the calldata floor, so setting it *lower* does nothing; only set
   it to bid more conservatively than the floor
