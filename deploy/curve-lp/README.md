@@ -176,8 +176,12 @@ consume whatever deadline remains. Leaving all four omitted attempts every order
 and can cause deadline timeouts.
 
 Shared safety knobs across all chain configs:
-- `slippage-bps = 100` keeps a 1% calldata revert buffer
-- `bid-slippage-bps = 5` uses a 0.05% competitive bid haircut
+- `slippage-bps = 30` sets the `min_dy` floor baked into the router calldata,
+  and with it the amount we promise CoW — the two are the same number by
+  construction (see "Slippage and overdrafts" below)
+- `bid-slippage-bps` is omitted, so it defaults to `slippage-bps`. It is
+  clamped to the calldata floor, so setting it *lower* does nothing; only set
+  it to bid more conservatively than the floor
 - `max-quote-deviation-bps = 300` rejects API/on-chain quote drift above 3%
 - `max-general-order-market-deviation-bps = 200` skips non-LP general orders
   whose limit price is more than 2% off the auction reference prices
@@ -196,6 +200,50 @@ letting common pairs consume the whole auction:
 
 These filters and caps apply only to non-LP orders. LP-priority orders are
 always attempted first and are not capped by these settings.
+
+### Slippage and overdrafts
+
+Two numbers exist per sell order, and the relationship between them is the
+whole story:
+
+- **calldata floor** — the `min_dy` argument baked into the CurveRouterV2
+  `exchange` call, `expected_output × (1 − slippage-bps)`. Execution below it
+  reverts. This is the *only* on-chain protection we have: the CoW driver
+  applies its own slippage machinery to `Interaction::Liquidity` only, and our
+  solver always emits `Interaction::Custom`, which the driver passes through
+  byte-for-byte.
+- **bid** — the amount we promise CoW via the clearing prices.
+
+If the bid is above the floor, every execution landing between the two is paid
+out of the settlement contract's buffers. That is a solver overdraft, and it is
+what CoW's team flagged in July 2026: the config was `slippage-bps = 100` with
+`bid-slippage-bps = 5`, i.e. we promised 0.9995 × expected while guaranteeing
+only 0.99 × expected, leaving a 95bps window that bled on every fill.
+
+`sell_order_bid_output` (`crates/solvers/src/domain/solver/curve_lp.rs`) now
+clamps the bid down to the floor, so the two move together and overdrafts are
+structurally impossible rather than tuned away. **Do not reintroduce a bid that
+can exceed the calldata floor.**
+
+That leaves `slippage-bps` as the single dial, and it cuts both ways:
+
+- too wide → the surplus we give up is also the budget available to anything
+  that can move the price between quote and execution (stale quotes,
+  interpolated router estimates, sandwiching on thin pools)
+- too tight → the settlement stops simulating and we lose the auction
+
+Losing the auction is the cheap failure. The driver re-simulates the settlement
+on every new block until the deadline and voids the score on revert
+(`crates/driver/src/domain/competition/mod.rs`), so a floor that is too tight
+costs us a *dropped solution*, not a failed on-chain settlement. Real revert
+risk is only the drift between the last pre-deadline simulation and inclusion,
+i.e. a block or two. That asymmetry is why 30bps is a reasonable starting point
+and why it can be tightened further if we are not losing volume.
+
+To tune it, change `slippage-bps` in the chain's TOML and redeploy that chain
+only (`./deploy.sh --chains=<chain>`). Watch our solved-order rate against
+CoW's reported win rate and buffer delta; the step that costs win rate without
+improving the buffer is one step too far.
 
 ### Secrets
 

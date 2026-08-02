@@ -201,8 +201,10 @@ pub struct Config {
     pub node_url: Url,
     /// Slippage buffer in basis points (e.g., 100 = 1%).
     pub slippage_bps: u32,
-    /// Competitive bid haircut in basis points. This controls the amount we
-    /// promise to CoW; `slippage_bps` still controls calldata revert safety.
+    /// Competitive bid haircut in basis points, applied to the amount we
+    /// promise CoW. Clamped to the calldata floor set by `slippage_bps`, so it
+    /// can only ever make the bid *more* conservative — a value below
+    /// `slippage_bps` is inert. Defaults to `slippage_bps`.
     pub bid_slippage_bps: u32,
     /// Maximum deviation between API quote and on-chain get_dy (basis points).
     pub max_quote_deviation_bps: u32,
@@ -1716,6 +1718,22 @@ fn cap_orders<T: std::borrow::Borrow<Order>>(
     }
 }
 
+/// The amount we promise CoW for a sell order.
+///
+/// Invariant: the bid never exceeds `calldata_min_out`. Realized output is
+/// only guaranteed to be at least the calldata floor, so promising more than
+/// that floor makes the shortfall payable out of the settlement contract's
+/// buffers — a solver overdraft. Clamping down to the floor makes that
+/// structurally impossible: whatever the router delivers above the floor is
+/// surplus we never promised, not a debt we owe.
+///
+/// `bid_slippage_bps` can therefore only make us *more* conservative than the
+/// calldata floor; setting it below `slippage_bps` has no effect.
+///
+/// `order_floor` wins over both, but that is safe rather than a hole in the
+/// invariant: `solve_order` rejects the quote outright when
+/// `calldata_min_out < order.buy.amount`, so by the time we get here
+/// `calldata_min_out >= order_floor` always holds.
 fn sell_order_bid_output(
     expected_output: eth::U256,
     calldata_min_out: eth::U256,
@@ -1723,7 +1741,7 @@ fn sell_order_bid_output(
     bid_slippage_bps: u32,
 ) -> eth::U256 {
     QuoteRequest::min_out_with_slippage(expected_output, bid_slippage_bps)
-        .max(calldata_min_out)
+        .min(calldata_min_out)
         .max(order_floor)
 }
 
@@ -2323,19 +2341,36 @@ mod tests {
     }
 
     #[test]
-    fn sell_order_bid_output_uses_tighter_bid_floor_without_lowering_calldata_floor() {
+    fn sell_order_bid_output_never_exceeds_calldata_floor() {
         let expected = U256::from(1_000_000u64);
         let calldata_floor = U256::from(990_000u64);
         let order_floor = U256::from(950_000u64);
 
+        // A bid haircut thinner than the calldata floor (20bps vs 100bps) must
+        // not let us promise 998_000 when execution only guarantees 990_000 —
+        // that gap is exactly what turns into a solver overdraft.
         assert_eq!(
             sell_order_bid_output(expected, calldata_floor, order_floor, 20),
-            U256::from(998_000u64)
+            calldata_floor
         );
     }
 
     #[test]
-    fn sell_order_bid_output_never_goes_below_calldata_or_order_floor() {
+    fn sell_order_bid_output_honors_a_haircut_wider_than_the_calldata_floor() {
+        let expected = U256::from(1_000_000u64);
+        let calldata_floor = U256::from(990_000u64);
+        let order_floor = U256::from(950_000u64);
+
+        // 200bps is more conservative than the 100bps calldata floor, so it
+        // wins: the knob may only ever tighten the bid.
+        assert_eq!(
+            sell_order_bid_output(expected, calldata_floor, order_floor, 200),
+            U256::from(980_000u64)
+        );
+    }
+
+    #[test]
+    fn sell_order_bid_output_never_goes_below_order_floor() {
         let expected = U256::from(1_000_000u64);
         let calldata_floor = U256::from(990_000u64);
         let order_floor = U256::from(995_000u64);
@@ -2344,6 +2379,49 @@ mod tests {
             sell_order_bid_output(expected, calldata_floor, order_floor, 200),
             order_floor
         );
+    }
+
+    #[test]
+    fn sell_order_bid_output_collapses_with_the_floor_on_router_retry_fallback() {
+        // When the second router round trip fails, `NewRouterClient::quote`
+        // falls back to a quote bound at the order's limit price, so the
+        // calldata floor collapses to `order_floor`. The bid must collapse
+        // with it rather than staying anchored near `expected_output`.
+        let expected = U256::from(1_000_000u64);
+        let order_floor = U256::from(600_000u64);
+
+        assert_eq!(
+            sell_order_bid_output(expected, order_floor, order_floor, 5),
+            order_floor
+        );
+    }
+
+    #[test]
+    fn sell_order_bid_output_is_never_above_the_calldata_floor() {
+        let expected = U256::from(1_000_000u64);
+
+        for bid_bps in [0u32, 5, 30, 100, 250, 10_000] {
+            for floor in [600_000u64, 950_000, 990_000, 1_000_000] {
+                let calldata_floor = U256::from(floor);
+                // `solve_order` guarantees `calldata_floor >= order_floor`.
+                for order_floor in [
+                    U256::ZERO,
+                    calldata_floor / U256::from(2u64),
+                    calldata_floor,
+                ] {
+                    let bid = sell_order_bid_output(expected, calldata_floor, order_floor, bid_bps);
+                    assert!(
+                        bid <= calldata_floor,
+                        "bid {bid} exceeded calldata floor {calldata_floor} (bid_bps={bid_bps}, \
+                         order_floor={order_floor})"
+                    );
+                    assert!(
+                        bid >= order_floor,
+                        "bid {bid} below order floor {order_floor}"
+                    );
+                }
+            }
+        }
     }
 
     // --- token_allowlist filter tests ---

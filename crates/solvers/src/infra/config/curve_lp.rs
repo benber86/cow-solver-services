@@ -75,12 +75,14 @@ struct Config {
     /// Node URL for on-chain verification.
     node_url: Url,
 
-    /// Slippage buffer in basis points (e.g., 100 = 1%).
+    /// Slippage buffer in basis points (e.g., 100 = 1%). Sets the `min_dy`
+    /// floor baked into the router calldata, and with it the amount we bid.
     #[serde(default = "default_slippage_bps")]
     slippage_bps: u32,
 
-    /// Competitive bid haircut in basis points. Defaults to `slippage-bps`
-    /// when omitted so existing configs keep their previous behavior.
+    /// Competitive bid haircut in basis points. Clamped to the calldata floor,
+    /// so it only has an effect when larger than `slippage-bps`. Defaults to
+    /// `slippage-bps` when omitted.
     #[serde(default)]
     bid_slippage_bps: Option<u32>,
 
