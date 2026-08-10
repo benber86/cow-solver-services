@@ -24,10 +24,22 @@ const MAX_QUOTE_CACHE_ENTRIES: usize = 4096;
 
 /// Identity of a quote for caching purposes.
 ///
-/// `receiver` is excluded because it is always this chain's settlement
-/// contract, and `min_out` because it is *derived* from the response being
-/// cached rather than an input that varies between callers for the same order.
-type QuoteKey = (eth::Address, eth::Address, eth::U256);
+/// `min_out` is part of the key even though it looks derived. `bind_floor`
+/// clamps the slippage haircut *up* to the order's limit, so the limit reaches
+/// the calldata the service builds — two orders on the same pair and size but
+/// with different limits genuinely get different quotes. Sharing one between
+/// them would hand the higher-limit order a floor below what it needs, which
+/// `solve_order` then rejects as `InsufficientOutput` — and that rejection
+/// carries a five-minute backoff, so a solvable order would be dropped for
+/// ~150 auctions on a 2s-block chain.
+///
+/// This costs no hit rate for the case the cache exists for: an order's limit
+/// is fixed for its lifetime, so re-quoting the same order across consecutive
+/// auctions still hits.
+///
+/// `receiver` stays out of the key — it is always this chain's settlement
+/// contract.
+type QuoteKey = (eth::Address, eth::Address, eth::U256, Option<eth::U256>);
 
 struct CachedQuote {
     quote: ExecutableQuote,
@@ -71,7 +83,7 @@ impl NewRouterClient {
     }
 
     fn cache_key(req: &QuoteRequest) -> QuoteKey {
-        (req.sell_token, req.buy_token, req.sell_amount)
+        (req.sell_token, req.buy_token, req.sell_amount, req.min_out)
     }
 
     fn cached_quote(&self, req: &QuoteRequest) -> Option<ExecutableQuote> {
@@ -540,6 +552,19 @@ mod tests {
     }
 
     #[test]
+    fn quote_cache_still_hits_for_a_repeated_order() {
+        // Keying on the limit must not cost the hit rate the cache exists for:
+        // an order's limit is fixed for its lifetime, so the same order
+        // re-quoted in the next auction is byte-identical and must hit.
+        let client = client_with_ttl(Duration::from_secs(30));
+        let req = dummy_req(false);
+        client.store_quote(&req, &sample_quote());
+
+        let next_auction = req.clone();
+        assert!(client.cached_quote(&next_auction).is_some());
+    }
+
+    #[test]
     fn quote_cache_expires_entries() {
         // A one-nanosecond TTL is already elapsed by the time we look.
         let client = client_with_ttl(Duration::from_nanos(1));
@@ -561,6 +586,14 @@ mod tests {
         let mut other_pair = req.clone();
         other_pair.buy_token = Address::repeat_byte(0x33);
         assert!(client.cached_quote(&other_pair).is_none());
+
+        // Different order limit on the same pair and size. `bind_floor` clamps
+        // up to the limit, so the limit reaches the calldata — sharing an entry
+        // would give this order a floor below what it needs, which solve_order
+        // rejects as InsufficientOutput *and* backs off for five minutes.
+        let mut higher_limit = req.clone();
+        higher_limit.min_out = Some(eth::U256::from(999_999u64));
+        assert!(client.cached_quote(&higher_limit).is_none());
 
         // The original key still hits — the misses above were real misses, not
         // the cache having been clobbered.
