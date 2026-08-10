@@ -36,7 +36,17 @@ const DEADLINE_SLACK: chrono::Duration = chrono::Duration::milliseconds(500);
 /// Maximum number of orders solved concurrently (bounds network fan-out).
 const MAX_CONCURRENT_ORDERS: usize = 8;
 /// Maximum time spent waiting for the Curve routing API per order.
-const ROUTE_REQUEST_TIMEOUT: Duration = Duration::from_millis(2500);
+/// Upper bound on how long a single order may spend in the route provider,
+/// even when the auction deadline is generous. Sized for probe + bind + one
+/// retry at the router's observed high-percentile latency (~1.4s per call).
+/// The cap exists so one slow order cannot hold a `MAX_CONCURRENT_ORDERS` slot
+/// for the whole auction.
+const ROUTE_BUDGET_CAP: Duration = Duration::from_millis(4500);
+
+/// Below this there is not enough time left for even one round trip (the
+/// fastest observed is ~420ms), so skip the order rather than occupy a
+/// concurrency slot with something that cannot finish.
+const MIN_ROUTE_BUDGET: Duration = Duration::from_millis(400);
 /// Maximum time spent waiting for on-chain quote verification per order.
 const ONCHAIN_VERIFY_TIMEOUT: Duration = Duration::from_millis(1500);
 /// Maximum time spent waiting for token price fallback per order.
@@ -206,6 +216,8 @@ pub struct Config {
     /// can only ever make the bid *more* conservative — a value below
     /// `slippage_bps` is inert. Defaults to `slippage_bps`.
     pub bid_slippage_bps: u32,
+    /// How long a route may be reused across auctions. Zero disables caching.
+    pub quote_cache_ttl: Duration,
     /// Maximum deviation between API quote and on-chain get_dy (basis points).
     pub max_quote_deviation_bps: u32,
     /// Gas offset for solution gas estimation.
@@ -315,8 +327,12 @@ impl Solver {
         {
             RouteProviderKind::Legacy => (Arc::new(legacy), None),
             RouteProviderKind::NewRouter { url } => {
-                let new_router =
-                    NewRouterClient::new(url, config.chain.router_address, config.slippage_bps);
+                let new_router = NewRouterClient::new(
+                    url,
+                    config.chain.router_address,
+                    config.slippage_bps,
+                    config.quote_cache_ttl,
+                );
                 // Sidechain telemetry: a second legacy client (same chain) that
                 // we only ever invoke for log comparison on real solves.
                 let tele = LegacyProvider::new(
@@ -507,6 +523,9 @@ impl Inner {
 
     async fn solve(&self, auction: Auction, sender: tokio::sync::mpsc::UnboundedSender<Solution>) {
         let is_quote = matches!(auction.id, auction::Id::Quote);
+        // Same reduced deadline the outer task is racing, so per-order budgets
+        // and the overall abort agree on when time is up.
+        let deadline = auction.deadline.clone().reduce(DEADLINE_SLACK);
         let mut sent_count: usize = 0;
         let mut receiver_dropped = false;
         let supported: Vec<_> = auction
@@ -533,6 +552,7 @@ impl Inner {
         let mut stream = futures::stream::iter(selected.into_iter().map(|(i, order)| {
             let tokens = &auction.tokens;
             let gas_price = &auction.gas_price;
+            let deadline = &deadline;
             async move {
                 tracing::debug!(
                     order_uid = %order.uid,
@@ -541,7 +561,10 @@ impl Inner {
                     "processing Curve LP order"
                 );
 
-                match self.solve_order(&order, tokens, gas_price, is_quote).await {
+                match self
+                    .solve_order(&order, tokens, gas_price, is_quote, deadline)
+                    .await
+                {
                     Ok(solved) => {
                         let legacy_output = solved
                             .legacy
@@ -1023,9 +1046,10 @@ impl Inner {
         tokens: &auction::Tokens,
         gas_price: &auction::GasPrice,
         is_quote: bool,
+        deadline: &auction::Deadline,
     ) -> Result<SolvedOrder, SolveError> {
         if is_native_price_probe(order, is_quote, self.chain.wrapped_native_token) {
-            return self.solve_native_price_probe(order).await;
+            return self.solve_native_price_probe(order, deadline).await;
         }
 
         // Sidechain real-solve only: fire the legacy comparison NOW, in
@@ -1036,6 +1060,10 @@ impl Inner {
             self.spawn_legacy_telemetry(order, gas_price)
         } else {
             None
+        };
+
+        let Some(budget) = route_budget(deadline) else {
+            return Err(SolveError::DeadlineExhausted);
         };
 
         let route_start = std::time::Instant::now();
@@ -1050,8 +1078,7 @@ impl Inner {
         };
 
         let route_fut = async {
-            let result =
-                tokio::time::timeout(ROUTE_REQUEST_TIMEOUT, self.provider.quote(&request)).await;
+            let result = tokio::time::timeout(budget, self.provider.quote(&request)).await;
             let route_ms = route_start.elapsed().as_millis() as u64;
             (result, route_ms)
         };
@@ -1060,17 +1087,19 @@ impl Inner {
         let price_start = std::time::Instant::now();
         let price_fetch = async {
             if needs_price {
-                let result = tokio::time::timeout(
-                    PRICE_FETCH_TIMEOUT,
-                    self.price_client.get_eth_price(
+                let result = self
+                    .price_client
+                    .get_eth_price(
                         self.chain.price_api_chain.as_slug(),
                         self.chain.wrapped_native_token,
                         order.sell.token.0,
-                    ),
-                )
-                .await
-                .ok()
-                .and_then(Result::ok);
+                        // Runs concurrently with the route, so it must not be
+                        // the thing that overruns the budget. Owned by the
+                        // client so a timeout is recorded rather than lost.
+                        PRICE_FETCH_TIMEOUT.min(budget),
+                    )
+                    .await
+                    .ok();
                 let price_ms = price_start.elapsed().as_millis() as u64;
                 (result, price_ms)
             } else {
@@ -1082,10 +1111,10 @@ impl Inner {
             tokio::join!(route_fut, price_fetch);
         let quote = quote_result
             .map_err(|_| {
-                SolveError::Provider(route_provider::Error::Api(api::Error::Network(format!(
+                SolveError::Provider(route_provider::Error::Transport(format!(
                     "route request timed out after {}ms",
-                    ROUTE_REQUEST_TIMEOUT.as_millis()
-                ))))
+                    budget.as_millis()
+                )))
             })?
             .map_err(SolveError::Provider)?;
 
@@ -1315,10 +1344,14 @@ impl Inner {
         })
     }
 
-    async fn solve_native_price_probe(&self, order: &Order) -> Result<SolvedOrder, SolveError> {
+    async fn solve_native_price_probe(
+        &self,
+        order: &Order,
+        deadline: &auction::Deadline,
+    ) -> Result<SolvedOrder, SolveError> {
         let route_start = std::time::Instant::now();
         let (fwd, estimated_sell, route_ms) = self
-            .estimate_native_price_probe_sell_amount(order, route_start)
+            .estimate_native_price_probe_sell_amount(order, route_start, deadline)
             .await?;
 
         // Probes never settle; calldata may be empty (new-router quote mode).
@@ -1398,6 +1431,7 @@ impl Inner {
         &self,
         order: &Order,
         route_start: std::time::Instant,
+        deadline: &auction::Deadline,
     ) -> Result<(route_provider::ExecutableQuote, U256, u64), SolveError> {
         let mut sell_amount = self.native_price_probe_initial_sell_amount(order).await;
         if sell_amount.is_zero() {
@@ -1410,7 +1444,7 @@ impl Inner {
 
         for attempt in 0..=NATIVE_PRICE_PROBE_EXPANSION_ATTEMPTS {
             match self
-                .quote_native_price_probe_forward(order, sell_amount)
+                .quote_native_price_probe_forward(order, sell_amount, deadline)
                 .await
             {
                 Ok(q) => {
@@ -1464,7 +1498,7 @@ impl Inner {
             }
 
             match self
-                .quote_native_price_probe_forward(order, candidate)
+                .quote_native_price_probe_forward(order, candidate, deadline)
                 .await
             {
                 Ok(q) => {
@@ -1504,17 +1538,16 @@ impl Inner {
     }
 
     async fn native_price_probe_initial_sell_amount(&self, order: &Order) -> U256 {
-        let fetched = tokio::time::timeout(
-            NATIVE_PRICE_PROBE_PRICE_TIMEOUT,
-            self.price_client.get_eth_price(
+        let fetched = self
+            .price_client
+            .get_eth_price(
                 self.chain.price_api_chain.as_slug(),
                 self.chain.wrapped_native_token,
                 order.sell.token.0,
-            ),
-        )
-        .await
-        .ok()
-        .and_then(Result::ok);
+                NATIVE_PRICE_PROBE_PRICE_TIMEOUT,
+            )
+            .await
+            .ok();
 
         let Some(price) = fetched.filter(|price| !price.is_zero()) else {
             return order.buy.amount;
@@ -1542,6 +1575,7 @@ impl Inner {
         &self,
         order: &Order,
         sell_amount: U256,
+        deadline: &auction::Deadline,
     ) -> Result<route_provider::ExecutableQuote, SolveError> {
         let req = QuoteRequest {
             sell_token: order.sell.token.0,
@@ -1552,13 +1586,19 @@ impl Inner {
             min_out: None,
             gas_price_gwei: None,
         };
-        tokio::time::timeout(ROUTE_REQUEST_TIMEOUT, self.provider.quote(&req))
+        // The probe walks the sell amount up and down over several sequential
+        // quotes, so each one has to re-read the clock rather than assume a
+        // fixed slice.
+        let Some(budget) = route_budget(deadline) else {
+            return Err(SolveError::DeadlineExhausted);
+        };
+        tokio::time::timeout(budget, self.provider.quote(&req))
             .await
             .map_err(|_| {
-                SolveError::Provider(route_provider::Error::Api(api::Error::Network(format!(
+                SolveError::Provider(route_provider::Error::Transport(format!(
                     "forward route timed out after {}ms",
-                    ROUTE_REQUEST_TIMEOUT.as_millis()
-                ))))
+                    budget.as_millis()
+                )))
             })?
             .map_err(SolveError::Provider)
     }
@@ -1793,10 +1833,20 @@ fn effective_trade_amounts(
     })
 }
 
+/// Whether a failed solve says something durable about the *order*, and so
+/// justifies sidelining it for `GENERAL_ORDER_FAILURE_BACKOFF`.
+///
+/// The bar is high on purpose. The backoff is five minutes of wall clock, which
+/// on a 2s-block chain is over a hundred auctions — so anything that might
+/// succeed on the next attempt must not land here. Infrastructure failures tell
+/// us nothing about the order and are excluded.
 fn should_backoff_general_failure(err: &SolveError) -> bool {
     match err {
         SolveError::EffectiveAmountUnderFee => true,
         SolveError::InsufficientOutput { .. } => true,
+        // The request never reached a verdict — a blip against the router
+        // service, not a statement about this order.
+        SolveError::Provider(err) if err.is_transient() => false,
         SolveError::Provider(route_provider::Error::CalldataUnavailable(msg)) => {
             is_route_failure_backoff_message(msg)
         }
@@ -1804,16 +1854,27 @@ fn should_backoff_general_failure(err: &SolveError) -> bool {
         SolveError::Provider(route_provider::Error::Api(api::Error::Api {
             status,
             message,
-        })) => *status == 422 || is_route_failure_backoff_message(message),
+        })) => {
+            !is_transient_http_status(*status)
+                && (*status == 422 || is_route_failure_backoff_message(message))
+        }
         _ => false,
     }
 }
 
+/// HTTP statuses that mean "try again", not "this order is unroutable".
+fn is_transient_http_status(status: u16) -> bool {
+    status == 408 || status == 429 || (500..600).contains(&status)
+}
+
 fn is_route_failure_backoff_message(message: &str) -> bool {
     let message = message.to_ascii_lowercase();
+    // NB: no 5xx here. A 503 is the router service being unwell, not the order
+    // being unroutable, and backing off five minutes on one made outages
+    // self-amplifying: the orders dropped during a blip stayed dropped long
+    // after it passed.
     [
         "http 422",
-        "http 503",
         "min_out",
         "no route",
         "no_route",
@@ -1825,6 +1886,21 @@ fn is_route_failure_backoff_message(message: &str) -> bool {
     ]
     .iter()
     .any(|needle| message.contains(needle))
+}
+
+/// How long this order may spend fetching a route.
+///
+/// Derived from what is actually left of the auction rather than a constant,
+/// because the two failure modes are symmetric and both cost orders: a fixed
+/// budget larger than the time remaining lets an order occupy a concurrency
+/// slot it can never use, and a fixed budget smaller than the time remaining
+/// throws away orders we had time to solve. The latter was the real one — a
+/// flat 2.5s against a router averaging 0.4-1.4s per call, twice per order.
+///
+/// `None` means don't start this order at all.
+fn route_budget(deadline: &auction::Deadline) -> Option<Duration> {
+    let remaining = deadline.remaining()?;
+    (remaining >= MIN_ROUTE_BUDGET).then(|| remaining.min(ROUTE_BUDGET_CAP))
 }
 
 fn gas_price_to_gwei(gas_price: &auction::GasPrice) -> Option<f64> {
@@ -1843,6 +1919,9 @@ pub enum SolveError {
     FeeCalculation,
     EffectiveAmountUnderFee,
     SolutionConstruction,
+    /// Too little of the auction left to attempt a route lookup. Not a
+    /// property of the order, so it never triggers the failure backoff.
+    DeadlineExhausted,
 }
 
 impl fmt::Display for SolveError {
@@ -1861,6 +1940,9 @@ impl fmt::Display for SolveError {
             SolveError::FeeCalculation => write!(f, "fee calculation failed"),
             SolveError::EffectiveAmountUnderFee => {
                 write!(f, "effective amount is below fee")
+            }
+            SolveError::DeadlineExhausted => {
+                write!(f, "not enough auction time left to fetch a route")
             }
             SolveError::SolutionConstruction => write!(f, "solution construction failed"),
         }
@@ -2009,6 +2091,12 @@ mod tests {
         alloy::primitives::address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
     const WXDAI_GNOSIS: eth::Address =
         alloy::primitives::address!("e91D153E0b41518A2Ce8Dd3D7944Fa863463a97d");
+
+    /// A deadline far enough out that `route_budget` returns the cap, so tests
+    /// exercise the solve path rather than the out-of-time short circuit.
+    fn test_deadline() -> auction::Deadline {
+        auction::Deadline(chrono::Utc::now() + chrono::Duration::seconds(30))
+    }
 
     fn probe_order_with_buy_token(buy_token: eth::Address) -> Order {
         Order {
@@ -2178,7 +2266,10 @@ mod tests {
         order.sell.token = eth::TokenAddress(lp);
         order.buy.amount = U256::from(1_000u64);
 
-        let solved = inner.solve_native_price_probe(&order).await.unwrap();
+        let solved = inner
+            .solve_native_price_probe(&order, &test_deadline())
+            .await
+            .unwrap();
 
         assert_eq!(solved.input_amount, U256::from(500u64));
         assert_eq!(solved.output_amount, U256::from(1_000u64));
@@ -2215,7 +2306,10 @@ mod tests {
         order.sell.token = eth::TokenAddress(lp);
         order.buy.amount = U256::from(1_000u64);
 
-        let solved = inner.solve_native_price_probe(&order).await.unwrap();
+        let solved = inner
+            .solve_native_price_probe(&order, &test_deadline())
+            .await
+            .unwrap();
 
         assert_eq!(solved.input_amount, U256::from(4_000u64));
         assert_eq!(solved.output_amount, U256::from(1_000u64));
@@ -2995,5 +3089,103 @@ mod tests {
         let selected = inner.select_orders(orders, &tokens, false);
         let selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
         assert_eq!(selected_indices, vec![0]);
+    }
+
+    #[test]
+    fn route_budget_uses_remaining_time_when_under_the_cap() {
+        // The case a fixed 2.5s budget got wrong in the other direction: with
+        // only ~1s of auction left, don't hand the order 2.5s it cannot use.
+        let deadline =
+            auction::Deadline(chrono::Utc::now() + chrono::Duration::milliseconds(1_000));
+        let budget = route_budget(&deadline).expect("should start");
+        assert!(budget <= Duration::from_millis(1_000));
+        assert!(budget > Duration::from_millis(700));
+    }
+
+    #[test]
+    fn route_budget_caps_a_generous_deadline() {
+        // And the case it got wrong in the expensive direction: plenty of time
+        // left, but one order still must not hog a concurrency slot forever.
+        let deadline = auction::Deadline(chrono::Utc::now() + chrono::Duration::seconds(30));
+        assert_eq!(route_budget(&deadline), Some(ROUTE_BUDGET_CAP));
+    }
+
+    #[test]
+    fn route_budget_declines_when_too_little_time_remains() {
+        let deadline = auction::Deadline(chrono::Utc::now() + chrono::Duration::milliseconds(50));
+        assert_eq!(route_budget(&deadline), None);
+    }
+
+    #[test]
+    fn route_budget_declines_on_an_expired_deadline() {
+        let deadline = auction::Deadline(chrono::Utc::now() - chrono::Duration::seconds(5));
+        assert_eq!(route_budget(&deadline), None);
+    }
+
+    #[test]
+    fn deadline_exhaustion_does_not_backoff_general_orders() {
+        assert!(!should_backoff_general_failure(
+            &SolveError::DeadlineExhausted
+        ));
+    }
+
+    #[test]
+    fn transport_failures_do_not_backoff_general_orders() {
+        // A blip against the router service says nothing about the order. The
+        // backoff is 5 minutes, i.e. >100 auctions on a 2s-block chain, so
+        // letting infrastructure noise in here made outages self-amplifying.
+        for msg in ["network: connection reset", "read body: incomplete message"] {
+            let err = SolveError::Provider(route_provider::Error::Transport(msg.into()));
+            assert!(
+                !should_backoff_general_failure(&err),
+                "{msg} must not trigger backoff"
+            );
+        }
+    }
+
+    #[test]
+    fn server_error_statuses_do_not_backoff_general_orders() {
+        for status in [500u16, 502, 503, 504, 429, 408] {
+            let transport = SolveError::Provider(route_provider::Error::Transport(format!(
+                "HTTP {status}: upstream unavailable"
+            )));
+            assert!(
+                !should_backoff_general_failure(&transport),
+                "HTTP {status} from the new router must not trigger backoff"
+            );
+
+            let legacy = SolveError::Provider(route_provider::Error::Api(api::Error::Api {
+                status,
+                message: "upstream unavailable".into(),
+            }));
+            assert!(
+                !should_backoff_general_failure(&legacy),
+                "HTTP {status} from the legacy API must not trigger backoff"
+            );
+        }
+    }
+
+    #[test]
+    fn unroutable_orders_still_backoff() {
+        // The cases the backoff exists for: the service gave a verdict, and it
+        // will give the same verdict next auction.
+        for msg in [
+            "no route",
+            "min_out exceeds route output",
+            "sim_validation failed",
+            "HTTP 422: below required output",
+        ] {
+            let err = SolveError::Provider(route_provider::Error::CalldataUnavailable(msg.into()));
+            assert!(
+                should_backoff_general_failure(&err),
+                "{msg} should trigger backoff"
+            );
+        }
+
+        let unprocessable = SolveError::Provider(route_provider::Error::Api(api::Error::Api {
+            status: 422,
+            message: "unprocessable".into(),
+        }));
+        assert!(should_backoff_general_failure(&unprocessable));
     }
 }

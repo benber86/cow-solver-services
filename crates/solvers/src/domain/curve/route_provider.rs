@@ -61,6 +61,16 @@ impl QuoteRequest {
 #[derive(Debug)]
 pub enum Error {
     Api(api::Error),
+    /// Transport-level failure: the request never produced a verdict about the
+    /// route. Connection error, truncated body, 408/429/5xx.
+    ///
+    /// Kept distinct from `CalldataUnavailable` because the two demand opposite
+    /// handling: this one is worth retrying and must NOT put the order into the
+    /// failure backoff, since nothing was learned about the order itself. A
+    /// blip against the router service would otherwise sideline an order for
+    /// `GENERAL_ORDER_FAILURE_BACKOFF` — five minutes, which on a 2s-block
+    /// chain is over a hundred auctions.
+    Transport(String),
     CalldataUnavailable(String),
     RouterAddressMismatch {
         expected: eth::Address,
@@ -72,10 +82,19 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Whether the request failed without producing a verdict, so retrying it
+    /// could plausibly succeed and the order should not be backed off.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::Transport(_))
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Api(e) => write!(f, "{e}"),
+            Self::Transport(msg) => write!(f, "transport error: {msg}"),
             Self::CalldataUnavailable(msg) => write!(f, "calldata unavailable: {msg}"),
             Self::RouterAddressMismatch { expected, got } => write!(
                 f,

@@ -253,6 +253,14 @@ general-edge-tokens = [
 
 # Safety settings
 slippage-bps = 30               # 0.3% calldata min_dy floor; also the amount we bid
+# Reuse a route across auctions for this long. These chains produce
+# auctions faster than a quote goes stale, and we were re-quoting every
+# order from scratch every couple of seconds. A stale hit costs the
+# auction (settlement fails to simulate), never the buffers: the bid is
+# clamped to the calldata floor baked into the same cached quote.
+# Mainnet leaves this at the default 0 (off) — its auctions are slower
+# than the TTL would be useful for.
+quote-cache-ttl-ms = 2000
 max-quote-deviation-bps = 300   # 3% max deviation between API and on-chain quote
 max-general-order-market-deviation-bps = 200  # 2% pre-router general-order filter
 max-general-order-validity-secs = 86400       # skip >1d non-LP general orders

@@ -86,6 +86,14 @@ struct Config {
     #[serde(default)]
     bid_slippage_bps: Option<u32>,
 
+    /// How long a route may be reused across auctions, in milliseconds.
+    ///
+    /// Meant for chains whose auctions arrive faster than quotes go stale: on a
+    /// 2s-block chain the same order is re-quoted every couple of seconds, two
+    /// round trips at a time. Omit or set to 0 to disable.
+    #[serde(default)]
+    quote_cache_ttl_ms: u64,
+
     /// Maximum deviation between API quote and on-chain get_dy (basis points).
     #[serde(default = "default_max_quote_deviation_bps")]
     max_quote_deviation_bps: u32,
@@ -205,6 +213,7 @@ pub async fn load(path: &Path) -> curve_lp::Config {
         node_url: config.node_url,
         slippage_bps: config.slippage_bps,
         bid_slippage_bps: config.bid_slippage_bps.unwrap_or(config.slippage_bps),
+        quote_cache_ttl: std::time::Duration::from_millis(config.quote_cache_ttl_ms),
         max_quote_deviation_bps: config.max_quote_deviation_bps,
         solution_gas_offset: config.solution_gas_offset.into(),
         route_provider,

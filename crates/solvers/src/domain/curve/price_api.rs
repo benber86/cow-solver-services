@@ -16,7 +16,7 @@ use {
 pub struct Client {
     http: reqwest::Client,
     base_url: Url,
-    cache: Mutex<HashMap<eth::Address, CachedPrice>>,
+    cache: Mutex<HashMap<eth::Address, CacheEntry>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -29,14 +29,24 @@ struct PriceData {
     usd_price: f64,
 }
 
-/// Cached ETH-denominated price with fetch timestamp.
-struct CachedPrice {
-    price: eth::U256,
-    fetched_at: Instant,
+/// A remembered lookup outcome. Failures are recorded too — see
+/// `NEGATIVE_CACHE_TTL`.
+enum CacheEntry {
+    Price { price: eth::U256, at: Instant },
+    Unavailable { at: Instant },
 }
 
 /// How long to keep a cached price before refreshing.
 const CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// How long to remember that a token has no usable price.
+///
+/// The same unpriced token reappears in every auction, so without this we pay
+/// the full lookup timeout for it again and again — on a 2s-block chain that is
+/// a fresh timeout every couple of seconds, indefinitely, for a token that is
+/// simply not priced. Deliberately much shorter than `CACHE_TTL` so a transient
+/// outage sidelines a token for seconds rather than minutes.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(15);
 
 impl Client {
     /// Creates a new Curve Price API client.
@@ -59,16 +69,54 @@ impl Client {
     ///
     /// `chain` is the Curve Price API chain slug ("ethereum" | "arbitrum" | "xdai").
     /// `wrapped_native` is the pivot token: WETH on Ethereum/Arbitrum, WXDAI on Gnosis.
+    /// The `timeout` is applied *inside* this call rather than by the caller.
+    ///
+    /// That matters: a caller-side `tokio::time::timeout` drops the future
+    /// mid-flight, so the client never learns the lookup failed and caches
+    /// nothing — leaving the next auction to repeat the identical timeout. By
+    /// owning the deadline we always reach a verdict we can record.
     pub async fn get_eth_price(
         &self,
         chain: &str,
         wrapped_native: eth::Address,
         token: eth::Address,
+        timeout: Duration,
     ) -> Result<eth::U256, Error> {
-        if let Some(price) = self.cached_price(token) {
-            return Ok(price);
+        match self.cached(token) {
+            Some(Ok(price)) => return Ok(price),
+            Some(Err(())) => return Err(Error::RecentlyUnavailable),
+            None => {}
         }
 
+        let result =
+            tokio::time::timeout(timeout, self.fetch_eth_price(chain, wrapped_native, token))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(Error::Network(format!(
+                        "price lookup timed out after {}ms",
+                        timeout.as_millis()
+                    )))
+                });
+
+        match result {
+            Ok(price) => {
+                self.insert_price(token, price);
+                Ok(price)
+            }
+            Err(err) => {
+                tracing::debug!(?token, %err, "caching unavailable token price");
+                self.insert_unavailable(token);
+                Err(err)
+            }
+        }
+    }
+
+    async fn fetch_eth_price(
+        &self,
+        chain: &str,
+        wrapped_native: eth::Address,
+        token: eth::Address,
+    ) -> Result<eth::U256, Error> {
         // Fetch both token and wrapped-native USD prices in parallel.
         let (token_usd, native_usd) = tokio::join!(
             self.get_usd_price_raw(chain, token),
@@ -96,9 +144,7 @@ impl Client {
             return Err(Error::Parse("price overflow".to_string()));
         }
 
-        let as_u256 = eth::U256::from(native_price as u128);
-        self.insert_cache(token, as_u256);
-        Ok(as_u256)
+        Ok(eth::U256::from(native_price as u128))
     }
 
     /// Fetches raw USD price for a token as f64.
@@ -136,25 +182,32 @@ impl Client {
         Ok(usd_price)
     }
 
-    fn cached_price(&self, token: eth::Address) -> Option<eth::U256> {
+    /// `Some(Ok(price))` = fresh price, `Some(Err(()))` = known-unavailable and
+    /// not worth another request yet, `None` = nothing usable, go fetch.
+    fn cached(&self, token: eth::Address) -> Option<Result<eth::U256, ()>> {
         let cache = self.cache.lock().ok()?;
-        let entry = cache.get(&token)?;
-        if entry.fetched_at.elapsed() <= CACHE_TTL {
-            Some(entry.price)
-        } else {
-            None
+        match cache.get(&token)? {
+            CacheEntry::Price { price, at } if at.elapsed() <= CACHE_TTL => Some(Ok(*price)),
+            CacheEntry::Unavailable { at } if at.elapsed() <= NEGATIVE_CACHE_TTL => Some(Err(())),
+            _ => None,
         }
     }
 
-    fn insert_cache(&self, token: eth::Address, price: eth::U256) {
+    fn insert_price(&self, token: eth::Address, price: eth::U256) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(
                 token,
-                CachedPrice {
+                CacheEntry::Price {
                     price,
-                    fetched_at: Instant::now(),
+                    at: Instant::now(),
                 },
             );
+        }
+    }
+
+    fn insert_unavailable(&self, token: eth::Address) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(token, CacheEntry::Unavailable { at: Instant::now() });
         }
     }
 }
@@ -162,8 +215,14 @@ impl Client {
 #[derive(Debug)]
 pub enum Error {
     Network(String),
-    Api { status: u16, message: String },
+    Api {
+        status: u16,
+        message: String,
+    },
     Parse(String),
+    /// A recent lookup for this token failed and the negative cache entry has
+    /// not expired, so no request was made.
+    RecentlyUnavailable,
 }
 
 impl fmt::Display for Error {
@@ -174,6 +233,9 @@ impl fmt::Display for Error {
                 write!(f, "API error (status {}): {}", status, message)
             }
             Error::Parse(msg) => write!(f, "parse error: {}", msg),
+            Error::RecentlyUnavailable => {
+                write!(f, "price recently unavailable; not retried yet")
+            }
         }
     }
 }
@@ -183,6 +245,86 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unreachable_client() -> Client {
+        // Port 1 refuses immediately, so any test that actually issues a
+        // request fails fast rather than hanging.
+        Client::new("http://localhost:1/".parse().unwrap())
+    }
+
+    #[test]
+    fn fresh_price_is_served_from_cache() {
+        let client = unreachable_client();
+        let token = eth::Address::repeat_byte(0x11);
+        assert!(client.cached(token).is_none());
+
+        client.insert_price(token, eth::U256::from(1_234u64));
+        assert_eq!(client.cached(token), Some(Ok(eth::U256::from(1_234u64))));
+    }
+
+    #[test]
+    fn failed_lookups_are_remembered() {
+        let client = unreachable_client();
+        let token = eth::Address::repeat_byte(0x22);
+
+        client.insert_unavailable(token);
+        assert_eq!(
+            client.cached(token),
+            Some(Err(())),
+            "an unavailable token must be distinguishable from an unknown one"
+        );
+    }
+
+    #[tokio::test]
+    async fn known_unavailable_token_short_circuits_without_a_request() {
+        // The regression this guards: the caller used to wrap the lookup in its
+        // own timeout, which dropped the future mid-flight so nothing was ever
+        // recorded — and the next auction, seconds later, paid the identical
+        // timeout again, forever.
+        let client = unreachable_client();
+        let token = eth::Address::repeat_byte(0x33);
+        client.insert_unavailable(token);
+
+        let started = Instant::now();
+        let err = client
+            .get_eth_price(
+                "base",
+                eth::Address::repeat_byte(0x44),
+                token,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("must not fetch");
+
+        assert!(matches!(err, Error::RecentlyUnavailable));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "should have returned from cache, not attempted a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_lookup_populates_the_negative_cache() {
+        let client = unreachable_client();
+        let token = eth::Address::repeat_byte(0x55);
+
+        // First call actually tries (and fails against a dead port).
+        let _ = client
+            .get_eth_price(
+                "base",
+                eth::Address::repeat_byte(0x66),
+                token,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect_err("dead port must fail");
+
+        assert_eq!(
+            client.cached(token),
+            Some(Err(())),
+            "the failure must be recorded so the next auction skips the lookup"
+        );
+    }
 
     #[test]
     fn test_eth_price_conversion() {

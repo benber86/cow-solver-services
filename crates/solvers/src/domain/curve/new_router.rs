@@ -6,50 +6,56 @@ use {
     async_trait::async_trait,
     reqwest::Url,
     serde::{Deserialize, Serialize},
-    std::time::Duration,
+    std::{
+        collections::HashMap,
+        sync::Mutex,
+        time::{Duration, Instant},
+    },
 };
 
 /// Retries of the binding round trip before we give up on the order. The
 /// probe already cost a round trip and the whole `quote` call shares one
-/// upstream budget (`ROUTE_REQUEST_TIMEOUT`), so this is deliberately shallow.
+/// upstream budget (`route_budget`), so this is deliberately shallow.
 const BIND_RETRY_ATTEMPTS: u32 = 1;
+
+/// Cap on cached quotes so a large order book cannot grow the map without
+/// bound — the TTL alone never evicts on a chain that goes quiet.
+const MAX_QUOTE_CACHE_ENTRIES: usize = 4096;
+
+/// Identity of a quote for caching purposes.
+///
+/// `receiver` is excluded because it is always this chain's settlement
+/// contract, and `min_out` because it is *derived* from the response being
+/// cached rather than an input that varies between callers for the same order.
+type QuoteKey = (eth::Address, eth::Address, eth::U256);
+
+struct CachedQuote {
+    quote: ExecutableQuote,
+    stored_at: Instant,
+}
 
 pub struct NewRouterClient {
     http: reqwest::Client,
     quote_url: Url,
     router_address: eth::Address,
     slippage_bps: u32,
+    /// How long a route may be reused across auctions. Zero disables caching.
+    cache_ttl: Duration,
+    cache: Mutex<HashMap<QuoteKey, CachedQuote>>,
 }
 
-/// A failed `/quote` call, tagged with whether retrying could plausibly help.
-///
-/// Transient means the request never produced a verdict: connection reset,
-/// truncated body, 408/429/5xx. Everything else is deterministic — a 4xx, an
-/// unparseable body, or the service reporting `error` (no route, `min_out`
-/// unreachable). Those fail identically on a retry and only burn the deadline.
-struct QuoteFailure {
-    error: Error,
-    transient: bool,
-}
-
-impl QuoteFailure {
-    fn permanent(error: Error) -> Self {
-        Self {
-            error,
-            transient: false,
-        }
-    }
-
-    fn transient(error: Error) -> Self {
-        Self {
-            error,
-            transient: true,
-        }
-    }
-}
+// Failures are classified where we actually know the cause: transport-level
+// problems become `Error::Transport` (retryable, no backoff), everything the
+// service actually answered becomes `Error::CalldataUnavailable` (a verdict —
+// no route, `min_out` unreachable — so retrying only burns the deadline).
 
 impl NewRouterClient {
-    pub fn new(quote_url: Url, router_address: eth::Address, slippage_bps: u32) -> Self {
+    pub fn new(
+        quote_url: Url,
+        router_address: eth::Address,
+        slippage_bps: u32,
+        cache_ttl: Duration,
+    ) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
@@ -59,7 +65,42 @@ impl NewRouterClient {
             quote_url,
             router_address,
             slippage_bps,
+            cache_ttl,
+            cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn cache_key(req: &QuoteRequest) -> QuoteKey {
+        (req.sell_token, req.buy_token, req.sell_amount)
+    }
+
+    fn cached_quote(&self, req: &QuoteRequest) -> Option<ExecutableQuote> {
+        if self.cache_ttl.is_zero() {
+            return None;
+        }
+        let cache = self.cache.lock().ok()?;
+        let entry = cache.get(&Self::cache_key(req))?;
+        (entry.stored_at.elapsed() <= self.cache_ttl).then(|| entry.quote.clone())
+    }
+
+    fn store_quote(&self, req: &QuoteRequest, quote: &ExecutableQuote) {
+        if self.cache_ttl.is_zero() {
+            return;
+        }
+        let Ok(mut cache) = self.cache.lock() else {
+            return;
+        };
+        if cache.len() >= MAX_QUOTE_CACHE_ENTRIES {
+            let ttl = self.cache_ttl;
+            cache.retain(|_, entry| entry.stored_at.elapsed() <= ttl);
+        }
+        cache.insert(
+            Self::cache_key(req),
+            CachedQuote {
+                quote: quote.clone(),
+                stored_at: Instant::now(),
+            },
+        );
     }
 
     fn build_request_body(req: &QuoteRequest) -> RequestBody {
@@ -163,7 +204,7 @@ impl NewRouterClient {
         }
     }
 
-    async fn post_quote(&self, req: &QuoteRequest) -> Result<ExecutableQuote, QuoteFailure> {
+    async fn post_quote(&self, req: &QuoteRequest) -> Result<ExecutableQuote, Error> {
         let body = Self::build_request_body(req);
         let resp = self
             .http
@@ -171,33 +212,32 @@ impl NewRouterClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| {
-                QuoteFailure::transient(Error::CalldataUnavailable(format!("network: {e}")))
-            })?;
+            .map_err(|e| Error::Transport(format!("network: {e}")))?;
 
         let status = resp.status();
-        let raw = resp.bytes().await.map_err(|e| {
-            QuoteFailure::transient(Error::CalldataUnavailable(format!("read body: {e}")))
-        })?;
+        let raw = resp
+            .bytes()
+            .await
+            .map_err(|e| Error::Transport(format!("read body: {e}")))?;
 
         if !status.is_success() {
             let txt = String::from_utf8_lossy(&raw).to_string();
-            let error = Error::CalldataUnavailable(format!("HTTP {status}: {txt}"));
+            let msg = format!("HTTP {status}: {txt}");
             return Err(if Self::status_is_transient(status) {
-                QuoteFailure::transient(error)
+                Error::Transport(msg)
             } else {
-                QuoteFailure::permanent(error)
+                Error::CalldataUnavailable(msg)
             });
         }
 
         let parsed: ResponseBody = serde_json::from_slice(&raw).map_err(|e| {
-            QuoteFailure::permanent(Error::CalldataUnavailable(format!(
+            Error::CalldataUnavailable(format!(
                 "parse error: {e}; body: {}",
                 String::from_utf8_lossy(&raw)
-            )))
+            ))
         })?;
 
-        Self::parse_response(parsed, req, self.router_address).map_err(QuoteFailure::permanent)
+        Self::parse_response(parsed, req, self.router_address)
     }
 }
 
@@ -205,9 +245,27 @@ impl NewRouterClient {
 impl RouteProvider for NewRouterClient {
     async fn quote(&self, req: &QuoteRequest) -> Result<ExecutableQuote, Error> {
         // Quote probes: single call, no calldata needed, server-side
-        // `min_out` (if any) is the only floor that exists.
+        // `min_out` (if any) is the only floor that exists. Never served from
+        // cache — these answer CoW's /quote requests and the native-price
+        // probe's amount search, both of which want a fresh price.
         if req.is_quote {
-            return self.post_quote(req).await.map_err(|failure| failure.error);
+            return self.post_quote(req).await;
+        }
+
+        // The same order is re-quoted every auction, and on a 2s-block chain
+        // that is two round trips per order every two seconds against a
+        // service we also depend on for latency. A hit here costs the freshness
+        // of `expected_output`; because the bid is clamped to the calldata
+        // floor baked into this same quote, a stale one cannot make us promise
+        // more than the calldata guarantees — it can only make the settlement
+        // fail to simulate, which costs the auction rather than the buffers.
+        if let Some(quote) = self.cached_quote(req) {
+            tracing::debug!(
+                sell_token = ?req.sell_token,
+                buy_token = ?req.buy_token,
+                "serving route from cache"
+            );
+            return Ok(quote);
         }
 
         // Real solves need ONE floor that's both the bid and the calldata
@@ -233,10 +291,7 @@ impl RouteProvider for NewRouterClient {
         // fallback instead promised a real price against a 5 crvUSD floor,
         // i.e. an unbounded overdraft. Neither is acceptable — the only safe
         // outcome when we cannot bind a real floor is to not bid at all.
-        let probe = self
-            .post_quote(req)
-            .await
-            .map_err(|failure| failure.error)?;
+        let probe = self.post_quote(req).await?;
 
         let mut bind_req = req.clone();
         bind_req.min_out = Some(Self::bind_floor(
@@ -248,16 +303,15 @@ impl RouteProvider for NewRouterClient {
         let mut attempt = 0u32;
         loop {
             match self.post_quote(&bind_req).await {
-                Ok(quote) => return Ok(quote),
-                Err(failure) if failure.transient && attempt < BIND_RETRY_ATTEMPTS => {
-                    attempt += 1;
-                    tracing::debug!(
-                        attempt,
-                        error = %failure.error,
-                        "retrying router bind request"
-                    );
+                Ok(quote) => {
+                    self.store_quote(req, &quote);
+                    return Ok(quote);
                 }
-                Err(failure) => return Err(failure.error),
+                Err(error) if error.is_transient() && attempt < BIND_RETRY_ATTEMPTS => {
+                    attempt += 1;
+                    tracing::debug!(attempt, %error, "retrying router bind request");
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -440,6 +494,77 @@ mod tests {
         let err = NewRouterClient::parse_response(body, &req, Address::repeat_byte(0xCA))
             .expect_err("must fail");
         assert!(matches!(err, Error::CalldataUnavailable(_)));
+    }
+
+    fn client_with_ttl(ttl: Duration) -> NewRouterClient {
+        NewRouterClient::new(
+            "https://router.invalid/quote".parse().unwrap(),
+            Address::repeat_byte(0xCA),
+            100,
+            ttl,
+        )
+    }
+
+    fn sample_quote() -> ExecutableQuote {
+        ExecutableQuote {
+            expected_output: eth::U256::from(1_000_000u64),
+            min_out: eth::U256::from(990_000u64),
+            router_address: Address::repeat_byte(0xCA),
+            calldata: vec![0xde, 0xad],
+            gas_estimate: Some(350_000),
+            quality: Some(QuoteQuality::RouterExecution),
+        }
+    }
+
+    #[test]
+    fn quote_cache_returns_a_fresh_entry() {
+        let client = client_with_ttl(Duration::from_secs(30));
+        let req = dummy_req(false);
+        assert!(client.cached_quote(&req).is_none());
+
+        client.store_quote(&req, &sample_quote());
+        let hit = client.cached_quote(&req).expect("should hit");
+        assert_eq!(hit.expected_output, eth::U256::from(1_000_000u64));
+        assert_eq!(hit.min_out, eth::U256::from(990_000u64));
+    }
+
+    #[test]
+    fn quote_cache_is_disabled_at_zero_ttl() {
+        let client = client_with_ttl(Duration::ZERO);
+        let req = dummy_req(false);
+        client.store_quote(&req, &sample_quote());
+        assert!(
+            client.cached_quote(&req).is_none(),
+            "a zero TTL must neither store nor serve"
+        );
+    }
+
+    #[test]
+    fn quote_cache_expires_entries() {
+        // A one-nanosecond TTL is already elapsed by the time we look.
+        let client = client_with_ttl(Duration::from_nanos(1));
+        let req = dummy_req(false);
+        client.store_quote(&req, &sample_quote());
+        assert!(client.cached_quote(&req).is_none());
+    }
+
+    #[test]
+    fn quote_cache_discriminates_by_pair_and_amount() {
+        let client = client_with_ttl(Duration::from_secs(30));
+        let req = dummy_req(false);
+        client.store_quote(&req, &sample_quote());
+
+        let mut other_amount = req.clone();
+        other_amount.sell_amount = eth::U256::from(999u64);
+        assert!(client.cached_quote(&other_amount).is_none());
+
+        let mut other_pair = req.clone();
+        other_pair.buy_token = Address::repeat_byte(0x33);
+        assert!(client.cached_quote(&other_pair).is_none());
+
+        // The original key still hits — the misses above were real misses, not
+        // the cache having been clobbered.
+        assert!(client.cached_quote(&req).is_some());
     }
 
     #[test]
