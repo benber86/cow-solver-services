@@ -1908,12 +1908,10 @@ token-allowlist = [
     "0xfffAE954601cFF1195a8E20342db7EE66d56436B",  # ETHxwstETH-f - Curve.fi Factory Crypto Pool: ETHx-wstETH
 ]
 
-# Non-LP orders must touch YB, yYB, or crvUSD on at least one side.
-# Overdraft cleanup 2026-08: general flow bled buffers on thin CRV-family
-# and stable pairs; confine it to pairs where Curve has a real edge.
+# Non-LP orders must touch crvUSD on one side. This keeps the general flow
+# that feeds the YB pools (all pair BTC-variants/WETH against crvUSD) and the
+# main crvUSD stable pools, and nothing else (overdraft cleanup 2026-08).
 general-edge-tokens = [
-    "0x01791F726B4103694969820be083196cC7c045fF",  # YB
-    "0x22222222aEA0076fCA927a3f44dc0B4FdF9479D6",  # yYB
     "0xf939E0A03FB07F59A73314E73794Be0E57ac1b4E",  # crvUSD
 ]
 
