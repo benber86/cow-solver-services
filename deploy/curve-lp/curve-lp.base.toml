@@ -111,6 +111,10 @@ token-allowlist = [
     "0xEB466342C4d449BC9f53A865D5Cb90586f405215",  # axlUSDC
 ]
 
+# Non-LP handling disabled (overdraft cleanup 2026-08): empty list means no
+# general order can match. LP-priority flow is unaffected.
+general-edge-tokens = []
+
 # Optional buy-token either-side filter (left disabled):
 # allowed-buy-tokens = [
 # ]

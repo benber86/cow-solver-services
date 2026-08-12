@@ -77,18 +77,9 @@ token-allowlist = [
 
 # Non-LP real-auction orders must touch at least one of these tokens. Keep
 # EURe in this set so CoWFeeModule EURe -> WXDAI orders remain eligible.
-general-edge-tokens = [
-    "0xa555d5344f6FB6c65da19e403Cb4c1eC4a1a5Ee3",  # BREAD
-    "0x712b3d230F3C1c19db860d80619288b1F0BDd0Bd",  # CRV
-    "0x54E4cB2a4Fa0ee46E3d9A98D13Bea119666E09f6",  # EURC.e
-    "0xcB444e90D8198415266c6a2724b7900fb12FC56E",  # EURe
-    "0x420CA0f9B9b604cE0fd9C18EF134C705e5Fa3430",  # EURe (variant)
-    "0x9C58BAcC331c9aa871AFD802DB6379a98e80CEdb",  # GNO
-    "0xF490c80aAE5f2616d3e3BDa2483E30C4CB21d1A0",  # osGNO
-    "0x2a22f9c3b484c3629090FeED35F17Ff8F88f76F0",  # USDC.e
-    "0xC6ed4f520f6A4e4DC27273509239b7F8A68d2068",  # UUSD
-    "0x6C76971f98945AE98dD7d4DFcA8711ebea946eA6",  # wstETH
-]
+# Non-LP handling disabled (overdraft cleanup 2026-08): empty list means no
+# general order can match. LP-priority flow is unaffected.
+general-edge-tokens = []
 
 # Optional buy-token either-side filter (left disabled):
 # allowed-buy-tokens = [

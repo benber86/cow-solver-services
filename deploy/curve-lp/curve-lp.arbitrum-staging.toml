@@ -219,39 +219,9 @@ token-allowlist = [
 # Non-LP real-auction orders must touch at least one of these tokens. This
 # keeps generic blue-chip pairs (USDC/WBTC, USDC/WETH, USDT/USDC) from
 # consuming Arbitrum attempts while preserving LP-priority coverage.
-general-edge-tokens = [
-    "0x75289388d50364c3013583d97bd70cED0e183e32",  # asdCRV
-    "0x11cDb42B0EB46D95f990BeDD4695A6e3fA034978",  # CRV
-    "0x498Bf2B1e120FeD3ad3D42EA2165E9b73f99C1e5",  # crvUSD
-    "0x18C14C2D707b2212e17d1579789Fc06010cfca23",  # ETH+
-    "0x0c06cCF38114ddfc35e07427B9424adcca9F44F8",  # EURe
-    "0x12275DCB9048680c4Be40942eA4D92c74C63b844",  # eUSD
-    "0x7A10F506E4c7658e6AD15Fdf0443d450B7FA80D7",  # EYWA
-    "0xc608Dfb90A430Df79a8a1eDBC8be7f1A0Eb4E763",  # fETH
-    "0x17FC002b466eEc40DaE837Fc4bE5c67993ddBd6F",  # FRAX
-    "0xD87b532ed5BAcEC131352CA8988800c7Ad52d555",  # FRT
-    "0x178412e79c25968a32e89b11f63B33F733770c2A",  # frxETH
-    "0xe3f7c2e873d8F73bCa7961E2D2e18Bbde2Bda7Ec",  # FXB_20261231
-    "0xDc8B6B6bEab4d5034aE91B7A1cf7D05A41f0d239",  # GMAC
-    "0x0BBF664D46becc28593368c97236FAa0fb397595",  # KNOX
-    "0x1DD6b5F9281c6B4f043c02A83a46c2772024636c",  # LUAUSD
-    "0xFEa7a6a0B346362BF88A9e4A88416B77a57D6c2A",  # MIM
-    "0xDBf31dF14B66535aF65AaC99C32e9eA844e14501",  # renBTC
-    "0x96a993f06951B01430523D0D5590192d650EBf3e",  # rgUSD
-    "0xCa5Ca9083702c56b481D1eec86F1776FDbd2e594",  # RSR
-    "0x0B2b2B2076d95dda7817e785989fE353fe955ef9",  # sUSDai
-    "0x6c84a8f1c29108F47a79964b5Fe888D4f4D0dE40",  # tBTC
-    "0x3d15fD46CE9e551498328B1C83071D9509E2C3a0",  # uniETH
-    "0x0A1a1A107E45b7Ced86833863f482BC5f4ed82EF",  # USDai
-    "0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8",  # USDC.e (bridged)
-    "0xb1084db8D3C05CEbd5FA9335dF95EE4b8a0edc30",  # USDT+
-    "0x33C88D4caC6aC34F77020915a2a88cd0417dC069",  # USSD
-    "0x62d5a59E0d67c0381aAd53B201B4A1B8Dcd2C833",  # vsdCRV
-    "0x64343594Ab9b56e99087BfA6F2335Db24c2d1F17",  # VST
-    "0x5979D7b546E38E414F7E9822514be443A4800529",  # wstETH
-    "0x55380fe7A1910dFf29A47B622057ab4139DA42C5",  # xETH
-    "0xe80772Eaf6e2E18B651F160Bc9158b2A5caFCA65",  # xUSD
-]
+# Non-LP handling disabled (overdraft cleanup 2026-08): empty list means no
+# general order can match. LP-priority flow is unaffected.
+general-edge-tokens = []
 
 # Optional buy-token either-side filter (left disabled):
 # allowed-buy-tokens = [
