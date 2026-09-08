@@ -51,6 +51,19 @@ services:
     command: >
       -c '
         sed "s/\$$DOMAIN/$$DOMAIN/g" /etc/nginx/nginx.template > /etc/nginx/nginx.conf;
+        # Certbot updates the shared volume; nginx must load the new certificate.
+        cert=/etc/letsencrypt/live/$$DOMAIN/fullchain.pem;
+        loaded=$$(sha256sum "$$cert");
+        (
+          while sleep 60; do
+            current=$$(sha256sum "$$cert") || continue;
+            if [ "$$current" != "$$loaded" ]; then
+              if nginx -t && nginx -s reload; then
+                loaded=$$current;
+              fi;
+            fi;
+          done
+        ) &
         exec nginx -g "daemon off;"
       '
     logging:
@@ -91,9 +104,9 @@ services:
         # Renewal loop
         echo "Starting renewal loop...";
         while :; do
-          sleep 12h;
           echo "Checking for renewal...";
           certbot renew --webroot --webroot-path=/var/www/certbot;
+          sleep 12h;
         done
       '
     depends_on:

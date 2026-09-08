@@ -429,11 +429,16 @@ docker compose -f docker-compose.prod.yml logs {chain} --tail 100
 
 ### Cert renewal failing
 Cert lives in the `certbot-etc` volume, renewed in a loop by the `certbot`
-service. Logs:
+service. It checks on startup and every 12 hours. Nginx checks the certificate
+every minute and reloads when it changes. Logs:
 ```
 docker compose -f docker-compose.prod.yml logs certbot
 ```
-Force a refresh by recreating the ingress: `./deploy.sh --ingress-only`.
+To check renewal immediately and load the certificate:
+```
+docker compose -f docker-compose.prod.yml exec certbot certbot renew --webroot --webroot-path=/var/www/certbot
+docker compose -f docker-compose.prod.yml exec nginx nginx -s reload
+```
 
 ### CoW driver sends traffic that all 404s or times out
 Confirm CoW has the right URL(s) registered for the chain/env pair in question.
