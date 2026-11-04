@@ -256,12 +256,19 @@ impl NewRouterClient {
 #[async_trait]
 impl RouteProvider for NewRouterClient {
     async fn quote(&self, req: &QuoteRequest) -> Result<ExecutableQuote, Error> {
-        // Quote probes: single call, no calldata needed, server-side
-        // `min_out` (if any) is the only floor that exists. Never served from
+        // Quote probes: single call, no calldata needed. Never served from
         // cache — these answer CoW's /quote requests and the native-price
         // probe's amount search, both of which want a fresh price.
+        //
+        // There is no bind trip here, yet the floor we report is still what
+        // the bid gets clamped to. CoW's /quote carries a 1 wei buy amount
+        // as a placeholder, so echoing `req.min_out` as the floor collapsed
+        // every sell-side quote to a 1 wei bid. Report the floor a real
+        // solve would bind instead.
         if req.is_quote {
-            return self.post_quote(req).await;
+            let mut quote = self.post_quote(req).await?;
+            quote.min_out = Self::bind_floor(quote.expected_output, self.slippage_bps, req.min_out);
+            return Ok(quote);
         }
 
         // The same order is re-quoted every auction, and on a 2s-block chain
@@ -598,6 +605,42 @@ mod tests {
         // The original key still hits — the misses above were real misses, not
         // the cache having been clobbered.
         assert!(client.cached_quote(&req).is_some());
+    }
+
+    async fn serve_fixed_quote(expected_out: &'static str) -> Url {
+        let app = axum::Router::new().route(
+            "/quote",
+            axum::routing::post(move || async move {
+                axum::Json(serde_json::json!({
+                    "expected_out": expected_out,
+                    "gas_estimate": 350_000,
+                    "final_token": format!("{:#x}", Address::repeat_byte(0x22)),
+                    "router_address": format!("{:#x}", Address::repeat_byte(0xCA)),
+                }))
+            }),
+        );
+        let server =
+            axum::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(app.into_make_service());
+        let addr = server.local_addr();
+        tokio::spawn(server);
+        format!("http://{addr}/quote").parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn quote_only_floor_mirrors_the_bind_floor_not_the_placeholder_limit() {
+        // CoW's /quote sends a sell order with a 1 wei buy amount. The
+        // quote-only path makes no bind trip, so the floor it reports is what
+        // `sell_order_bid_output` clamps the bid to. Echoing the 1 wei
+        // placeholder there collapsed every sell-side quote to a 1 wei bid.
+        let url = serve_fixed_quote("1000000").await;
+        let client = NewRouterClient::new(url, Address::repeat_byte(0xCA), 30, Duration::ZERO);
+        let mut req = dummy_req(true);
+        req.min_out = Some(eth::U256::from(1u64));
+
+        let quote = client.quote(&req).await.expect("quote");
+
+        assert_eq!(quote.expected_output, eth::U256::from(1_000_000u64));
+        assert_eq!(quote.min_out, eth::U256::from(997_000u64));
     }
 
     #[test]
