@@ -1907,6 +1907,7 @@ token-allowlist = [
     "0xFFd3b4D343A8964a5C3c1caAc20f319C41A97BFF",  # yn-RWA/USD - ynRWAx/ynUSDx
     "0xFfF8634dE89271b6075C55FA89B4E9A087Fdb9FE",  # tacBTCpool - tacBTC/cb/f
     "0xfffAE954601cFF1195a8E20342db7EE66d56436B",  # ETHxwstETH-f - Curve.fi Factory Crypto Pool: ETHx-wstETH
+    "0xD0a32F6d4850F9D6DF7d4F8f84af1Fcd3Cf993CC",  # SWAN - SwanDAO (SWAN/WETH LP zaps)
 ]
 
 # Non-LP orders must touch crvUSD on one side. This keeps the general flow
