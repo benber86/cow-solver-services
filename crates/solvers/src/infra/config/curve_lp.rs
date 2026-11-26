@@ -4,7 +4,14 @@ use {
     crate::domain::{
         curve::route_provider::ReportBank,
         eth,
-        solver::curve_lp::{self, ChainConfig, CurvePriceApiChain, RouteProviderKind},
+        solver::curve_lp::{
+            self,
+            ChainConfig,
+            CurvePriceApiChain,
+            GeneralPair,
+            RouteProviderKind,
+            TokenPair,
+        },
     },
     reqwest::Url,
     serde::Deserialize,
@@ -24,6 +31,15 @@ impl Default for RouteProviderTag {
     fn default() -> Self {
         Self::Legacy
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct GeneralPairEntry {
+    tokens: Vec<eth::Address>,
+    /// Haircut for this pair in basis points, in place of `slippage-bps`.
+    #[serde(default)]
+    slippage_bps: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +82,12 @@ struct Config {
     /// quote requests bypass it.
     #[serde(default)]
     general_edge_tokens: Option<Vec<eth::Address>>,
+
+    /// Token pairs non-LP orders may trade in either direction even when
+    /// neither token is in `general-edge-tokens`. Unlike an edge token, a pair
+    /// only admits orders between its own two tokens.
+    #[serde(default)]
+    general_pairs: Vec<GeneralPairEntry>,
 
     /// Curve Router API URL.
     curve_api_url: Url,
@@ -163,6 +185,23 @@ struct Config {
     report_bank_max_fee_wei: u64,
 }
 
+/// A `general-pairs` entry: exactly two distinct tokens, and a haircut that
+/// leaves something to bid. TOML would happily read a longer list into a fixed
+/// pair and drop the rest, so the length is checked here.
+fn general_pair(entry: &GeneralPairEntry) -> Result<GeneralPair, String> {
+    let pair = match entry.tokens.as_slice() {
+        [a, b] => TokenPair::new(*a, *b).ok_or_else(|| format!("{a:?} is paired with itself"))?,
+        other => return Err(format!("expected 2 tokens, got {}", other.len())),
+    };
+    if entry.slippage_bps.is_some_and(|bps| bps >= 10_000) {
+        return Err("slippage-bps must be below 10000".to_owned());
+    }
+    Ok(GeneralPair {
+        pair,
+        slippage_bps: entry.slippage_bps,
+    })
+}
+
 fn default_slippage_bps() -> u32 {
     100 // 1%
 }
@@ -221,6 +260,14 @@ pub async fn load(path: &Path) -> curve_lp::Config {
         allowed_buy_tokens: config.allowed_buy_tokens,
         token_allowlist: config.token_allowlist,
         general_edge_tokens: config.general_edge_tokens,
+        general_pairs: config
+            .general_pairs
+            .iter()
+            .map(|entry| {
+                general_pair(entry)
+                    .unwrap_or_else(|e| panic!("invalid general-pairs entry in {path:?}: {e}"))
+            })
+            .collect(),
         curve_api_url: config.curve_api_url,
         curve_price_api_url: config.curve_price_api_url,
         node_url: config.node_url,
@@ -406,6 +453,45 @@ token-allowlist = [
         let raw = minimal_toml("");
         let parsed: Config = toml::de::from_str(&raw).expect("should parse");
         assert!(parsed.token_allowlist.is_none());
+    }
+
+    const WETH_GNOSIS: &str = "0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1";
+    const WXDAI: &str = "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d";
+
+    fn pair_entry(tokens: &[&str], slippage_bps: Option<u32>) -> GeneralPairEntry {
+        GeneralPairEntry {
+            tokens: tokens.iter().map(|t| t.parse().unwrap()).collect(),
+            slippage_bps,
+        }
+    }
+
+    #[test]
+    fn general_pairs_parse_with_an_optional_haircut_and_default_to_none() {
+        let raw = minimal_toml(&format!(
+            r#"
+general-pairs = [
+    {{ tokens = ["{WETH_GNOSIS}", "{WXDAI}"], slippage-bps = 10 }},
+    {{ tokens = ["{WETH_GNOSIS}", "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83"] }},
+]
+"#
+        ));
+        let parsed: Config = toml::de::from_str(&raw).expect("should parse");
+        assert_eq!(parsed.general_pairs.len(), 2);
+        assert_eq!(general_pair(&parsed.general_pairs[0]).unwrap().slippage_bps, Some(10));
+        assert_eq!(general_pair(&parsed.general_pairs[1]).unwrap().slippage_bps, None);
+
+        let absent: Config = toml::de::from_str(&minimal_toml("")).expect("should parse");
+        assert!(absent.general_pairs.is_empty());
+    }
+
+    #[test]
+    fn general_pair_must_be_exactly_two_distinct_tokens_with_a_usable_haircut() {
+        let usdc = "0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83";
+        assert!(general_pair(&pair_entry(&[WETH_GNOSIS, WXDAI], None)).is_ok());
+        assert!(general_pair(&pair_entry(&[WETH_GNOSIS, WXDAI, usdc], None)).is_err());
+        assert!(general_pair(&pair_entry(&[WETH_GNOSIS], None)).is_err());
+        assert!(general_pair(&pair_entry(&[WETH_GNOSIS, WETH_GNOSIS], None)).is_err());
+        assert!(general_pair(&pair_entry(&[WETH_GNOSIS, WXDAI], Some(10_000))).is_err());
     }
 
     #[test]

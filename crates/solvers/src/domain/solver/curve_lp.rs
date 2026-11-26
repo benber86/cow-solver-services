@@ -191,6 +191,31 @@ impl ChainConfig {
 }
 
 /// Curve LP token solver.
+/// Two distinct tokens, regardless of which is sold and which is bought.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TokenPair(eth::Address, eth::Address);
+
+impl TokenPair {
+    /// `None` when both tokens are the same: that is not a pair to trade.
+    pub fn new(a: eth::Address, b: eth::Address) -> Option<Self> {
+        match a.cmp(&b) {
+            std::cmp::Ordering::Less => Some(Self(a, b)),
+            std::cmp::Ordering::Greater => Some(Self(b, a)),
+            std::cmp::Ordering::Equal => None,
+        }
+    }
+}
+
+/// A pair non-LP orders may trade, with the haircut to use for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeneralPair {
+    pub pair: TokenPair,
+    /// Haircut for this pair's bid and calldata floor, in place of
+    /// `slippage_bps`. A pool that moves little between quote and inclusion
+    /// can afford a tighter one than the chain-wide default.
+    pub slippage_bps: Option<u32>,
+}
+
 pub struct Solver {
     inner: Arc<Inner>,
 }
@@ -214,6 +239,10 @@ pub struct Config {
     /// general order must have at least one side in this set. LP-priority
     /// orders and quote requests bypass it.
     pub general_edge_tokens: Option<Vec<eth::Address>>,
+    /// Token pairs a non-LP order may trade even when neither side is an edge
+    /// token. Both of the order's tokens must be the pair's, in either
+    /// direction.
+    pub general_pairs: Vec<GeneralPair>,
     /// Curve Router API URL.
     pub curve_api_url: Url,
     /// Curve Price API URL.
@@ -267,6 +296,8 @@ struct Inner {
     allowed_buy_tokens: Option<HashSet<eth::Address>>,
     token_allowlist: Option<HashSet<eth::Address>>,
     general_edge_tokens: Option<HashSet<eth::Address>>,
+    /// Allowed pair -> its own haircut, when it has one.
+    general_pairs: HashMap<TokenPair, Option<u32>>,
     provider: Arc<dyn RouteProvider>,
     /// Best-effort legacy probe alongside new-router real solves on
     /// sidechains. `None` on mainnet (legacy is the primary path so the
@@ -377,6 +408,11 @@ impl Solver {
                 allowed_buy_tokens: config.allowed_buy_tokens.map(|v| v.into_iter().collect()),
                 token_allowlist: config.token_allowlist.map(|v| v.into_iter().collect()),
                 general_edge_tokens: config.general_edge_tokens.map(|v| v.into_iter().collect()),
+                general_pairs: config
+                    .general_pairs
+                    .into_iter()
+                    .map(|general| (general.pair, general.slippage_bps))
+                    .collect(),
                 provider,
                 legacy_telemetry,
                 price_client,
@@ -793,11 +829,21 @@ impl Inner {
             return None;
         }
         let edge_tokens = self.general_edge_tokens.as_ref()?;
-        if edge_tokens.contains(&order.sell.token.0) || edge_tokens.contains(&order.buy.token.0) {
+        if edge_tokens.contains(&order.sell.token.0)
+            || edge_tokens.contains(&order.buy.token.0)
+            || TokenPair::new(order.sell.token.0, order.buy.token.0)
+                .is_some_and(|pair| self.general_pairs.contains_key(&pair))
+        {
             None
         } else {
             Some("no_general_edge_token_match")
         }
+    }
+
+    /// The haircut configured for exactly this order's pair, if any.
+    fn pair_slippage_bps(&self, order: &Order) -> Option<u32> {
+        let pair = TokenPair::new(order.sell.token.0, order.buy.token.0)?;
+        *self.general_pairs.get(&pair)?
     }
 
     fn general_validity_rejection_reason(
@@ -1099,6 +1145,7 @@ impl Inner {
         };
 
         let route_start = std::time::Instant::now();
+        let pair_slippage_bps = self.pair_slippage_bps(order);
         let request = QuoteRequest {
             sell_token: order.sell.token.0,
             buy_token: order.buy.token.0,
@@ -1108,6 +1155,7 @@ impl Inner {
             min_out: Some(order.buy.amount),
             gas_price_gwei: gas_price_to_gwei(gas_price),
             report_aware: self.report_aware_quotes && !is_quote,
+            slippage_bps: pair_slippage_bps,
         };
 
         let route_fut = async {
@@ -1281,7 +1329,7 @@ impl Inner {
                     quote.expected_output,
                     quote.min_out,
                     order.buy.amount,
-                    self.bid_slippage_bps,
+                    pair_slippage_bps.unwrap_or(self.bid_slippage_bps),
                 ),
             ),
             order::Side::Buy => (
@@ -1785,6 +1833,7 @@ impl Inner {
             min_out: None,
             gas_price_gwei: None,
             report_aware: false,
+            slippage_bps: None,
         };
         // The probe walks the sell amount up and down over several sequential
         // quotes, so each one has to re-read the clock rather than assume a
@@ -1822,6 +1871,7 @@ impl Inner {
             min_out: None,
             gas_price_gwei: gas_price_to_gwei(gas_price),
             report_aware: false,
+            slippage_bps: None,
         };
         Some(tokio::spawn(async move {
             let started = std::time::Instant::now();
@@ -2489,6 +2539,7 @@ mod tests {
             allowed_buy_tokens: None,
             token_allowlist: None,
             general_edge_tokens: None,
+            general_pairs: HashMap::new(),
             provider: Arc::new(NoopProvider),
             legacy_telemetry: None,
             price_client: price_api::Client::new("http://localhost:1".parse().unwrap()),
@@ -2946,6 +2997,7 @@ mod tests {
             min_out: Some(order.buy.amount),
             gas_price_gwei: None,
             report_aware: true,
+            slippage_bps: None,
         };
         let report_route = provider.quote(&request).await.unwrap();
         assert!(!report_route.pre_calls.is_empty());
@@ -2981,6 +3033,7 @@ mod tests {
             min_out: Some(order.buy.amount),
             gas_price_gwei: None,
             report_aware: false,
+            slippage_bps: None,
         };
         let ordinary = provider.quote(&request).await.unwrap();
 
@@ -3048,6 +3101,7 @@ mod tests {
             min_out: Some(order.buy.amount),
             gas_price_gwei: None,
             report_aware: true,
+            slippage_bps: None,
         };
         let mut report_route = provider.quote(&request).await.unwrap();
         report_route.report.as_mut().unwrap().one_slot_late_failure =
@@ -3372,6 +3426,46 @@ mod tests {
         // The generic USDC/WETH order is skipped because neither side is an
         // edge token. LP-priority orders bypass the edge filter entirely.
         assert_eq!(selected_indices, vec![2, 1]);
+    }
+
+    #[test]
+    fn listed_pair_is_selected_in_either_direction_without_an_edge_token() {
+        let usdc = eth::Address::repeat_byte(0x02);
+        let weth = eth::Address::repeat_byte(0x03);
+        let wxdai = eth::Address::repeat_byte(0x05);
+
+        let mut inner = test_inner(100, 50);
+        inner.token_allowlist = Some([usdc, weth, wxdai].into_iter().collect());
+        // No edge tokens at all: only the listed pair may trade.
+        inner.general_edge_tokens = Some(HashSet::new());
+        inner.general_pairs = [(TokenPair::new(weth, wxdai).unwrap(), Some(10))]
+            .into_iter()
+            .collect();
+        assert_eq!(inner.pair_slippage_bps(&sell_order(wxdai, weth)), Some(10));
+        assert_eq!(inner.pair_slippage_bps(&sell_order(usdc, weth)), None);
+
+        let orders = vec![
+            (0, sell_order(weth, wxdai)),
+            (1, sell_order(wxdai, weth)),
+            (2, sell_order(usdc, weth)),
+            (3, sell_order(wxdai, usdc)),
+        ];
+        let tokens = tokens_with_unit_prices(&[usdc, weth, wxdai]);
+
+        let selected = inner.select_orders(orders, &tokens, false);
+        let mut selected_indices: Vec<_> = selected.into_iter().map(|(i, _)| i).collect();
+        selected_indices.sort_unstable();
+
+        // Sharing one token with the pair is not enough.
+        assert_eq!(selected_indices, vec![0, 1]);
+    }
+
+    #[test]
+    fn token_pair_ignores_direction_and_rejects_a_token_paired_with_itself() {
+        let a = eth::Address::repeat_byte(0x02);
+        let b = eth::Address::repeat_byte(0x03);
+        assert_eq!(TokenPair::new(a, b), TokenPair::new(b, a));
+        assert!(TokenPair::new(a, a).is_none());
     }
 
     #[test]

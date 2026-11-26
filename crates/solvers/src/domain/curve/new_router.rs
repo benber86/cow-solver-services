@@ -406,7 +406,11 @@ impl RouteProvider for NewRouterClient {
         // solve would bind instead.
         if req.is_quote {
             let mut quote = self.post_quote(req).await?;
-            quote.min_out = Self::bind_floor(quote.expected_output, self.slippage_bps, req.min_out);
+            quote.min_out = Self::bind_floor(
+                quote.expected_output,
+                req.slippage_bps.unwrap_or(self.slippage_bps),
+                req.min_out,
+            );
             return Ok(quote);
         }
 
@@ -489,7 +493,7 @@ impl NewRouterClient {
         let mut bind_req = req.clone();
         bind_req.min_out = Some(Self::bind_floor(
             probe.expected_output,
-            self.slippage_bps,
+            req.slippage_bps.unwrap_or(self.slippage_bps),
             req.min_out,
         ));
 
@@ -612,6 +616,7 @@ mod tests {
             min_out: Some(eth::U256::from(900_000u64)),
             gas_price_gwei: Some(1.5),
             report_aware: false,
+            slippage_bps: None,
         }
     }
 
@@ -1130,6 +1135,22 @@ mod tests {
         assert!(quote.pre_calls.is_empty());
         assert_eq!(quote.expected_output, eth::U256::from(1_000_000u64));
         assert!(quote.min_out >= eth::U256::from(900_000u64));
+    }
+
+    #[tokio::test]
+    async fn a_request_haircut_replaces_the_clients_default() {
+        let url = serve_fixed_quote("1000000").await;
+        // client default: 30bp
+        let client = NewRouterClient::new(url, Address::repeat_byte(0xCA), 30, Duration::ZERO);
+        let mut req = dummy_req(true);
+        req.min_out = Some(eth::U256::from(1u64));
+
+        let default = client.quote(&req).await.expect("quote");
+        assert_eq!(default.min_out, eth::U256::from(997_000u64));
+
+        req.slippage_bps = Some(10);
+        let tighter = client.quote(&req).await.expect("quote");
+        assert_eq!(tighter.min_out, eth::U256::from(999_000u64));
     }
 
     async fn serve_fixed_quote(expected_out: &'static str) -> Url {
