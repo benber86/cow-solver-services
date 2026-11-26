@@ -768,9 +768,15 @@ impl Inner {
     fn general_edge_rejection_reason(
         &self,
         order: &Order,
+        tokens: &Tokens,
         is_quote: bool,
     ) -> Option<&'static str> {
-        if is_quote {
+        // Quotes admitted despite missing reference prices share the real auction pair scope.
+        if is_quote
+            && (self.max_general_order_market_deviation_bps.is_none()
+                || (tokens.reference_price(&order.sell.token).is_some()
+                    && tokens.reference_price(&order.buy.token).is_some()))
+        {
             return None;
         }
         let edge_tokens = self.general_edge_tokens.as_ref()?;
@@ -867,7 +873,7 @@ impl Inner {
             }
 
             let is_regular_fallback = self
-                .general_edge_rejection_reason(&item.1, is_quote)
+                .general_edge_rejection_reason(&item.1, tokens, is_quote)
                 .is_some();
             if is_regular_fallback && !self.regular_fallback_enabled() {
                 edge_filtered_general += 1;
@@ -999,7 +1005,7 @@ impl Inner {
             }
 
             let is_regular_fallback = self
-                .general_edge_rejection_reason(order, is_quote)
+                .general_edge_rejection_reason(order, tokens, is_quote)
                 .is_some();
             if is_regular_fallback && !self.regular_fallback_enabled() {
                 edge_filtered_general += 1;
@@ -3197,6 +3203,22 @@ mod tests {
                 Some("off_market_limit_price")
             );
         }
+    }
+
+    #[test]
+    fn indicative_quotes_missing_prices_follow_auction_pair_scope() {
+        let edge = eth::Address::repeat_byte(1);
+        let token = eth::Address::repeat_byte(2);
+        let other = eth::Address::repeat_byte(3);
+        let mut inner = test_inner(100, 50);
+        inner.general_edge_tokens = Some([edge].into_iter().collect());
+        inner.max_general_order_market_deviation_bps = Some(200);
+
+        let orders = vec![(0, sell_order(token, edge)), (1, sell_order(token, other))];
+        let prices = tokens_with_unit_prices(&[]);
+        let selected = inner.select_orders(orders, &prices, true);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].0, 0);
     }
 
     #[test]
