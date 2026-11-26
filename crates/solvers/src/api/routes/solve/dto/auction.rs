@@ -41,6 +41,7 @@ pub fn into_domain(auction: Auction) -> Result<auction::Auction, Error> {
             .orders
             .iter()
             .map(|order| order::Order {
+                owner: order.owner,
                 uid: order::Uid(order.uid),
                 sell: eth::Asset {
                     token: eth::TokenAddress(order.sell_token),

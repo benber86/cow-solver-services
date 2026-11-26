@@ -22,6 +22,9 @@ curve-price-api-url = "https://prices.curve.finance/"
 route-provider = "new-router"
 new-router-url = "https://ethereum.router.curve.finance/quote"
 
+# Ethereum Yield Basis PythReportBank for report-backed auction bids.
+report-bank = "0x8a0f866de34631311b7745C5f4eec7Bf1F6849dB"
+
 # LP tokens are tried first and are not capped by the general-order limits.
 # token-allowlist below opens non-LP mainnet routes only within the Curve
 # mainnet token universe.

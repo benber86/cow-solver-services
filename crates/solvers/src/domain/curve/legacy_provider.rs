@@ -89,6 +89,8 @@ impl LegacyProvider {
             calldata,
             gas_estimate: None,
             quality: None,
+            pre_calls: Vec::new(),
+            report: None,
         }
     }
 }

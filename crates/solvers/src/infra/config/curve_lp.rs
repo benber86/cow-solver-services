@@ -2,6 +2,7 @@
 
 use {
     crate::domain::{
+        curve::route_provider::ReportBank,
         eth,
         solver::curve_lp::{self, ChainConfig, CurvePriceApiChain, RouteProviderKind},
     },
@@ -148,6 +149,18 @@ struct Config {
     /// hints, or wrappers are skipped before routing.
     #[serde(default)]
     skip_general_orders_with_hooks: bool,
+
+    /// Oracle report bank. Setting it makes the solver ask the router to also
+    /// price real-auction orders with a fresh report delivered ahead of the
+    /// swap, and it is the only contract such a route may call from the
+    /// settlement. Omit to keep report routes off; quote requests never use
+    /// them.
+    #[serde(default)]
+    report_bank: Option<eth::Address>,
+
+    /// Most wei a report delivery may carry (the bank's verification fee).
+    #[serde(default)]
+    report_bank_max_fee_wei: u64,
 }
 
 fn default_slippage_bps() -> u32 {
@@ -224,6 +237,10 @@ pub async fn load(path: &Path) -> curve_lp::Config {
         max_general_order_market_deviation_bps: config.max_general_order_market_deviation_bps,
         max_general_order_validity_secs: config.max_general_order_validity_secs,
         skip_general_orders_with_hooks: config.skip_general_orders_with_hooks,
+        report_bank: config.report_bank.map(|address| ReportBank {
+            address,
+            max_fee: eth::U256::from(config.report_bank_max_fee_wei),
+        }),
     }
 }
 

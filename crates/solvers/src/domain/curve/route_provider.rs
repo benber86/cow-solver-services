@@ -20,6 +20,46 @@ pub struct ExecutableQuote {
     pub calldata: Vec<u8>,
     pub gas_estimate: Option<u64>,
     pub quality: Option<QuoteQuality>,
+    /// Calls that must run before `calldata` in the same settlement, in
+    /// order. `expected_output` and `min_out` only hold if they do.
+    pub pre_calls: Vec<PreCall>,
+    /// How the order priced against a fresh oracle report, when the provider
+    /// tried that.
+    pub report: Option<ReportPricing>,
+}
+
+/// The one contract a report route may ask the settlement to call, and the
+/// most ETH that call may carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportBank {
+    pub address: eth::Address,
+    pub max_fee: eth::U256,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreCall {
+    pub target: eth::Address,
+    pub value: eth::U256,
+    pub calldata: Vec<u8>,
+}
+
+/// One order priced three ways by the provider: on its ordinary route, and
+/// with a report delivered first at the next slot and one slot after it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReportPricing {
+    /// The quote this came with is the report route.
+    pub selected: bool,
+    pub observation_time_us: u64,
+    /// Block timestamp the report route was priced at.
+    pub inclusion_timestamp: u64,
+    pub age_at_inclusion_secs: f64,
+    pub ordinary_out: Option<eth::U256>,
+    pub next_slot_out: Option<eth::U256>,
+    /// What the same calldata pays out one slot later, with the report
+    /// delivered then.
+    pub one_slot_late_out: Option<eth::U256>,
+    /// Why a settlement landing one slot late would not go through.
+    pub one_slot_late_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +89,9 @@ pub struct QuoteRequest {
     pub receiver: eth::Address,
     pub min_out: Option<eth::U256>,
     pub gas_price_gwei: Option<f64>,
+    /// Ask the provider to also price the order with a fresh oracle report
+    /// delivered ahead of it.
+    pub report_aware: bool,
 }
 
 impl QuoteRequest {

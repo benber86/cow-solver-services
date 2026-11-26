@@ -1,8 +1,18 @@
 //! `RouteProvider` impl backed by *.router.curve.finance/quote.
 
 use {
-    super::route_provider::{Error, ExecutableQuote, QuoteQuality, QuoteRequest, RouteProvider},
+    super::route_provider::{
+        Error,
+        ExecutableQuote,
+        PreCall,
+        QuoteQuality,
+        QuoteRequest,
+        ReportBank,
+        ReportPricing,
+        RouteProvider,
+    },
     crate::domain::eth,
+    alloy::{sol, sol_types::SolCall},
     async_trait::async_trait,
     reqwest::Url,
     serde::{Deserialize, Serialize},
@@ -12,6 +22,13 @@ use {
         time::{Duration, Instant},
     },
 };
+
+sol! {
+    function deliver_report(bytes update) external payable;
+}
+
+/// The bank refuses anything longer; a longer `update` is not a report.
+const MAX_REPORT_UPDATE_BYTES: usize = 301;
 
 /// Retries of the binding round trip before we give up on the order. The
 /// probe already cost a round trip and the whole `quote` call shares one
@@ -54,6 +71,8 @@ pub struct NewRouterClient {
     /// How long a route may be reused across auctions. Zero disables caching.
     cache_ttl: Duration,
     cache: Mutex<HashMap<QuoteKey, CachedQuote>>,
+    /// Without one, no report route is ever asked for or accepted.
+    report_bank: Option<ReportBank>,
 }
 
 // Failures are classified where we actually know the cause: transport-level
@@ -79,7 +98,52 @@ impl NewRouterClient {
             slippage_bps,
             cache_ttl,
             cache: Mutex::new(HashMap::new()),
+            report_bank: None,
         }
+    }
+
+    pub fn with_report_bank(mut self, report_bank: Option<ReportBank>) -> Self {
+        self.report_bank = report_bank;
+        self
+    }
+
+    /// A pre-call runs from the settlement contract, with its funds and its
+    /// approvals, and the simulated buy amount says nothing about what else
+    /// such a call does. So the service only gets to choose the report bytes:
+    /// the target, the function and the value ceiling are fixed here.
+    fn check_pre_calls(
+        quote: &ExecutableQuote,
+        req: &QuoteRequest,
+        report_bank: Option<&ReportBank>,
+    ) -> Result<(), Error> {
+        let reject = |why: &str| Err(Error::CalldataUnavailable(format!("report route: {why}")));
+        if quote.pre_calls.is_empty() {
+            return Ok(());
+        }
+        if !req.report_aware || req.is_quote {
+            return reject("returned for a request that did not ask for one");
+        }
+        let Some(bank) = report_bank else {
+            return reject("no report bank is configured");
+        };
+        let [call] = quote.pre_calls.as_slice() else {
+            return reject("expected exactly one bank call");
+        };
+        if call.target != bank.address {
+            return reject("bank call targets a contract other than the configured bank");
+        }
+        if call.value > bank.max_fee {
+            return reject("bank call carries more than the configured fee ceiling");
+        }
+        let Ok(decoded) = deliver_reportCall::abi_decode(&call.calldata) else {
+            return reject("bank call is not deliver_report(bytes)");
+        };
+        if decoded.update.len() > MAX_REPORT_UPDATE_BYTES
+            || decoded.abi_encode() != call.calldata
+        {
+            return reject("bank call is not a canonical deliver_report(bytes)");
+        }
+        Ok(())
     }
 
     fn cache_key(req: &QuoteRequest) -> QuoteKey {
@@ -96,7 +160,9 @@ impl NewRouterClient {
     }
 
     fn store_quote(&self, req: &QuoteRequest, quote: &ExecutableQuote) {
-        if self.cache_ttl.is_zero() {
+        // A report quote is only good for the slot it was priced at: the
+        // report ages, and the bank stops accepting it after a minute.
+        if self.cache_ttl.is_zero() || !quote.pre_calls.is_empty() {
             return;
         }
         let Ok(mut cache) = self.cache.lock() else {
@@ -124,6 +190,9 @@ impl NewRouterClient {
             receiver: (!req.is_quote).then(|| format!("{:#x}", req.receiver)),
             min_out: req.min_out.map(|v| v.to_string()),
             gas_price_gwei: req.gas_price_gwei,
+            // A quote is answered long before any settlement, so a report
+            // priced into it would have aged out by the time it mattered.
+            report_aware: req.report_aware && !req.is_quote,
         }
     }
 
@@ -185,6 +254,11 @@ impl NewRouterClient {
         //     and we record the same here.
         let min_out = req.min_out.unwrap_or(expected_output);
 
+        let (pre_calls, report) = match body.report {
+            Some(report) => Self::parse_report(report, req.is_quote)?,
+            None => (Vec::new(), None),
+        };
+
         Ok(ExecutableQuote {
             expected_output,
             min_out,
@@ -192,7 +266,70 @@ impl NewRouterClient {
             calldata,
             gas_estimate: Some(body.gas_estimate),
             quality: body.quote_quality.map(Into::into),
+            pre_calls,
+            report,
         })
+    }
+
+    /// The bank calls come from the same response as the swap calldata they
+    /// precede: the service priced that calldata on top of exactly these calls.
+    fn parse_report(
+        report: ReportWire,
+        is_quote: bool,
+    ) -> Result<(Vec<PreCall>, Option<ReportPricing>), Error> {
+        let selected = report.selected == ReportSelectionWire::Report;
+        let amount = |raw: Option<String>| raw.and_then(|v| v.parse::<eth::U256>().ok());
+        let pre_calls = if selected && !is_quote {
+            report
+                .bank_calls
+                .into_iter()
+                .map(|call| {
+                    let invalid = |what: &str| {
+                        Error::CalldataUnavailable(format!("invalid bank call {what}"))
+                    };
+                    Ok(PreCall {
+                        target: call.to.parse().map_err(|_| invalid("target"))?,
+                        value: call.value.parse().map_err(|_| invalid("value"))?,
+                        calldata: alloy::hex::decode(
+                            call.data.strip_prefix("0x").unwrap_or(&call.data),
+                        )
+                        .map_err(|_| invalid("data"))?,
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()?
+        } else {
+            Vec::new()
+        };
+        if selected && !is_quote && pre_calls.is_empty() {
+            return Err(Error::CalldataUnavailable(
+                "report route selected without a bank call".into(),
+            ));
+        }
+        Ok((
+            pre_calls,
+            Some(ReportPricing {
+                selected,
+                observation_time_us: report.observation_time_us,
+                inclusion_timestamp: report.inclusion_timestamp,
+                age_at_inclusion_secs: report.age_at_inclusion_secs,
+                ordinary_out: amount(report.shadow.ordinary_out),
+                next_slot_out: amount(report.shadow.next_slot_out),
+                one_slot_late_out: amount(report.shadow.one_slot_late_out),
+                one_slot_late_failure: report.shadow.one_slot_late_failure,
+            }),
+        ))
+    }
+
+    /// The bind request's floor sits just under the report route's output, so
+    /// the ordinary route usually cannot meet it and comes back unpriced. The
+    /// probe did price it, and that figure is what the report's gain is
+    /// measured against.
+    fn keep_probe_ordinary_out(bound: &mut ExecutableQuote, probe: &ExecutableQuote) {
+        if let (Some(bound), Some(probe)) = (bound.report.as_mut(), probe.report.as_ref())
+            && bound.ordinary_out.is_none()
+        {
+            bound.ordinary_out = probe.ordinary_out;
+        }
     }
 
     /// Whether an unsuccessful HTTP status is worth retrying.
@@ -249,7 +386,9 @@ impl NewRouterClient {
             ))
         })?;
 
-        Self::parse_response(parsed, req, self.router_address)
+        let quote = Self::parse_response(parsed, req, self.router_address)?;
+        Self::check_pre_calls(&quote, req, self.report_bank.as_ref())?;
+        Ok(quote)
     }
 }
 
@@ -310,7 +449,42 @@ impl RouteProvider for NewRouterClient {
         // fallback instead promised a real price against a 5 crvUSD floor,
         // i.e. an unbounded overdraft. Neither is acceptable — the only safe
         // outcome when we cannot bind a real floor is to not bid at all.
-        let probe = self.post_quote(req).await?;
+        match self.probe_and_bind(req).await {
+            // The floor came from a report-priced probe, and by the time the
+            // route was bound the report no longer carried it. That says
+            // nothing about the ordinary route, which may still clear the
+            // order's own limit.
+            Err(BindError {
+                error,
+                report_priced: true,
+            }) if !error.is_transient() => {
+                tracing::debug!(%error, "report route could not be bound; trying the ordinary route");
+                let ordinary = QuoteRequest {
+                    report_aware: false,
+                    ..req.clone()
+                };
+                self.probe_and_bind(&ordinary)
+                    .await
+                    .map_err(|bind| bind.error)
+            }
+            result => result.map_err(|bind| bind.error),
+        }
+    }
+}
+
+struct BindError {
+    error: Error,
+    /// The floor being bound came from a probe that used a report route.
+    report_priced: bool,
+}
+
+impl NewRouterClient {
+    async fn probe_and_bind(&self, req: &QuoteRequest) -> Result<ExecutableQuote, BindError> {
+        let probe = self.post_quote(req).await.map_err(|error| BindError {
+            error,
+            report_priced: false,
+        })?;
+        let report_priced = !probe.pre_calls.is_empty();
 
         let mut bind_req = req.clone();
         bind_req.min_out = Some(Self::bind_floor(
@@ -322,7 +496,8 @@ impl RouteProvider for NewRouterClient {
         let mut attempt = 0u32;
         loop {
             match self.post_quote(&bind_req).await {
-                Ok(quote) => {
+                Ok(mut quote) => {
+                    Self::keep_probe_ordinary_out(&mut quote, &probe);
                     self.store_quote(req, &quote);
                     return Ok(quote);
                 }
@@ -330,7 +505,12 @@ impl RouteProvider for NewRouterClient {
                     attempt += 1;
                     tracing::debug!(attempt, %error, "retrying router bind request");
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    return Err(BindError {
+                        error,
+                        report_priced,
+                    });
+                }
             }
         }
     }
@@ -349,6 +529,8 @@ struct RequestBody {
     min_out: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     gas_price_gwei: Option<f64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    report_aware: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -361,6 +543,41 @@ struct ResponseBody {
     router_address: String,
     calldata: Option<String>,
     error: Option<String>,
+    report: Option<ReportWire>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+struct ReportWire {
+    selected: ReportSelectionWire,
+    observation_time_us: u64,
+    inclusion_timestamp: u64,
+    age_at_inclusion_secs: f64,
+    #[serde(default)]
+    bank_calls: Vec<BankCallWire>,
+    shadow: ReportShadowWire,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ReportSelectionWire {
+    Report,
+    Ordinary,
+}
+
+#[derive(Debug, Deserialize)]
+struct BankCallWire {
+    to: String,
+    data: String,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReportShadowWire {
+    ordinary_out: Option<String>,
+    next_slot_out: Option<String>,
+    one_slot_late_out: Option<String>,
+    one_slot_late_failure: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -394,6 +611,7 @@ mod tests {
             receiver: Address::repeat_byte(0x90),
             min_out: Some(eth::U256::from(900_000u64)),
             gas_price_gwei: Some(1.5),
+            report_aware: false,
         }
     }
 
@@ -406,6 +624,7 @@ mod tests {
             router_address: format!("{:#x}", Address::repeat_byte(0xCA)),
             calldata: Some("0xdeadbeef".into()),
             error: None,
+            report: None,
         }
     }
 
@@ -515,6 +734,138 @@ mod tests {
         assert!(matches!(err, Error::CalldataUnavailable(_)));
     }
 
+    fn report_body(selected: &str, bank_calls: serde_json::Value) -> ResponseBody {
+        let mut body = ok_body();
+        body.report = Some(
+            serde_json::from_value(serde_json::json!({
+                "selected": selected,
+                "observation_time_us": 1_795_626_006_000_000u64,
+                "inclusion_timestamp": 1_795_626_012u64,
+                "age_at_inclusion_secs": 6.0,
+                "bank_calls": bank_calls,
+                "bank_gas": 75_659,
+                "shadow": {
+                    "ordinary_out": "990000",
+                    "next_slot_out": "1000000",
+                    "one_slot_late_out": null,
+                },
+            }))
+            .unwrap(),
+        );
+        body
+    }
+
+    fn bank_call() -> serde_json::Value {
+        serde_json::json!([{
+            "to": format!("{:#x}", Address::repeat_byte(0xBA)),
+            "data": "0xbeef",
+            "value": "7",
+        }])
+    }
+
+    #[test]
+    fn build_request_body_asks_for_reports_on_real_solves_only() {
+        let mut real = dummy_req(false);
+        real.report_aware = true;
+        assert!(NewRouterClient::build_request_body(&real).report_aware);
+
+        let mut quote = dummy_req(true);
+        quote.report_aware = true;
+        assert!(!NewRouterClient::build_request_body(&quote).report_aware);
+
+        let plain =
+            serde_json::to_value(NewRouterClient::build_request_body(&dummy_req(false))).unwrap();
+        assert!(plain.get("report_aware").is_none());
+    }
+
+    #[test]
+    fn parse_response_report_route_carries_its_bank_calls() {
+        let req = dummy_req(false);
+        let q = NewRouterClient::parse_response(
+            report_body("report", bank_call()),
+            &req,
+            Address::repeat_byte(0xCA),
+        )
+        .unwrap();
+
+        assert_eq!(
+            q.pre_calls,
+            vec![PreCall {
+                target: Address::repeat_byte(0xBA),
+                value: eth::U256::from(7),
+                calldata: vec![0xbe, 0xef],
+            }]
+        );
+        let report = q.report.unwrap();
+        assert!(report.selected);
+        assert_eq!(report.inclusion_timestamp, 1_795_626_012);
+        assert_eq!(report.ordinary_out, Some(eth::U256::from(990_000u64)));
+        assert_eq!(report.next_slot_out, Some(eth::U256::from(1_000_000u64)));
+        assert_eq!(report.one_slot_late_out, None);
+    }
+
+    #[test]
+    fn parse_response_ordinary_route_has_no_bank_calls() {
+        let req = dummy_req(false);
+        let q = NewRouterClient::parse_response(
+            report_body("ordinary", serde_json::json!([])),
+            &req,
+            Address::repeat_byte(0xCA),
+        )
+        .unwrap();
+
+        assert!(q.pre_calls.is_empty());
+        assert!(!q.report.unwrap().selected);
+    }
+
+    #[test]
+    fn parse_response_rejects_a_report_route_without_its_bank_call() {
+        let req = dummy_req(false);
+        let err = NewRouterClient::parse_response(
+            report_body("report", serde_json::json!([])),
+            &req,
+            Address::repeat_byte(0xCA),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::CalldataUnavailable(_)));
+    }
+
+    #[test]
+    fn bound_quote_keeps_the_ordinary_output_the_probe_priced() {
+        let req = dummy_req(false);
+        let router = Address::repeat_byte(0xCA);
+        let probe =
+            NewRouterClient::parse_response(report_body("report", bank_call()), &req, router)
+                .unwrap();
+        let mut bound_body = report_body("report", bank_call());
+        bound_body.report.as_mut().unwrap().shadow.ordinary_out = None;
+        let mut bound = NewRouterClient::parse_response(bound_body, &req, router).unwrap();
+        assert_eq!(bound.report.as_ref().unwrap().ordinary_out, None);
+
+        NewRouterClient::keep_probe_ordinary_out(&mut bound, &probe);
+
+        assert_eq!(
+            bound.report.unwrap().ordinary_out,
+            Some(eth::U256::from(990_000u64))
+        );
+    }
+
+    #[test]
+    fn report_quotes_are_never_cached() {
+        let client = client_with_ttl(Duration::from_secs(30));
+        let req = dummy_req(false);
+        let mut quote = sample_quote();
+        quote.pre_calls = vec![PreCall {
+            target: Address::repeat_byte(0xBA),
+            value: eth::U256::ZERO,
+            calldata: vec![0xbe, 0xef],
+        }];
+
+        client.store_quote(&req, &quote);
+
+        assert!(client.cached_quote(&req).is_none());
+    }
+
     fn client_with_ttl(ttl: Duration) -> NewRouterClient {
         NewRouterClient::new(
             "https://router.invalid/quote".parse().unwrap(),
@@ -532,6 +883,8 @@ mod tests {
             calldata: vec![0xde, 0xad],
             gas_estimate: Some(350_000),
             quality: Some(QuoteQuality::RouterExecution),
+            pre_calls: Vec::new(),
+            report: None,
         }
     }
 
@@ -605,6 +958,178 @@ mod tests {
         // The original key still hits — the misses above were real misses, not
         // the cache having been clobbered.
         assert!(client.cached_quote(&req).is_some());
+    }
+
+    const BANK: Address = Address::repeat_byte(0xBA);
+
+    fn configured_bank() -> ReportBank {
+        ReportBank {
+            address: BANK,
+            max_fee: eth::U256::ZERO,
+        }
+    }
+
+    fn deliver_report(update: Vec<u8>) -> Vec<u8> {
+        deliver_reportCall {
+            update: update.into(),
+        }
+        .abi_encode()
+    }
+
+    fn report_quote(pre_call: PreCall) -> ExecutableQuote {
+        let mut quote = sample_quote();
+        quote.pre_calls = vec![pre_call];
+        quote
+    }
+
+    fn bank_pre_call() -> PreCall {
+        PreCall {
+            target: BANK,
+            value: eth::U256::ZERO,
+            calldata: deliver_report(vec![0x2a; 139]),
+        }
+    }
+
+    fn report_req() -> QuoteRequest {
+        let mut req = dummy_req(false);
+        req.report_aware = true;
+        req
+    }
+
+    fn checked(quote: &ExecutableQuote, req: &QuoteRequest) -> Result<(), Error> {
+        NewRouterClient::check_pre_calls(quote, req, Some(&configured_bank()))
+    }
+
+    #[test]
+    fn delivery_to_the_configured_bank_is_accepted() {
+        assert!(checked(&report_quote(bank_pre_call()), &report_req()).is_ok());
+        assert!(checked(&sample_quote(), &dummy_req(false)).is_ok());
+    }
+
+    #[test]
+    fn bank_call_to_any_other_contract_is_rejected() {
+        let mut call = bank_pre_call();
+        call.target = Address::repeat_byte(0xEE);
+        assert!(checked(&report_quote(call), &report_req()).is_err());
+    }
+
+    #[test]
+    fn bank_call_that_is_not_a_plain_report_delivery_is_rejected() {
+        // another function on the right contract
+        let mut other_function = bank_pre_call();
+        other_function.calldata[..4].copy_from_slice(&[0xa9, 0x05, 0x9c, 0xbb]);
+        assert!(checked(&report_quote(other_function), &report_req()).is_err());
+
+        // the right function with bytes appended after its arguments
+        let mut trailing = bank_pre_call();
+        trailing.calldata.extend_from_slice(&[0u8; 32]);
+        assert!(checked(&report_quote(trailing), &report_req()).is_err());
+
+        // an update longer than the bank accepts
+        let mut oversized = bank_pre_call();
+        oversized.calldata = deliver_report(vec![0x2a; MAX_REPORT_UPDATE_BYTES + 1]);
+        assert!(checked(&report_quote(oversized), &report_req()).is_err());
+    }
+
+    #[test]
+    fn bank_call_carrying_more_than_the_fee_ceiling_is_rejected() {
+        let mut call = bank_pre_call();
+        call.value = eth::U256::from(1);
+        assert!(checked(&report_quote(call), &report_req()).is_err());
+    }
+
+    #[test]
+    fn more_than_one_bank_call_is_rejected() {
+        let mut quote = report_quote(bank_pre_call());
+        quote.pre_calls.push(bank_pre_call());
+        assert!(checked(&quote, &report_req()).is_err());
+    }
+
+    #[test]
+    fn report_route_is_rejected_when_it_was_not_asked_for() {
+        let quote = report_quote(bank_pre_call());
+        assert!(checked(&quote, &dummy_req(false)).is_err());
+        assert!(
+            NewRouterClient::check_pre_calls(&quote, &report_req(), None).is_err(),
+            "no bank configured"
+        );
+    }
+
+    /// A router whose report route is on offer to a probe but gone by the
+    /// bind: report-aware requests with the probe's floor fail, everything
+    /// else gets the ordinary route.
+    async fn serve_report_route_that_cannot_be_bound() -> Url {
+        let app = axum::Router::new().route(
+            "/quote",
+            axum::routing::post(
+                |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    let ok = |out: &str| {
+                        serde_json::json!({
+                            "expected_out": out,
+                            "gas_estimate": 350_000,
+                            "final_token": format!("{:#x}", Address::repeat_byte(0x22)),
+                            "router_address": format!("{:#x}", Address::repeat_byte(0xCA)),
+                            "calldata": "0xdeadbeef",
+                        })
+                    };
+                    let report_aware = body["report_aware"].as_bool().unwrap_or(false);
+                    let min_out: u64 = body["min_out"].as_str().unwrap().parse().unwrap();
+                    let response = if !report_aware {
+                        ok("1000000")
+                    } else if min_out <= 900_000 {
+                        let mut probe = ok("1010000");
+                        probe["report"] = serde_json::json!({
+                            "selected": "report",
+                            "observation_time_us": 1u64,
+                            "inclusion_timestamp": 7u64,
+                            "age_at_inclusion_secs": 6.0,
+                            "bank_calls": [{
+                                "to": format!("{BANK:#x}"),
+                                "data": format!(
+                                    "0x{}",
+                                    alloy::hex::encode(deliver_report(vec![0x2a; 139]))
+                                ),
+                                "value": "0",
+                            }],
+                            "shadow": {
+                                "ordinary_out": "1000000",
+                                "next_slot_out": "1010000",
+                                "one_slot_late_out": null,
+                            },
+                        });
+                        probe
+                    } else {
+                        serde_json::json!({
+                            "expected_out": "0",
+                            "gas_estimate": 0,
+                            "final_token": "0x0",
+                            "router_address": "",
+                            "error": "min_out exceeds selected route output",
+                        })
+                    };
+                    axum::Json(response)
+                },
+            ),
+        );
+        let server =
+            axum::Server::bind(&"127.0.0.1:0".parse().unwrap()).serve(app.into_make_service());
+        let addr = server.local_addr();
+        tokio::spawn(server);
+        format!("http://{addr}/quote").parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn report_route_lost_between_probe_and_bind_falls_back_to_the_ordinary_route() {
+        let url = serve_report_route_that_cannot_be_bound().await;
+        let client = NewRouterClient::new(url, Address::repeat_byte(0xCA), 30, Duration::ZERO)
+            .with_report_bank(Some(configured_bank()));
+
+        // dummy_req's limit is 900_000: the ordinary route clears it
+        let quote = client.quote(&report_req()).await.expect("ordinary route");
+
+        assert!(quote.pre_calls.is_empty());
+        assert_eq!(quote.expected_output, eth::U256::from(1_000_000u64));
+        assert!(quote.min_out >= eth::U256::from(900_000u64));
     }
 
     async fn serve_fixed_quote(expected_out: &'static str) -> Url {
