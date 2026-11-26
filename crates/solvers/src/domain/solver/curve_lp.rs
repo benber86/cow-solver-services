@@ -18,7 +18,13 @@ use {
         order::{self, Order},
         solution::{self, Solution},
     },
-    alloy::primitives::U256,
+    alloy::{
+        primitives::U256,
+        providers::Provider,
+        rpc::types::{TransactionInput, TransactionRequest},
+        sol,
+        sol_types::SolCall,
+    },
     futures::stream::StreamExt,
     reqwest::Url,
     serde::Deserialize,
@@ -30,6 +36,10 @@ use {
     },
     tracing::Instrument,
 };
+
+sol! {
+    function decimals() external view returns (uint8);
+}
 
 /// The amount of time we aim the solver to finish before the deadline.
 const DEADLINE_SLACK: chrono::Duration = chrono::Duration::milliseconds(500);
@@ -277,6 +287,8 @@ struct Inner {
     /// Node used to simulate a report route before bidding on it. Without one
     /// a report route cannot be checked, so the ordinary route is used.
     node: Option<ethrpc::AlloyProvider>,
+    /// Decimals read from the chain for tokens the auction did not describe.
+    token_decimals: Mutex<HashMap<eth::Address, u8>>,
     general_order_failure_backoff: Mutex<HashMap<order::Uid, Instant>>,
 }
 
@@ -381,6 +393,7 @@ impl Solver {
                 skip_general_orders_with_hooks: config.skip_general_orders_with_hooks,
                 report_aware_quotes: config.report_bank.is_some(),
                 node: Some(web3.alloy.clone()),
+                token_decimals: Mutex::new(HashMap::new()),
                 general_order_failure_backoff: Mutex::new(HashMap::new()),
             }),
         }
@@ -1068,7 +1081,7 @@ impl Inner {
         deadline: &auction::Deadline,
     ) -> Result<SolvedOrder, SolveError> {
         if is_native_price_probe(order, is_quote, self.chain.wrapped_native_token) {
-            return self.solve_native_price_probe(order, deadline).await;
+            return self.solve_native_price_probe(order, tokens, deadline).await;
         }
 
         // Sidechain real-solve only: fire the legacy comparison NOW, in
@@ -1107,19 +1120,28 @@ impl Inner {
         let price_start = std::time::Instant::now();
         let price_fetch = async {
             if needs_price {
-                let result = self
-                    .price_client
-                    .get_eth_price(
-                        self.chain.price_api_chain.as_slug(),
-                        self.chain.wrapped_native_token,
-                        order.sell.token.0,
-                        // Runs concurrently with the route, so it must not be
-                        // the thing that overruns the budget. Owned by the
-                        // client so a timeout is recorded rather than lost.
-                        PRICE_FETCH_TIMEOUT.min(budget),
-                    )
+                // Runs concurrently with the route, so it must not be the
+                // thing that overruns the budget.
+                let price_budget = PRICE_FETCH_TIMEOUT.min(budget);
+                let result = match self
+                    .token_decimals(order.sell.token, tokens, price_budget)
                     .await
-                    .ok();
+                {
+                    Some(decimals) => self
+                        .price_client
+                        .get_eth_price(
+                            self.chain.price_api_chain.as_slug(),
+                            self.chain.wrapped_native_token,
+                            order.sell.token.0,
+                            decimals,
+                            // Owned by the client so a timeout is recorded
+                            // rather than lost.
+                            price_budget.saturating_sub(price_start.elapsed()),
+                        )
+                        .await
+                        .ok(),
+                    None => None,
+                };
                 let price_ms = price_start.elapsed().as_millis() as u64;
                 (result, price_ms)
             } else {
@@ -1480,11 +1502,12 @@ impl Inner {
     async fn solve_native_price_probe(
         &self,
         order: &Order,
+        tokens: &auction::Tokens,
         deadline: &auction::Deadline,
     ) -> Result<SolvedOrder, SolveError> {
         let route_start = std::time::Instant::now();
         let (fwd, estimated_sell, route_ms) = self
-            .estimate_native_price_probe_sell_amount(order, route_start, deadline)
+            .estimate_native_price_probe_sell_amount(order, tokens, route_start, deadline)
             .await?;
 
         // Probes never settle; calldata may be empty (new-router quote mode).
@@ -1563,10 +1586,13 @@ impl Inner {
     async fn estimate_native_price_probe_sell_amount(
         &self,
         order: &Order,
+        tokens: &auction::Tokens,
         route_start: std::time::Instant,
         deadline: &auction::Deadline,
     ) -> Result<(route_provider::ExecutableQuote, U256, u64), SolveError> {
-        let mut sell_amount = self.native_price_probe_initial_sell_amount(order).await;
+        let mut sell_amount = self
+            .native_price_probe_initial_sell_amount(order, tokens)
+            .await;
         if sell_amount.is_zero() {
             sell_amount = U256::from(1u64);
         }
@@ -1670,17 +1696,57 @@ impl Inner {
         ))
     }
 
-    async fn native_price_probe_initial_sell_amount(&self, order: &Order) -> U256 {
-        let fetched = self
-            .price_client
-            .get_eth_price(
-                self.chain.price_api_chain.as_slug(),
-                self.chain.wrapped_native_token,
-                order.sell.token.0,
-                NATIVE_PRICE_PROBE_PRICE_TIMEOUT,
-            )
+    /// A token's decimals: from the auction when it says, otherwise from the
+    /// token contract (read once, then remembered). `None` when neither
+    /// answers; callers must not assume a value, since a wrong one misprices
+    /// the token by orders of magnitude.
+    async fn token_decimals(
+        &self,
+        token: eth::TokenAddress,
+        tokens: &auction::Tokens,
+        timeout: Duration,
+    ) -> Option<u8> {
+        if let Some(decimals) = tokens.get(&token).and_then(|token| token.decimals) {
+            return Some(decimals);
+        }
+        if let Some(decimals) = self.token_decimals.lock().ok()?.get(&token.0).copied() {
+            return Some(decimals);
+        }
+        let node = self.node.as_ref()?;
+        let call = TransactionRequest::default()
+            .to(token.0)
+            .input(TransactionInput::new(decimalsCall {}.abi_encode().into()));
+        let returned = tokio::time::timeout(timeout, node.call(call))
             .await
-            .ok();
+            .ok()?
+            .ok()?;
+        let decimals = decimalsCall::abi_decode_returns(&returned).ok()?;
+        self.token_decimals.lock().ok()?.insert(token.0, decimals);
+        Some(decimals)
+    }
+
+    async fn native_price_probe_initial_sell_amount(
+        &self,
+        order: &Order,
+        tokens: &auction::Tokens,
+    ) -> U256 {
+        let fetched = match self
+            .token_decimals(order.sell.token, tokens, NATIVE_PRICE_PROBE_PRICE_TIMEOUT)
+            .await
+        {
+            Some(decimals) => self
+                .price_client
+                .get_eth_price(
+                    self.chain.price_api_chain.as_slug(),
+                    self.chain.wrapped_native_token,
+                    order.sell.token.0,
+                    decimals,
+                    NATIVE_PRICE_PROBE_PRICE_TIMEOUT,
+                )
+                .await
+                .ok(),
+            None => None,
+        };
 
         let Some(price) = fetched.filter(|price| !price.is_zero()) else {
             return order.buy.amount;
@@ -2438,6 +2504,7 @@ mod tests {
             skip_general_orders_with_hooks: false,
             report_aware_quotes: false,
             node: None,
+            token_decimals: Mutex::new(HashMap::new()),
             general_order_failure_backoff: Mutex::new(HashMap::new()),
         }
     }
@@ -2465,7 +2532,7 @@ mod tests {
         order.buy.amount = U256::from(1_000u64);
 
         let solved = inner
-            .solve_native_price_probe(&order, &test_deadline())
+            .solve_native_price_probe(&order, &auction::Tokens(HashMap::new()), &test_deadline())
             .await
             .unwrap();
 
@@ -2505,7 +2572,7 @@ mod tests {
         order.buy.amount = U256::from(1_000u64);
 
         let solved = inner
-            .solve_native_price_probe(&order, &test_deadline())
+            .solve_native_price_probe(&order, &auction::Tokens(HashMap::new()), &test_deadline())
             .await
             .unwrap();
 
@@ -2994,6 +3061,65 @@ mod tests {
         assert!(settled.pre_calls.is_empty());
         assert_eq!(settled.expected_output, U256::from(1_000u64));
         assert!(!provider.requests.lock().unwrap().last().unwrap().report_aware);
+    }
+
+    fn tokens_with_decimals(token: eth::Address, decimals: Option<u8>) -> auction::Tokens {
+        auction::Tokens(HashMap::from([(
+            eth::TokenAddress(token),
+            auction::Token {
+                decimals,
+                symbol: None,
+                reference_price: None,
+                available_balance: U256::ZERO,
+                trusted: true,
+            },
+        )]))
+    }
+
+    #[tokio::test]
+    async fn token_decimals_come_from_the_auction_when_it_states_them() {
+        let wbtc = eth::Address::repeat_byte(0x22);
+        let inner = test_inner(100, 50);
+        let decimals = inner
+            .token_decimals(
+                eth::TokenAddress(wbtc),
+                &tokens_with_decimals(wbtc, Some(8)),
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(decimals, Some(8));
+    }
+
+    #[tokio::test]
+    async fn token_decimals_are_unknown_rather_than_assumed() {
+        // No decimals in the auction and no node to ask: the answer is "don't
+        // know", never 18.
+        let token = eth::Address::repeat_byte(0x22);
+        let inner = test_inner(100, 50);
+        assert!(inner.node.is_none());
+        let unknown = inner
+            .token_decimals(
+                eth::TokenAddress(token),
+                &tokens_with_decimals(token, None),
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(unknown, None);
+    }
+
+    #[tokio::test]
+    async fn token_decimals_read_from_the_chain_are_remembered() {
+        let token = eth::Address::repeat_byte(0x22);
+        let inner = test_inner(100, 50);
+        inner.token_decimals.lock().unwrap().insert(token, 6);
+        let decimals = inner
+            .token_decimals(
+                eth::TokenAddress(token),
+                &auction::Tokens(HashMap::new()),
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(decimals, Some(6));
     }
 
     #[test]
