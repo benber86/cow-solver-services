@@ -737,15 +737,16 @@ impl Inner {
         &self,
         order: &Order,
         tokens: &Tokens,
+        is_quote: bool,
     ) -> Option<&'static str> {
         let max_deviation_bps = self.max_general_order_market_deviation_bps?;
         let sell_price = match tokens.reference_price(&order.sell.token) {
             Some(price) => price,
-            None => return Some("missing_sell_reference_price"),
+            None => return (!is_quote).then_some("missing_sell_reference_price"),
         };
         let buy_price = match tokens.reference_price(&order.buy.token) {
             Some(price) => price,
-            None => return Some("missing_buy_reference_price"),
+            None => return (!is_quote).then_some("missing_buy_reference_price"),
         };
 
         let sell_value = order_value(order.sell.amount, sell_price);
@@ -878,7 +879,7 @@ impl Inner {
                     "general order skipped by edge-token filter"
                 );
             } else if let Some(reason) =
-                self.general_marketability_rejection_reason(&item.1, tokens)
+                self.general_marketability_rejection_reason(&item.1, tokens, is_quote)
             {
                 marketability_filtered_general += 1;
                 tracing::debug!(
@@ -1003,7 +1004,7 @@ impl Inner {
             if is_regular_fallback && !self.regular_fallback_enabled() {
                 edge_filtered_general += 1;
             } else if self
-                .general_marketability_rejection_reason(order, tokens)
+                .general_marketability_rejection_reason(order, tokens, is_quote)
                 .is_some()
             {
                 marketability_filtered_general += 1;
@@ -3164,6 +3165,38 @@ mod tests {
         // General order 0 is >2% off-market and skipped. The LP-priority order
         // bypasses marketability even though its limit price is absurd.
         assert_eq!(selected_indices, vec![2, 1]);
+    }
+
+    #[test]
+    fn indicative_quotes_can_route_without_reference_prices() {
+        let sell = eth::Address::repeat_byte(1);
+        let buy = eth::Address::repeat_byte(2);
+        let order = sell_order_with_amounts(sell, buy, 100, 103);
+        let mut inner = test_inner(100, 50);
+        inner.max_general_order_market_deviation_bps = Some(200);
+
+        for (priced, reason) in [
+            (vec![], "missing_sell_reference_price"),
+            (vec![buy], "missing_sell_reference_price"),
+            (vec![sell], "missing_buy_reference_price"),
+        ] {
+            let tokens = tokens_with_unit_prices(&priced);
+            assert_eq!(
+                inner.general_marketability_rejection_reason(&order, &tokens, true),
+                None
+            );
+            assert_eq!(
+                inner.general_marketability_rejection_reason(&order, &tokens, false),
+                Some(reason)
+            );
+        }
+        let tokens = tokens_with_unit_prices(&[sell, buy]);
+        for is_quote in [true, false] {
+            assert_eq!(
+                inner.general_marketability_rejection_reason(&order, &tokens, is_quote),
+                Some("off_market_limit_price")
+            );
+        }
     }
 
     #[test]
