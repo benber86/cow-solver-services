@@ -87,6 +87,17 @@ token-allowlist = [
 # general order can match. LP-priority flow is unaffected.
 general-edge-tokens = []
 
+# Pairs non-LP orders may trade in either direction. A pair admits only orders
+# between its own two tokens, so listing WETH/WXDAI does not open every other
+# WXDAI pair the way an edge token would. `slippage-bps` on a pair replaces the
+# chain-wide haircut for its bid and calldata floor.
+general-pairs = [
+    # WETH/WXDAI fxswap pool 0x011E998D2d794424DE95935d55a6Ca81822Ecb2b. Its
+    # quote moved more than 10bp against us in ~2-6% of 10-30s windows
+    # (2026-11-26), with the Gnosis router refreshing every 10s.
+    { tokens = ["0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1", "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"], slippage-bps = 10 },
+]
+
 # Optional buy-token either-side filter (left disabled):
 # allowed-buy-tokens = [
 # ]

@@ -92,6 +92,9 @@ pub struct QuoteRequest {
     /// Ask the provider to also price the order with a fresh oracle report
     /// delivered ahead of it.
     pub report_aware: bool,
+    /// Haircut for this request's calldata floor, in place of the provider's
+    /// default.
+    pub slippage_bps: Option<u32>,
 }
 
 impl QuoteRequest {

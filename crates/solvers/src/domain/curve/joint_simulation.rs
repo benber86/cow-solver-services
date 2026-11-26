@@ -316,6 +316,7 @@ mod tests {
                     min_out: Some(U256::from(1)),
                     gas_price_gwei: None,
                     report_aware: true,
+                    slippage_bps: None,
                 })
                 .await
                 .expect("router quote");
