@@ -1381,11 +1381,12 @@ impl Inner {
         })
     }
 
-    /// A report route is only bid on once its bank call and swap have run
-    /// together, from the settlement contract, at the timestamp the route was
-    /// priced for. If they cannot be shown to work, the order falls back to
-    /// its ordinary route: the report route's output depends on a call that
-    /// would then be unproven.
+    /// A report route is only bid on when it would still settle one slot
+    /// late, and once its bank call and swap have run together, from the
+    /// settlement contract, at the timestamp the route was priced for.
+    /// Otherwise the order takes its ordinary route: a report ages by the
+    /// second, and a bid that only holds in the very next slot reverts
+    /// whenever the settlement lands a block later.
     async fn settle_on_route(
         &self,
         order: &Order,
@@ -1397,61 +1398,76 @@ impl Inner {
             return Ok(quote);
         };
         if quote.pre_calls.is_empty() {
-            log_report_pricing(order, &report, None);
+            log_report_pricing(order, &report, None, false);
             return Ok(quote);
         }
 
-        let verify_budget = ONCHAIN_VERIFY_TIMEOUT.min(budget);
-        let verify_start = Instant::now();
-        let simulated = match &self.node {
-            Some(node) => tokio::time::timeout(
-                verify_budget,
-                joint_simulation::simulate(
-                    node,
-                    joint_simulation::Request {
-                        settlement: self.chain.settlement_contract,
-                        owner: order.owner,
-                        sell_token: order.sell.token.0,
-                        sell_amount: order.sell.amount,
-                        buy_token: order.buy.token.0,
-                        quote: &quote,
-                        timestamp: report.inclusion_timestamp,
-                    },
-                ),
-            )
-            .await
-            .map_err(|_| "simulation timed out".to_owned())
-            .and_then(|result| result.map_err(|err| err.to_string())),
-            None => Err("no node to simulate against".to_owned()),
+        let started = Instant::now();
+        let checked = match survives_one_slot_late(&report, quote.min_out) {
+            Ok(()) => {
+                self.simulate_report_route(order, &quote, &report, budget).await
+            }
+            Err(reason) => Err(reason),
         };
-        match simulated {
+        match checked {
             Ok(received) => {
-                log_report_pricing(order, &report, Some(received));
+                log_report_pricing(order, &report, Some(received), true);
                 Ok(quote)
             }
             Err(reason) => {
-                tracing::warn!(
+                log_report_pricing(order, &report, None, false);
+                tracing::info!(
                     order_uid = %order.uid,
                     %reason,
-                    "report route did not simulate; using the ordinary route"
+                    "not bidding on the report route; using the ordinary route"
                 );
                 let ordinary = QuoteRequest {
                     report_aware: false,
                     ..request.clone()
                 };
                 tokio::time::timeout(
-                    budget.saturating_sub(verify_start.elapsed()),
+                    budget.saturating_sub(started.elapsed()),
                     self.provider.quote(&ordinary),
                 )
                 .await
                 .map_err(|_| {
                     SolveError::Provider(route_provider::Error::Transport(
-                        "ordinary route request timed out after a failed report route".into(),
+                        "ordinary route request timed out after a rejected report route".into(),
                     ))
                 })?
                 .map_err(SolveError::Provider)
             }
         }
+    }
+
+    async fn simulate_report_route(
+        &self,
+        order: &Order,
+        quote: &route_provider::ExecutableQuote,
+        report: &route_provider::ReportPricing,
+        budget: Duration,
+    ) -> Result<eth::U256, String> {
+        let Some(node) = &self.node else {
+            return Err("no node to simulate against".to_owned());
+        };
+        tokio::time::timeout(
+            ONCHAIN_VERIFY_TIMEOUT.min(budget),
+            joint_simulation::simulate(
+                node,
+                joint_simulation::Request {
+                    settlement: self.chain.settlement_contract,
+                    owner: order.owner,
+                    sell_token: order.sell.token.0,
+                    sell_amount: order.sell.amount,
+                    buy_token: order.buy.token.0,
+                    quote,
+                    timestamp: report.inclusion_timestamp,
+                },
+            ),
+        )
+        .await
+        .map_err(|_| "simulation timed out".to_owned())?
+        .map_err(|err| format!("simulation failed: {err}"))
     }
 
     async fn solve_native_price_probe(
@@ -1778,14 +1794,34 @@ struct SolvedOrder {
     legacy: Option<LegacyTelemetry>,
 }
 
-/// Basis-point delta between new-router and legacy outputs. Positive = new
-/// router won, negative = legacy won. Returns None if either is zero.
+/// Whether the route's own calldata, with its floor, would still settle if
+/// the settlement landed one slot after the one it was priced for. Not knowing
+/// counts as no.
+fn survives_one_slot_late(
+    report: &route_provider::ReportPricing,
+    floor: eth::U256,
+) -> Result<(), String> {
+    if let Some(failure) = &report.one_slot_late_failure {
+        return Err(format!("one slot late: {failure}"));
+    }
+    match report.one_slot_late_out {
+        None => Err("one slot late: outcome unknown".to_owned()),
+        Some(output) if output < floor => {
+            Err(format!(
+                "one slot late: output {output} below the floor {floor}"
+            ))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
 /// One line per report-priced order: what the report was worth at the next
-/// slot, what is left of that one slot later, and which route was taken.
+/// slot, what is left of that one slot later, and which route was bid.
 fn log_report_pricing(
     order: &Order,
     report: &route_provider::ReportPricing,
     simulated_received: Option<eth::U256>,
+    bid_on_report_route: bool,
 ) {
     let gain_bps =
         |with_report: Option<eth::U256>| output_gain_bps(report.ordinary_out?, with_report?);
@@ -1793,7 +1829,8 @@ fn log_report_pricing(
         order_uid = %order.uid,
         sell_token = ?order.sell.token,
         buy_token = ?order.buy.token,
-        selected = if report.selected { "report" } else { "ordinary" },
+        router_selected = if report.selected { "report" } else { "ordinary" },
+        bid = if bid_on_report_route { "report" } else { "ordinary" },
         age_at_inclusion_secs = report.age_at_inclusion_secs,
         observation_time_us = report.observation_time_us,
         ordinary_out = ?report.ordinary_out,
@@ -1815,6 +1852,8 @@ fn output_gain_bps(ordinary: eth::U256, with_report: eth::U256) -> Option<i32> {
     Some(i32::try_from(scaled).ok()? - 10_000)
 }
 
+/// Basis-point delta between new-router and legacy outputs. Positive = new
+/// router won, negative = legacy won. Returns None if either is zero.
 fn legacy_delta_bps(new_router: eth::U256, legacy: eth::U256) -> Option<i32> {
     if legacy.is_zero() || new_router.is_zero() {
         return None;
@@ -2800,7 +2839,7 @@ mod tests {
                     age_at_inclusion_secs: 6.0,
                     ordinary_out: Some(U256::from(1_000u64)),
                     next_slot_out: Some(U256::from(1_010u64)),
-                    one_slot_late_out: Some(U256::from(1_007u64)),
+                    one_slot_late_out: Some(U256::from(1_010u64)),
                     one_slot_late_failure: None,
                 }),
                 pre_calls,
@@ -2878,6 +2917,76 @@ mod tests {
 
         assert_eq!(settled.expected_output, U256::from(1_000u64));
         assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    }
+
+    fn report_pricing(
+        one_slot_late_out: Option<u64>,
+        one_slot_late_failure: Option<&str>,
+    ) -> route_provider::ReportPricing {
+        route_provider::ReportPricing {
+            selected: true,
+            observation_time_us: 1_000_000,
+            inclusion_timestamp: 7,
+            age_at_inclusion_secs: 6.0,
+            ordinary_out: Some(U256::from(1_000u64)),
+            next_slot_out: Some(U256::from(1_010u64)),
+            one_slot_late_out: one_slot_late_out.map(U256::from),
+            one_slot_late_failure: one_slot_late_failure.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn report_route_must_still_clear_its_floor_one_slot_late() {
+        let floor = U256::from(1_007u64);
+        assert!(survives_one_slot_late(&report_pricing(Some(1_007), None), floor).is_ok());
+        assert!(survives_one_slot_late(&report_pricing(Some(1_006), None), floor).is_err());
+        assert!(
+            survives_one_slot_late(
+                &report_pricing(Some(1_009), Some("report delivery fails")),
+                floor
+            )
+            .is_err()
+        );
+        assert!(
+            survives_one_slot_late(&report_pricing(None, None), floor).is_err(),
+            "an unknown outcome is not a pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn report_route_that_would_revert_one_slot_late_is_not_bid_on() {
+        let a = eth::Address::repeat_byte(0xaa);
+        let b = eth::Address::repeat_byte(0xbb);
+        let provider = Arc::new(ReportRouteProvider {
+            router: test_chain_config().router_address,
+            requests: Mutex::new(Vec::new()),
+        });
+        let mut inner = test_inner(100, 50);
+        inner.provider = provider.clone();
+        inner.report_aware_quotes = true;
+        let order = sell_order_with_amounts(a, b, 1_000, 900);
+        let request = QuoteRequest {
+            sell_token: a,
+            buy_token: b,
+            sell_amount: order.sell.amount,
+            is_quote: false,
+            receiver: inner.chain.settlement_contract,
+            min_out: Some(order.buy.amount),
+            gas_price_gwei: None,
+            report_aware: true,
+        };
+        let mut report_route = provider.quote(&request).await.unwrap();
+        report_route.report.as_mut().unwrap().one_slot_late_failure =
+            Some("output is below min_out".into());
+
+        let settled = inner
+            .settle_on_route(&order, report_route, &request, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert!(settled.pre_calls.is_empty());
+        assert_eq!(settled.expected_output, U256::from(1_000u64));
+        assert!(!provider.requests.lock().unwrap().last().unwrap().report_aware);
     }
 
     #[test]
