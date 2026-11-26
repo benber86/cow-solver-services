@@ -11,6 +11,7 @@ use {
 #[derive(Debug, Clone)]
 pub struct Order {
     pub uid: Uid,
+    pub owner: eth::Address,
     pub sell: eth::Asset,
     pub buy: eth::Asset,
     pub side: Side,
