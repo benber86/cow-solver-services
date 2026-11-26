@@ -16,7 +16,7 @@ use {
 pub struct Client {
     http: reqwest::Client,
     base_url: Url,
-    cache: Mutex<HashMap<eth::Address, CacheEntry>>,
+    cache: Mutex<HashMap<(eth::Address, u8), CacheEntry>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -34,6 +34,46 @@ struct PriceData {
 enum CacheEntry {
     Price { price: eth::U256, at: Instant },
     Unavailable { at: Instant },
+}
+
+/// Wrapped-native wei per 10^18 atoms of a token, from the USD price of one
+/// whole token and of one whole wrapped native.
+///
+/// One whole token is `10^decimals` atoms and costs `token_usd / native_usd`
+/// native, i.e. that many times 10^18 wei. Scaling to 10^18 atoms multiplies
+/// by `10^(18 - decimals)`: nothing for an 18-decimal token, 10^10 for WBTC,
+/// 10^12 for USDC.
+fn native_price(token_usd: f64, native_usd: f64, decimals: u8) -> Result<eth::U256, Error> {
+    if native_usd <= 0.0 {
+        return Err(Error::Parse("invalid wrapped-native price".to_string()));
+    }
+    let per_whole_token = (token_usd / native_usd) * 1e18;
+
+    if !per_whole_token.is_finite() || per_whole_token <= 0.0 {
+        return Err(Error::Parse(format!(
+            "invalid native price calculation: token_usd={token_usd}, native_usd={native_usd}"
+        )));
+    }
+    if per_whole_token >= 2.0_f64.powi(128) {
+        return Err(Error::Parse("price overflow".to_string()));
+    }
+    let per_whole_token = eth::U256::from(per_whole_token as u128);
+
+    // The decimal shift is exact in integers; in floating point it would
+    // smear the low digits of an already 30-digit number.
+    let ten = eth::U256::from(10u8);
+    let price = if decimals <= 18 {
+        per_whole_token.checked_mul(ten.pow(eth::U256::from(18 - decimals)))
+    } else {
+        ten.checked_pow(eth::U256::from(decimals - 18))
+            .map(|scale| per_whole_token / scale)
+    };
+    match price {
+        Some(price) if !price.is_zero() => Ok(price),
+        _ => Err(Error::Parse(format!(
+            "native price not representable for a {decimals}-decimal token"
+        ))),
+    }
 }
 
 /// How long to keep a cached price before refreshing.
@@ -65,7 +105,11 @@ impl Client {
 
     /// Fetches the native-token-denominated price for `token`.
     /// Returns price as U256 representing wrapped-native wei needed to buy
-    /// 10^18 of the token. This is compatible with `auction::Price`.
+    /// 10^18 atoms of the token. This is compatible with `auction::Price`.
+    ///
+    /// `decimals` is the token's own: the API prices one whole token, and how
+    /// many atoms that is differs by ten orders of magnitude between WBTC and
+    /// an 18-decimal token.
     ///
     /// `chain` is the Curve Price API chain slug ("ethereum" | "arbitrum" | "xdai").
     /// `wrapped_native` is the pivot token: WETH on Ethereum/Arbitrum, WXDAI on Gnosis.
@@ -80,32 +124,35 @@ impl Client {
         chain: &str,
         wrapped_native: eth::Address,
         token: eth::Address,
+        decimals: u8,
         timeout: Duration,
     ) -> Result<eth::U256, Error> {
-        match self.cached(token) {
+        match self.cached(token, decimals) {
             Some(Ok(price)) => return Ok(price),
             Some(Err(())) => return Err(Error::RecentlyUnavailable),
             None => {}
         }
 
-        let result =
-            tokio::time::timeout(timeout, self.fetch_eth_price(chain, wrapped_native, token))
-                .await
-                .unwrap_or_else(|_| {
-                    Err(Error::Network(format!(
-                        "price lookup timed out after {}ms",
-                        timeout.as_millis()
-                    )))
-                });
+        let result = tokio::time::timeout(
+            timeout,
+            self.fetch_eth_price(chain, wrapped_native, token, decimals),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::Network(format!(
+                "price lookup timed out after {}ms",
+                timeout.as_millis()
+            )))
+        });
 
         match result {
             Ok(price) => {
-                self.insert_price(token, price);
+                self.insert_price(token, decimals, price);
                 Ok(price)
             }
             Err(err) => {
                 tracing::debug!(?token, %err, "caching unavailable token price");
-                self.insert_unavailable(token);
+                self.insert_unavailable(token, decimals);
                 Err(err)
             }
         }
@@ -116,35 +163,14 @@ impl Client {
         chain: &str,
         wrapped_native: eth::Address,
         token: eth::Address,
+        decimals: u8,
     ) -> Result<eth::U256, Error> {
         // Fetch both token and wrapped-native USD prices in parallel.
         let (token_usd, native_usd) = tokio::join!(
             self.get_usd_price_raw(chain, token),
             self.get_usd_price_raw(chain, wrapped_native),
         );
-        let token_usd = token_usd?;
-        let native_usd = native_usd?;
-
-        if native_usd <= 0.0 {
-            return Err(Error::Parse("invalid wrapped-native price".to_string()));
-        }
-
-        // Convert: native_price = (token_usd / native_usd) * 10^18
-        // This gives us wei of the wrapped native needed to buy 10^18 of the token.
-        let native_price = (token_usd / native_usd) * 1e18;
-
-        if !native_price.is_finite() || native_price <= 0.0 {
-            return Err(Error::Parse(format!(
-                "invalid native price calculation: token_usd={}, native_usd={}",
-                token_usd, native_usd
-            )));
-        }
-
-        if native_price >= 2.0_f64.powi(128) {
-            return Err(Error::Parse("price overflow".to_string()));
-        }
-
-        Ok(eth::U256::from(native_price as u128))
+        native_price(token_usd?, native_usd?, decimals)
     }
 
     /// Fetches raw USD price for a token as f64.
@@ -184,19 +210,19 @@ impl Client {
 
     /// `Some(Ok(price))` = fresh price, `Some(Err(()))` = known-unavailable and
     /// not worth another request yet, `None` = nothing usable, go fetch.
-    fn cached(&self, token: eth::Address) -> Option<Result<eth::U256, ()>> {
+    fn cached(&self, token: eth::Address, decimals: u8) -> Option<Result<eth::U256, ()>> {
         let cache = self.cache.lock().ok()?;
-        match cache.get(&token)? {
+        match cache.get(&(token, decimals))? {
             CacheEntry::Price { price, at } if at.elapsed() <= CACHE_TTL => Some(Ok(*price)),
             CacheEntry::Unavailable { at } if at.elapsed() <= NEGATIVE_CACHE_TTL => Some(Err(())),
             _ => None,
         }
     }
 
-    fn insert_price(&self, token: eth::Address, price: eth::U256) {
+    fn insert_price(&self, token: eth::Address, decimals: u8, price: eth::U256) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(
-                token,
+                (token, decimals),
                 CacheEntry::Price {
                     price,
                     at: Instant::now(),
@@ -205,9 +231,9 @@ impl Client {
         }
     }
 
-    fn insert_unavailable(&self, token: eth::Address) {
+    fn insert_unavailable(&self, token: eth::Address, decimals: u8) {
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(token, CacheEntry::Unavailable { at: Instant::now() });
+            cache.insert((token, decimals), CacheEntry::Unavailable { at: Instant::now() });
         }
     }
 }
@@ -256,10 +282,11 @@ mod tests {
     fn fresh_price_is_served_from_cache() {
         let client = unreachable_client();
         let token = eth::Address::repeat_byte(0x11);
-        assert!(client.cached(token).is_none());
+        assert!(client.cached(token, 18).is_none());
 
-        client.insert_price(token, eth::U256::from(1_234u64));
-        assert_eq!(client.cached(token), Some(Ok(eth::U256::from(1_234u64))));
+        client.insert_price(token, 18, eth::U256::from(1_234u64));
+        assert!(client.cached(token, 8).is_none());
+        assert_eq!(client.cached(token, 18), Some(Ok(eth::U256::from(1_234u64))));
     }
 
     #[test]
@@ -267,9 +294,9 @@ mod tests {
         let client = unreachable_client();
         let token = eth::Address::repeat_byte(0x22);
 
-        client.insert_unavailable(token);
+        client.insert_unavailable(token, 18);
         assert_eq!(
-            client.cached(token),
+            client.cached(token, 18),
             Some(Err(())),
             "an unavailable token must be distinguishable from an unknown one"
         );
@@ -283,7 +310,7 @@ mod tests {
         // timeout again, forever.
         let client = unreachable_client();
         let token = eth::Address::repeat_byte(0x33);
-        client.insert_unavailable(token);
+        client.insert_unavailable(token, 18);
 
         let started = Instant::now();
         let err = client
@@ -291,6 +318,7 @@ mod tests {
                 "base",
                 eth::Address::repeat_byte(0x44),
                 token,
+                18,
                 Duration::from_secs(5),
             )
             .await
@@ -314,26 +342,89 @@ mod tests {
                 "base",
                 eth::Address::repeat_byte(0x66),
                 token,
+                18,
                 Duration::from_secs(2),
             )
             .await
             .expect_err("dead port must fail");
 
         assert_eq!(
-            client.cached(token),
+            client.cached(token, 18),
             Some(Err(())),
             "the failure must be recorded so the next auction skips the lookup"
         );
     }
 
     #[test]
-    fn test_eth_price_conversion() {
-        // Test ETH price calculation: token_usd=3000, weth_usd=2000
-        // eth_price = (3000 / 2000) * 10^18 = 1.5 * 10^18
-        let token_usd = 3000.0_f64;
-        let weth_usd = 2000.0_f64;
-        let eth_price = (token_usd / weth_usd) * 1e18;
-        let result = eth::U256::from(eth_price as u128);
-        assert_eq!(result, eth::U256::from(1_500_000_000_000_000_000u128));
+    fn native_price_of_an_18_decimal_token_is_the_usd_ratio_in_wei() {
+        // 3000 USD token against 2000 USD native: 1.5 native per whole token,
+        // and a whole token is already 10^18 atoms.
+        assert_eq!(
+            native_price(3_000.0, 2_000.0, 18).unwrap(),
+            eth::U256::from(1_500_000_000_000_000_000u128)
+        );
+    }
+
+    #[test]
+    fn native_price_scales_with_the_tokens_own_decimals() {
+        // One WBTC (10^8 atoms) at 60000 USD against 2000 USD native is 30
+        // native, so 10^18 atoms cost 30 * 10^10 native.
+        assert_eq!(
+            native_price(60_000.0, 2_000.0, 8).unwrap(),
+            eth::U256::from(30u128 * 10u128.pow(18) * 10u128.pow(10))
+        );
+        // One USDC (10^6 atoms) at 1 USD is 0.0005 native, so 10^18 atoms cost
+        // 5 * 10^14 * 10^12 wei.
+        assert_eq!(
+            native_price(1.0, 2_000.0, 6).unwrap(),
+            eth::U256::from(5u128 * 10u128.pow(14) * 10u128.pow(12))
+        );
+    }
+
+    #[test]
+    fn gas_fee_in_an_8_decimal_token_is_a_few_atoms_not_thousands_of_coins() {
+        // The bug this guards: pricing WBTC as if it had 18 decimals made the
+        // fee for a small trade come out above 10,000 WBTC.
+        let price = native_price(60_000.0, 2_000.0, 8).unwrap();
+        // 300k gas at 1 gwei = 3 * 10^14 wei of native
+        let gas_cost = eth::U256::from(300_000u128 * 1_000_000_000u128);
+        let fee_atoms = gas_cost * eth::U256::from(10u128.pow(18)) / price;
+        // 0.0003 native at 30 native per WBTC = 0.00001 WBTC = 1000 atoms
+        assert_eq!(fee_atoms, eth::U256::from(1_000u64));
+    }
+
+    #[test]
+    fn native_price_rejects_unusable_inputs() {
+        assert!(native_price(1.0, 0.0, 18).is_err());
+        assert!(native_price(1.0, 1.0, u8::MAX).is_err());
+        assert!(native_price(f64::NAN, 2_000.0, 18).is_err());
+        assert!(native_price(1e30, 1e-30, 0).is_err(), "overflow");
+        assert!(native_price(1e-9, 2_000.0, 40).is_err(), "rounds to nothing");
+    }
+
+    /// Live check against the Curve price API:
+    /// `cargo test -p solvers --lib live_fallback_price -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_fallback_price_gives_a_sane_gas_fee_for_wbtc_and_usdc() {
+        let client = Client::new("https://prices.curve.finance/".parse().unwrap());
+        let weth = alloy::primitives::address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2");
+        let gas_cost = eth::U256::from(300_000u128 * 1_000_000_000u128); // 300k gas at 1 gwei
+        for (name, token, decimals) in [
+            ("WBTC", alloy::primitives::address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"), 8u8),
+            ("USDC", alloy::primitives::address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), 6u8),
+        ] {
+            let price = client
+                .get_eth_price("ethereum", weth, token, decimals, Duration::from_secs(10))
+                .await
+                .expect("price");
+            let fee_atoms = gas_cost * eth::U256::from(10u128.pow(18)) / price;
+            let fee_whole = fee_atoms.to::<u128>() as f64 / 10f64.powi(i32::from(decimals));
+            println!("{name}: price {price}, fee for 0.0003 ETH of gas = {fee_whole} {name}");
+            // 0.0003 ETH is well under a dollar: a few cents of USDC, a few
+            // hundred-thousandths of a WBTC
+            let fee_usd = if name == "USDC" { fee_whole } else { fee_whole * 60_000.0 };
+            assert!((0.05..5.0).contains(&fee_usd), "{name} fee of ~${fee_usd} is not sane");
+        }
     }
 }
