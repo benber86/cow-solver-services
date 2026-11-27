@@ -96,6 +96,15 @@ general-pairs = [
     # quote moved more than 10bp against us in ~2-6% of 10-30s windows
     # (2026-11-26), with the Gnosis router refreshing every 10s.
     { tokens = ["0x6A023CCd1ff6F2045C3309768eAd9E68F978f6e1", "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"], slippage-bps = 10 },
+
+    # USD stables against each other. Winners on these pairs deliver within
+    # ~2bp of our own route's price, so the chain-wide 30bp loses every time.
+    # Over 19 minutes of 10-20s windows (2026-11-27) no quote on these pairs
+    # fell more than 0.2bp; that is too short to call a long-run revert rate.
+    { tokens = ["0x4ECaBa5870353805a9F068101A40E0f32ed605C6", "0x2a22f9c3b484c3629090FeED35F17Ff8F88f76F0"], slippage-bps = 1 },  # USDT / USDC.e
+    { tokens = ["0x4ECaBa5870353805a9F068101A40E0f32ed605C6", "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"], slippage-bps = 1 },  # USDT / WXDAI
+    { tokens = ["0x2a22f9c3b484c3629090FeED35F17Ff8F88f76F0", "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"], slippage-bps = 1 },  # USDC.e / WXDAI
+    { tokens = ["0xDDAfbb505ad214D7b80b1f830fcCc89B60fb7A83", "0xe91D153E0b41518A2Ce8Dd3D7944Fa863463a97d"], slippage-bps = 1 },  # USDC / WXDAI
 ]
 
 # Optional buy-token either-side filter (left disabled):
