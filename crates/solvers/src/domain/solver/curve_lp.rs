@@ -1130,6 +1130,12 @@ impl Inner {
             return self.solve_native_price_probe(order, tokens, deadline).await;
         }
 
+        // Without a solver fee the settlement pulls in less than the swap
+        // spends, and the buffers make up the difference.
+        if !is_quote && order.side == order::Side::Buy && !order.solver_determines_fee() {
+            return Err(SolveError::BuyOrderWithoutSolverFee);
+        }
+
         // Sidechain real-solve only: fire the legacy comparison NOW, in
         // parallel with everything else. The handle is polled non-blockingly
         // just before logging — if legacy hasn't finished by then, we drop it
@@ -1316,6 +1322,35 @@ impl Inner {
             }
         };
 
+        // A buy order's fee comes out of the user's max sell, which the swap
+        // spends in full, so only the output above the buy amount pays for gas.
+        let bid_slippage_bps = pair_slippage_bps.unwrap_or(self.bid_slippage_bps);
+        if order.side == order::Side::Buy
+            && !buy_order_margin_covers_fee(
+                quote.expected_output,
+                quote.min_out,
+                bid_slippage_bps,
+                order.sell.amount,
+                order.buy.amount,
+                fee_in_sell_token,
+            )
+        {
+            tracing::info!(
+                order_uid = %order.uid,
+                sell_token = ?order.sell.token,
+                buy_token = ?order.buy.token,
+                sell_amount = %order.sell.amount,
+                buy_amount = %order.buy.amount,
+                expected_output = %quote.expected_output,
+                calldata_min_out = %quote.min_out,
+                fee_in_sell_token = %fee_in_sell_token,
+                bid_haircut_bps = bid_slippage_bps,
+                is_quote,
+                "buy order skipped because its margin does not cover gas"
+            );
+            return Err(SolveError::EffectiveAmountUnderFee);
+        }
+
         // 8. Build the solution
         // For sell orders: input is the full sell amount, output is the
         // competitive bid. Calldata remains protected by quote.min_out.
@@ -1329,7 +1364,7 @@ impl Inner {
                     quote.expected_output,
                     quote.min_out,
                     order.buy.amount,
-                    pair_slippage_bps.unwrap_or(self.bid_slippage_bps),
+                    bid_slippage_bps,
                 ),
             ),
             order::Side::Buy => (
@@ -2094,6 +2129,31 @@ fn sell_order_bid_output(
         .max(order_floor)
 }
 
+fn buy_order_margin_covers_fee(
+    expected_output: eth::U256,
+    calldata_min_out: eth::U256,
+    bid_slippage_bps: u32,
+    sell_amount: eth::U256,
+    buy_amount: eth::U256,
+    fee_in_sell_token: eth::U256,
+) -> bool {
+    // Only the calldata floor is enforced on-chain, and it can sit below the
+    // expected output of the response that carries it.
+    let guaranteed_output = QuoteRequest::min_out_with_slippage(expected_output, bid_slippage_bps)
+        .min(calldata_min_out);
+    let Some(margin) = guaranteed_output.checked_sub(buy_amount) else {
+        return false;
+    };
+    // margin / expected_output >= fee / sell_amount, at the quote's own rate.
+    match (
+        margin.checked_mul(sell_amount),
+        fee_in_sell_token.checked_mul(expected_output),
+    ) {
+        (Some(margin), Some(fee)) => margin >= fee,
+        _ => false,
+    }
+}
+
 struct EffectiveTradeAmounts {
     sell: eth::U256,
     buy: eth::U256,
@@ -2152,6 +2212,7 @@ fn effective_trade_amounts(
 fn should_backoff_general_failure(err: &SolveError) -> bool {
     match err {
         SolveError::EffectiveAmountUnderFee => true,
+        SolveError::BuyOrderWithoutSolverFee => true,
         SolveError::InsufficientOutput { .. } => true,
         // The request never reached a verdict — a blip against the router
         // service, not a statement about this order.
@@ -2227,6 +2288,7 @@ pub enum SolveError {
     NoPriceForSellToken,
     FeeCalculation,
     EffectiveAmountUnderFee,
+    BuyOrderWithoutSolverFee,
     SolutionConstruction,
     /// Too little of the auction left to attempt a route lookup. Not a
     /// property of the order, so it never triggers the failure backoff.
@@ -2249,6 +2311,9 @@ impl fmt::Display for SolveError {
             SolveError::FeeCalculation => write!(f, "fee calculation failed"),
             SolveError::EffectiveAmountUnderFee => {
                 write!(f, "effective amount is below fee")
+            }
+            SolveError::BuyOrderWithoutSolverFee => {
+                write!(f, "buy order does not let the solver charge a fee")
             }
             SolveError::DeadlineExhausted => {
                 write!(f, "not enough auction time left to fetch a route")
@@ -3706,6 +3771,137 @@ mod tests {
         let counts = inner.selected_counts(&[bad_general], &tokens, false);
         assert_eq!(counts.total, 0);
         assert_eq!(counts.backoff_filtered_general, 1);
+    }
+
+    /// Binds the calldata floor at the order's limit, as the router does
+    /// when the expected output moves between its two responses.
+    struct FloorAtLimitProvider(LinearForwardProvider);
+
+    #[async_trait::async_trait]
+    impl RouteProvider for FloorAtLimitProvider {
+        async fn quote(
+            &self,
+            req: &QuoteRequest,
+        ) -> Result<route_provider::ExecutableQuote, route_provider::Error> {
+            let mut quote = self.0.quote(req).await?;
+            quote.min_out = req.min_out.unwrap();
+            Ok(quote)
+        }
+    }
+
+    async fn solve_buy_order(
+        numerator: u64,
+        denominator: u64,
+        class: order::Class,
+        floor_at_limit: bool,
+    ) -> Result<SolvedOrder, SolveError> {
+        let usdc = eth::Address::repeat_byte(0x02);
+        let usdt = eth::Address::repeat_byte(0x03);
+        let mut inner = test_inner(0, 50);
+        let provider = LinearForwardProvider {
+            sell_token: usdc,
+            buy_token: usdt,
+            router: eth::Address::repeat_byte(0x22),
+            numerator,
+            denominator,
+            requests: Mutex::new(Vec::new()),
+        };
+        inner.provider = if floor_at_limit {
+            Arc::new(FloorAtLimitProvider(provider))
+        } else {
+            Arc::new(provider)
+        };
+        let mut order = sell_order_with_amounts(usdc, usdt, 100_000_000, 100_000_000);
+        order.side = order::Side::Buy;
+        order.class = class;
+
+        // Unit prices and 1 wei gas make the fee 285_000, 28.5bp of the order.
+        inner
+            .solve_order(
+                &order,
+                &tokens_with_unit_prices(&[usdc, usdt]),
+                &auction::GasPrice(eth::Ether(U256::from(1u64))),
+                false,
+                &test_deadline(),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn accepted_buy_order_swaps_exactly_what_the_user_pays() {
+        let solved = solve_buy_order(101, 100, order::Class::Limit, false)
+            .await
+            .unwrap();
+
+        let [solution::Interaction::Custom(swap)] = solved.solution.interactions.as_slice() else {
+            panic!("expected a single router interaction");
+        };
+        assert_eq!(swap.inputs[0].amount, U256::from(100_000_000u64));
+        assert_eq!(solved.effective_sell_amount, swap.inputs[0].amount);
+        assert_eq!(solved.effective_buy_amount, U256::from(100_000_000u64));
+    }
+
+    #[tokio::test]
+    async fn buy_order_is_declined_when_margin_is_below_gas() {
+        assert!(matches!(
+            solve_buy_order(1001, 1000, order::Class::Limit, false).await,
+            Err(SolveError::EffectiveAmountUnderFee)
+        ));
+    }
+
+    #[tokio::test]
+    async fn buy_order_is_declined_when_only_the_expected_output_covers_gas() {
+        assert!(matches!(
+            solve_buy_order(101, 100, order::Class::Limit, true).await,
+            Err(SolveError::EffectiveAmountUnderFee)
+        ));
+    }
+
+    #[tokio::test]
+    async fn buy_order_without_solver_fee_is_declined() {
+        assert!(matches!(
+            solve_buy_order(101, 100, order::Class::Market, false).await,
+            Err(SolveError::BuyOrderWithoutSolverFee)
+        ));
+    }
+
+    #[test]
+    fn buy_order_margin_must_cover_the_gas_fee() {
+        // The Arbitrum fills: ~$3.78 at 1:1, Curve pays 9bp over, gas ~37bp.
+        let sell = U256::from(3_780_000u64);
+        let buy = U256::from(3_780_000u64);
+        let expected = U256::from(3_783_402u64);
+        let fee = U256::from(13_844u64);
+        assert!(!buy_order_margin_covers_fee(
+            expected, expected, 0, sell, buy, fee
+        ));
+
+        // 50bp of margin against a 10bp fee clears a 30bp haircut, not 45bp.
+        let sell = U256::from(1_000_000u64);
+        let buy = U256::from(1_000_000u64);
+        let expected = U256::from(1_005_000u64);
+        let fee = U256::from(1_000u64);
+        assert!(buy_order_margin_covers_fee(
+            expected, expected, 30, sell, buy, fee
+        ));
+        assert!(!buy_order_margin_covers_fee(
+            expected, expected, 45, sell, buy, fee
+        ));
+
+        // The expected output covers gas but the swap may settle at the floor.
+        assert!(!buy_order_margin_covers_fee(
+            expected, buy, 30, sell, buy, fee
+        ));
+
+        // Output below the buy amount never covers anything.
+        assert!(!buy_order_margin_covers_fee(
+            U256::from(999_999u64),
+            U256::from(999_999u64),
+            0,
+            sell,
+            buy,
+            U256::ZERO
+        ));
     }
 
     #[test]
